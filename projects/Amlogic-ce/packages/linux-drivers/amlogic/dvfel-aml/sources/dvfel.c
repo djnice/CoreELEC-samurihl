@@ -46,6 +46,7 @@
 #include <linux/amlogic/media/vfm/vframe_provider.h>
 #include <linux/amlogic/media/vfm/vframe_receiver.h>
 #include <linux/amlogic/media/codec_mm/codec_mm.h>
+#include <linux/amlogic/media/video_sink/video_keeper.h>
 #include <linux/amlogic/media/vicp/vicp.h>
 
 #include "dvfel_uapi.h"
@@ -85,13 +86,23 @@ module_param(debug, int, 0644);
 #define dvfel_dbg(fmt, ...) \
 	do { if (debug) pr_info(DRV_NAME ": " fmt, ##__VA_ARGS__); } while (0)
 
-enum slot_state { SLOT_FREE, SLOT_BUSY, SLOT_OUT };
+/*
+ * SLOT_HELD: taken by the display when the stream was reset. The display
+ * may keep showing it (video keeper, e.g. across a decoder reset on seek),
+ * so it is reused only once a frame of the new stream went out and the
+ * keeper no longer holds the header buffer.
+ */
+enum slot_state { SLOT_FREE, SLOT_BUSY, SLOT_OUT, SLOT_HELD };
 
 struct dvfel_slot {
 	enum slot_state state;
+	bool taken;		/* SLOT_OUT frame handed to the display */
 	u32 gen;
 	struct vframe_s *orig;
 	struct vframe_s out_vf;
+	/* the header handle lets the video keeper hold the frame */
+	struct codec_mm_s *body_mm, *head_mm;
+	bool body_tied;		/* body released by the header's release */
 	ulong body_phys, head_phys, table_phys, table_handle;
 };
 
@@ -163,6 +174,7 @@ struct dvfel_dev {
 	wait_queue_head_t wq_a, wq_b;
 	bool kick_a, kick_b;
 	bool new_stream;
+	bool shown_new;		/* the display took a frame since the last reset */
 
 	/* compositor (userspace) */
 	struct miscdevice misc;
@@ -207,6 +219,63 @@ static struct dvfel_dev *gdev;
 /* dvfel owned buffers                                                */
 /* ------------------------------------------------------------------ */
 
+/* the video keeper holds the frame of this slot */
+static bool slot_kept(struct dvfel_slot *s)
+{
+	return s->head_mm && atomic_read(&s->head_mm->use_cnt) > 1;
+}
+
+/*
+ * The body goes with the header: when the keeper holds the header of a
+ * frame on screen past our release, the body is released after it.
+ */
+static atomic_t bodies_pending = ATOMIC_INIT(0);
+
+static void body_release_cb(struct codec_mm_s *head, struct codec_mm_cb_s *cb)
+{
+	codec_mm_release(cb->private_data, DRV_NAME);
+	kfree(cb);
+	atomic_dec(&bodies_pending);
+}
+
+static int tie_body_to_head(struct dvfel_slot *s)
+{
+	struct codec_mm_cb_s *cb = kzalloc(sizeof(*cb), GFP_KERNEL);
+
+	if (!cb)
+		return -ENOMEM;
+	cb->func = body_release_cb;
+	cb->private_data = s->body_mm;
+	atomic_inc(&bodies_pending);
+	codec_mm_add_release_callback(s->head_mm, cb);
+	return 0;
+}
+
+/* a held slot may be reused (d->lock held) */
+static bool slot_released_locked(struct dvfel_dev *d, struct dvfel_slot *s)
+{
+	if (s->state == SLOT_HELD && d->shown_new && !slot_kept(s)) {
+		s->state = SLOT_FREE;
+		s->orig = NULL;
+	}
+	return s->state == SLOT_FREE;
+}
+
+/* some slot may still be on screen (d->lock held) */
+static bool slots_shown_locked(struct dvfel_dev *d)
+{
+	int i;
+
+	for (i = 0; i < d->nslots; i++) {
+		struct dvfel_slot *s = &d->slots[i];
+
+		if (s->state == SLOT_OUT || slot_kept(s) ||
+		    (s->state == SLOT_HELD && !slot_released_locked(d, s)))
+			return true;
+	}
+	return false;
+}
+
 static void dvfel_free_bufs(struct dvfel_dev *d)
 {
 	int i;
@@ -216,12 +285,18 @@ static void dvfel_free_bufs(struct dvfel_dev *d)
 
 		if (s->table_handle)
 			codec_mm_dma_free_coherent(s->table_handle);
-		if (s->head_phys)
-			codec_mm_free_for_dma(DRV_NAME, s->head_phys);
-		if (s->body_phys)
-			codec_mm_free_for_dma(DRV_NAME, s->body_phys);
+		/* a keeper reference keeps the frame alive past this */
+		if (s->body_tied)
+			s->body_mm = NULL;	/* released with the header */
+		if (s->head_mm)
+			codec_mm_release(s->head_mm, DRV_NAME);
+		if (s->body_mm)
+			codec_mm_release(s->body_mm, DRV_NAME);
+		s->body_tied = false;
+		s->head_mm = s->body_mm = NULL;
 		s->table_handle = s->table_phys = 0;
 		s->head_phys = s->body_phys = 0;
+		s->state = SLOT_FREE;
 	}
 	if (d->lin_phys)
 		codec_mm_free_for_dma(DRV_NAME, d->lin_phys);
@@ -233,6 +308,15 @@ static ulong alloc_dma(u32 size)
 {
 	return codec_mm_alloc_for_dma(DRV_NAME, PAGE_ALIGN(size) / PAGE_SIZE, 0,
 				      CODEC_MM_FLAGS_DMA);
+}
+
+static struct codec_mm_s *alloc_mm(u32 size, ulong *phys)
+{
+	struct codec_mm_s *mm = codec_mm_alloc(DRV_NAME, PAGE_ALIGN(size), 0,
+					       CODEC_MM_FLAGS_DMA);
+
+	*phys = mm ? mm->phy_addr : 0;
+	return mm;
 }
 
 static int dvfel_alloc_bufs(struct dvfel_dev *d, u32 w, u32 h)
@@ -248,12 +332,15 @@ static int dvfel_alloc_bufs(struct dvfel_dev *d, u32 w, u32 h)
 		u32 body = FBC_BODY_SIZE(w, h), j, *tbl;
 		ulong phys;
 
-		s->body_phys = alloc_dma(body);
-		s->head_phys = alloc_dma(FBC_HEAD_SIZE(w, h));
+		s->body_mm = alloc_mm(body, &s->body_phys);
+		s->head_mm = alloc_mm(FBC_HEAD_SIZE(w, h), &s->head_phys);
 		tbl = codec_mm_dma_alloc_coherent(&s->table_handle, &phys,
 						  FBC_TABLE_SIZE(w, h), DRV_NAME);
 		if (!s->body_phys || !s->head_phys || !tbl)
 			goto fail;
+		if (tie_body_to_head(s))
+			goto fail;
+		s->body_tied = true;
 		/* the AFBCE MMU table holds 20-bit page numbers */
 		if (s->body_phys + body > 0x100000000ULL)
 			goto fail;
@@ -297,6 +384,7 @@ static void dvfel_free_work(struct work_struct *work)
 	idle = dvfel_idle_locked(d);
 	spin_unlock_irqrestore(&d->lock, flags);
 
+	/* a frame the keeper still shows outlives this, see tie_body_to_head() */
 	mutex_lock(&d->buf_lock);
 	if (idle && d->bufs_ok) {
 		dvfel_free_bufs(d);
@@ -358,7 +446,7 @@ static struct dvfel_slot *slot_free(struct dvfel_dev *d)
 	int i;
 
 	for (i = 0; i < d->nslots; i++)
-		if (d->slots[i].state == SLOT_FREE)
+		if (slot_released_locked(d, &d->slots[i]))
 			return &d->slots[i];
 	return NULL;
 }
@@ -404,11 +492,15 @@ static void dvfel_reset_locked(struct dvfel_dev *d)
 
 	d->gen++;
 	d->new_stream = true;
+	d->shown_new = false;
 	d->outq_head = d->outq_cnt = 0;
 	/* pending entries of the old generation are dropped by stage B */
-	for (i = 0; i < d->nslots; i++)
-		if (d->slots[i].state == SLOT_OUT)
-			d->slots[i].state = SLOT_FREE;
+	for (i = 0; i < d->nslots; i++) {
+		struct dvfel_slot *s = &d->slots[i];
+
+		if (s->state == SLOT_OUT)
+			s->state = s->taken ? SLOT_HELD : SLOT_FREE;
+	}
 	memset(d->pass, 0, sizeof(d->pass));
 }
 
@@ -552,9 +644,14 @@ static void build_out_vf(struct dvfel_slot *s, struct vframe_s *orig, u32 w, u32
 	o->plane_num = 0;
 	memset(o->canvas0_config, 0, sizeof(o->canvas0_config));
 	memset(o->canvas1_config, 0, sizeof(o->canvas1_config));
+	/*
+	 * the video keeper holds the header by its handle (so the display
+	 * keeps showing this frame across a decoder reset); the body is a
+	 * scatter-type AFBC body to it, so it goes with the header instead
+	 */
 	o->mem_handle = NULL;
 	o->mem_handle_1 = NULL;
-	o->mem_head_handle = NULL;
+	o->mem_head_handle = s->head_mm;
 	o->mem_dw_handle = NULL;
 	o->vf_ext = NULL;
 	o->uvm_vf = NULL;
@@ -631,7 +728,7 @@ static bool ensure_bufs(struct dvfel_dev *d, u32 w, u32 h)
 		bool idle;
 
 		spin_lock_irqsave(&d->lock, flags);
-		idle = !d->outq_cnt && !d->pend_cnt;
+		idle = !d->outq_cnt && !d->pend_cnt && !slots_shown_locked(d);
 		spin_unlock_irqrestore(&d->lock, flags);
 		if (idle)
 			dvfel_free_bufs(d);
@@ -792,6 +889,7 @@ static int dvfel_thread_a(void *data)
 				s->orig = vf;
 				s->gen = gen;
 				s->state = SLOT_OUT;
+				s->taken = false;
 				pend_push(d, &s->out_vf, -1, gen);
 				d->frames_proc++;
 			} else {
@@ -891,6 +989,7 @@ static void finish_job(struct dvfel_dev *d, struct dvfel_pend *pe)
 		s->orig = orig;
 		s->gen = pe->gen;
 		s->state = SLOT_OUT;
+		s->taken = false;
 		outq_push(d, &s->out_vf);
 		d->frames_proc++;
 	} else {
@@ -1002,6 +1101,13 @@ static struct vframe_s *dvfel_get(void *op_arg)
 
 	spin_lock_irqsave(&d->lock, flags);
 	vf = outq_pop(d);
+	if (vf) {
+		struct dvfel_slot *s = slot_of(d, vf);
+
+		if (s)
+			s->taken = true;
+		d->shown_new = true;
+	}
 	spin_unlock_irqrestore(&d->lock, flags);
 	if (vf)
 		dvfel_kick(d);
@@ -1023,6 +1129,7 @@ static void dvfel_put(struct vframe_s *vf, void *op_arg)
 	if (s) {
 		if (s->state == SLOT_OUT && s->gen == d->gen)
 			upstream = s->orig;
+		/* a held slot waits for the keeper, see slot_released_locked() */
 		if (s->state == SLOT_OUT)
 			s->state = SLOT_FREE;
 		s->orig = NULL;
@@ -1048,6 +1155,8 @@ static int dvfel_prov_event(int type, void *data, void *op_arg)
 {
 	struct dvfel_dev *d = op_arg;
 
+	if (debug > 1 || (debug && !(type & VFRAME_EVENT_RECEIVER_GET_AUX_DATA)))
+		dvfel_dbg("downstream event 0x%x\n", type);
 	if (data && (type & (VFRAME_EVENT_RECEIVER_GET_AUX_DATA |
 			     VFRAME_EVENT_RECEIVER_DISP_MODE |
 			     VFRAME_EVENT_RECEIVER_REQ_STATE))) {
@@ -1104,6 +1213,8 @@ static int dvfel_recv_event(int type, void *data, void *op_arg)
 	struct dvfel_dev *d = op_arg;
 	unsigned long flags;
 
+	if (type != VFRAME_EVENT_PROVIDER_VFRAME_READY)
+		dvfel_dbg("upstream event 0x%x\n", type);
 	switch (type) {
 	case VFRAME_EVENT_PROVIDER_REG:
 		dvfel_dbg("upstream REG %s\n", data ? (char *)data : "");
@@ -1615,6 +1726,16 @@ static void __exit dvfel_exit(void)
 	mutex_lock(&d->buf_lock);
 	dvfel_free_bufs(d);
 	mutex_unlock(&d->buf_lock);
+	/* body_release_cb() must not outlive the module */
+	if (atomic_read(&bodies_pending)) {
+		int i;
+
+		try_free_keep_video(1);
+		for (i = 0; i < 50 && atomic_read(&bodies_pending); i++)
+			msleep(20);
+		if (atomic_read(&bodies_pending))
+			pr_warn(DRV_NAME ": the video keeper still holds a frame\n");
+	}
 	vfree(d->cap_buf);
 	kfree(d);
 }
