@@ -1,0 +1,1997 @@
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp
+new file mode 100644
+index 0000000..7efafe4
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp
+@@ -0,0 +1,815 @@
++/*
++ *  Copyright (C) 2026 Team CoreELEC
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "AMLDvFel.h"
++
++#include "felgpu.h"
++#include "dvfel_uapi.h"
++#include "utils/log.h"
++
++#include <cmath>
++#include <climits>
++#include <cstring>
++#include <fstream>
++#include <set>
++
++#include <EGL/egl.h>
++#include <EGL/eglext.h>
++#include <GLES2/gl2ext.h>
++#include <fcntl.h>
++#include <gbm.h>
++#include <linux/dma-heap.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++
++extern "C"
++{
++#include <libavcodec/avcodec.h>
++#include <libavutil/frame.h>
++}
++
++#include <libdovi/rpu_parser.h>
++
++#ifndef DRM_FORMAT_ABGR8888
++#define DRM_FORMAT_ABGR8888 0x34324241 /* 'AB24' */
++#endif
++
++namespace
++{
++constexpr const char* DVFEL_DEV = "/dev/dvfel";
++constexpr int GPU_BUFFERS = 3;
++constexpr int EL_TAPS = 4;             // Lanczos-2, see felgpu.h
++constexpr int EL_WAIT_MS = 40;         // wait for the EL frame of a job
++// Kodi feeds packets ~1.2 s ahead of display; EL decoding is paced to stay
++// at most EL_LEAD_US ahead of the frame the kernel asked for last
++constexpr int64_t EL_LEAD_US = 350000;
++constexpr size_t MAX_EL_FRAMES = 24;   // decoded EL frames kept (6 MB each at 4K)
++constexpr size_t MAX_EL_QUEUE = 400;   // compressed EL packets
++constexpr int64_t PTS_TOLERANCE_US = 1000;
++
++void WriteSysfs(const char* path, const std::string& value)
++{
++  std::ofstream f(path);
++  if (f)
++    f << value;
++  if (!f)
++    CLog::Log(LOGWARNING, "CAMLDvFel: cannot write '{}' to {}", value, path);
++}
++
++double Fixed(int64_t ipart, uint64_t fpart, uint64_t denom)
++{
++  return static_cast<double>(ipart) + std::ldexp(static_cast<double>(fpart), -static_cast<int>(denom));
++}
++
++// original (profile 7) RPU -> composition metadata; nullptr if not usable
++std::shared_ptr<felgpu_meta> ParseRpu(const uint8_t* nal, size_t size,
++                                      const std::shared_ptr<felgpu_meta>& prev)
++{
++  DoviRpuOpaque* rpu = dovi_parse_unspec62_nalu(nal, size);
++  if (!rpu)
++    return nullptr;
++
++  std::shared_ptr<felgpu_meta> meta;
++  const DoviRpuDataHeader* hdr = dovi_rpu_get_header(rpu);
++  const DoviRpuDataMapping* map = hdr ? dovi_rpu_get_data_mapping(rpu) : nullptr;
++
++  if (hdr && !map && hdr->use_prev_vdr_rpu_flag)
++  {
++    meta = prev;
++  }
++  else if (hdr && map && hdr->coefficient_data_type == 0)
++  {
++    const uint64_t denom = hdr->coefficient_log2_denom;
++    meta = std::make_shared<felgpu_meta>();
++    felgpu_meta& m = *meta;
++    std::memset(&m, 0, sizeof(m));
++    m.bl_bits = static_cast<int>(hdr->bl_bit_depth_minus8) + 8;
++    m.el_bits = static_cast<int>(hdr->el_bit_depth_minus8) + 8;
++    m.use_el = !hdr->disable_residual_flag && map->nlq_method_idc == 0 && map->nlq;
++
++    for (int c = 0; c < 3 && meta; c++)
++    {
++      const DoviReshapingCurve& cv = map->curves[c];
++      const int n = static_cast<int>(cv.num_pivots_minus2) + 2;
++      if (n > FELGPU_MAX_PIECES + 1 || cv.pivots.len < static_cast<size_t>(n))
++      {
++        meta = nullptr;
++        break;
++      }
++      m.npiv[c] = n;
++      int acc = 0;
++      for (int i = 0; i < n; i++) // pivots are coded as deltas
++        m.pivots[c][i] = acc += cv.pivots.data[i];
++
++      for (int k = 0; k < n - 1; k++)
++      {
++        m.mapping[c][k] = cv.mapping_idc;
++        if (cv.mapping_idc == 0 && cv.polynomial)
++        {
++          const DoviPolynomialCurve& p = *cv.polynomial;
++          const int order = static_cast<int>(p.poly_order_minus1.data[k]) + 1;
++          for (int j = 0; j <= order && j < 3; j++)
++            m.poly[c][k][j] = Fixed(p.poly_coef_int.list[k]->data[j], p.poly_coef.list[k]->data[j], denom);
++        }
++        else if (cv.mapping_idc == 1 && cv.mmr)
++        {
++          const DoviMMRCurve& r = *cv.mmr;
++          const int order = r.mmr_order_minus1.data[k] + 1;
++          m.mmr_order[c][k] = order;
++          m.mmr_const[c][k] = Fixed(r.mmr_constant_int.data[k], r.mmr_constant.data[k], denom);
++          for (int o = 0; o < order && o < 3; o++)
++            for (int t = 0; t < 7; t++)
++              m.mmr[c][k][o][t] = Fixed(r.mmr_coef_int.list[k]->list[o]->data[t],
++                                        r.mmr_coef.list[k]->list[o]->data[t], denom);
++        }
++        else
++        {
++          meta = nullptr;
++          break;
++        }
++      }
++      if (meta && m.use_el)
++      {
++        const DoviRpuDataNlq& q = *map->nlq;
++        m.nlq_offset[c] = q.nlq_offset[c];
++        m.nlq_slope[c] = Fixed(q.linear_deadzone_slope_int[c], q.linear_deadzone_slope[c], denom);
++        m.nlq_thresh[c] = Fixed(q.linear_deadzone_threshold_int[c], q.linear_deadzone_threshold[c], denom);
++        m.nlq_max[c] = Fixed(q.vdr_in_max_int[c], q.vdr_in_max[c], denom);
++      }
++    }
++  }
++
++  if (map)
++    dovi_rpu_free_data_mapping(map);
++  if (hdr)
++    dovi_rpu_free_header(hdr);
++  dovi_rpu_free(rpu);
++  return meta;
++}
++
++// debug: /storage/dvfel_dump_pts holds a pts; the EL frame and metadata used
++// for that frame are written to /storage/dvfel_el.yuv and dvfel_meta.txt
++int64_t DumpPts()
++{
++  std::ifstream f("/storage/dvfel_dump_pts");
++  long long v = -1;
++  if (f)
++    f >> v;
++  return v;
++}
++
++void DumpFrame(const AVFrame* el, const felgpu_meta& m)
++{
++  std::ofstream y("/storage/dvfel_el.yuv", std::ios::binary);
++  for (int p = 0; p < 3; p++)
++  {
++    const int w = p ? el->width / 2 : el->width, h = p ? el->height / 2 : el->height;
++    for (int r = 0; r < h; r++)
++      y.write(reinterpret_cast<const char*>(el->data[p] + r * el->linesize[p]), w * 2);
++  }
++  std::ofstream t("/storage/dvfel_meta.txt");
++  t.precision(12);
++  t << "bl " << m.bl_bits << " el " << m.el_bits << " use_el " << m.use_el << "\n";
++  for (int c = 0; c < 3; c++)
++  {
++    t << "comp " << c << " pivots";
++    for (int i = 0; i < m.npiv[c]; i++)
++      t << " " << m.pivots[c][i];
++    t << "\n";
++    for (int k = 0; k < m.npiv[c] - 1; k++)
++    {
++      t << "  piece " << k << " map " << m.mapping[c][k] << " poly " << m.poly[c][k][0] << " "
++        << m.poly[c][k][1] << " " << m.poly[c][k][2] << " mmr_order " << m.mmr_order[c][k]
++        << " const " << m.mmr_const[c][k] << " mmr";
++      for (int o = 0; o < m.mmr_order[c][k]; o++)
++        for (int j = 0; j < 7; j++)
++          t << " " << m.mmr[c][k][o][j];
++      t << "\n";
++    }
++    t << "  nlq offset " << m.nlq_offset[c] << " slope " << m.nlq_slope[c] << " thresh "
++      << m.nlq_thresh[c] << " max " << m.nlq_max[c] << "\n";
++  }
++}
++
++// HEVC NAL unit types of an Annex-B access unit: the first slice's type
++// (-1 without slices) and whether it ends a coded video sequence
++void ScanNals(const std::vector<uint8_t>& au, int& vclType, bool& endOfSeq)
++{
++  vclType = -1;
++  endOfSeq = false;
++  for (size_t i = 0; i + 4 < au.size(); i++)
++  {
++    if (au[i] != 0 || au[i + 1] != 0 || au[i + 2] != 1)
++      continue;
++    // like FFmpeg, skip invalid NAL units (forbidden bit, temporal id 0)
++    // and other layers; some EL tracks carry such stray units
++    const uint8_t h0 = au[i + 3], h1 = au[i + 4];
++    const int layer = ((h0 & 1) << 5) | (h1 >> 3);
++    if ((h0 & 0x80) || layer != 0 || (h1 & 7) == 0)
++    {
++      i += 3;
++      continue;
++    }
++    const int type = (h0 >> 1) & 0x3f;
++    if (type < 32 && vclType < 0)
++      vclType = type;
++    else if (type == 36 || type == 37) // end of sequence / bitstream
++      endOfSeq = true;
++    i += 3;
++  }
++}
++
++// std::map lookup of the entry closest to pts, within the tolerance
++template<typename T>
++typename std::map<int64_t, T>::iterator FindPts(std::map<int64_t, T>& m, int64_t pts)
++{
++  auto it = m.lower_bound(pts - PTS_TOLERANCE_US);
++  if (it != m.end() && std::llabs(it->first - pts) <= PTS_TOLERANCE_US)
++    return it;
++  return m.end();
++}
++} // namespace
++
++CAMLDvFel::~CAMLDvFel()
++{
++  Stop();
++}
++
++bool CAMLDvFel::IsAvailable()
++{
++  return access(DVFEL_DEV, R_OK | W_OK) == 0;
++}
++
++void CAMLDvFel::RouteThroughDvfel(bool enable)
++{
++  // non Dolby Vision decoding builds its map from vdec_vfm_path, Dolby Vision
++  // decoding (provider dvbldec) uses the static dvblpath map
++  WriteSysfs("/sys/class/vdec/vdec_vfm_path", enable ? "dvfel amlvideo deinterlace amvideo" : "disable");
++  WriteSysfs("/sys/class/vfm/map", "rm dvblpath");
++  WriteSysfs("/sys/class/vfm/map", enable ? "add dvblpath dvbldec dvfel amlvideo deinterlace amvideo"
++                                          : "add dvblpath dvbldec amlvideo deinterlace amvideo");
++}
++
++bool CAMLDvFel::Start(int width, int height)
++{
++  if (m_started)
++    return true;
++  if (width <= 0 || height <= 0 || (width & 3) || (height & 3))
++    return false;
++
++  m_width = width;
++  m_height = height;
++  m_stop = false;
++  m_noPairLogged = 0;
++
++  std::promise<bool> ready;
++  std::future<bool> ok = ready.get_future();
++  m_gpuThread = std::thread(&CAMLDvFel::GpuThread, this, std::move(ready));
++  if (!ok.get())
++  {
++    m_gpuThread.join();
++    CLog::Log(LOGERROR, "CAMLDvFel: GPU compositor failed to start, FEL composition disabled");
++    return false;
++  }
++  m_elThread = std::thread(&CAMLDvFel::ElThread, this);
++
++  RouteThroughDvfel(true);
++  m_started = true;
++  CLog::Log(LOGINFO, "CAMLDvFel: FEL composition started for {}x{}", width, height);
++  return true;
++}
++
++void CAMLDvFel::Stop()
++{
++  if (!m_started && !m_gpuThread.joinable())
++    return;
++
++  m_stop = true;
++  m_elCond.notify_all();
++  m_readyCond.notify_all();
++  if (m_elThread.joinable())
++    m_elThread.join();
++  if (m_gpuThread.joinable())
++    m_gpuThread.join();
++
++  if (m_started)
++  {
++    RouteThroughDvfel(false);
++    const uint64_t n = m_composed;
++    CLog::Log(LOGINFO,
++              "CAMLDvFel: stopped, {} frames composed (gpu avg {:.1f} ms), {} shown without EL, "
++              "{} EL frames decoded",
++              n, n ? m_gpuMsSum / n : 0.0, m_passthrough.load(), m_elDecoded.load());
++  }
++
++  std::lock_guard<std::mutex> lock(m_lock);
++  for (auto& f : m_elFrames)
++    av_frame_free(&f.second.frame);
++  m_elFrames.clear();
++  m_elQueue.clear();
++  m_started = false;
++}
++
++void CAMLDvFel::Reset()
++{
++  std::lock_guard<std::mutex> lock(m_lock);
++  m_elQueue.clear();
++  m_elQueue.push_back({0, {}, nullptr, true});
++  m_lastJobPts = INT64_MIN;
++  m_noPairLogged = 0;
++  m_pendingRpu.clear();
++  m_pendingEl.clear();
++  m_elCond.notify_all();
++}
++
++void CAMLDvFel::OnDoviRpu(const uint8_t* nal, uint32_t size)
++{
++  m_pendingRpu.assign(nal, nal + size);
++}
++
++void CAMLDvFel::OnDoviElNal(const uint8_t* nal, uint32_t size)
++{
++  static const uint8_t startCode[] = {0, 0, 0, 1};
++  m_pendingEl.insert(m_pendingEl.end(), startCode, startCode + 4);
++  m_pendingEl.insert(m_pendingEl.end(), nal, nal + size);
++}
++
++void CAMLDvFel::DropPacket()
++{
++  m_pendingRpu.clear();
++  m_pendingEl.clear();
++}
++
++void CAMLDvFel::CommitPacket(double pts)
++{
++  if (!m_started || pts < 0)
++  {
++    DropPacket();
++    return;
++  }
++  // the decoder reports the packet pts truncated to microseconds
++  const int64_t key = static_cast<int64_t>(pts);
++
++  std::shared_ptr<felgpu_meta> meta;
++  if (!m_pendingRpu.empty())
++    meta = ParseRpu(m_pendingRpu.data(), m_pendingRpu.size(), m_lastMeta);
++  if (meta)
++    m_lastMeta = meta;
++
++  std::lock_guard<std::mutex> lock(m_lock);
++  if (!m_pendingEl.empty() && m_elQueue.size() < MAX_EL_QUEUE)
++  {
++    m_elQueue.push_back({key, std::move(m_pendingEl), meta, false});
++    m_elCond.notify_all();
++  }
++  m_pendingEl.clear();
++  m_pendingRpu.clear();
++}
++
++void CAMLDvFel::ElThread()
++{
++  const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);
++  AVCodecContext* ctx = codec ? avcodec_alloc_context3(codec) : nullptr;
++  if (!ctx)
++    return;
++  ctx->thread_count = 3;
++  ctx->thread_type = FF_THREAD_FRAME;
++  if (avcodec_open2(ctx, codec, nullptr) < 0)
++  {
++    CLog::Log(LOGERROR, "CAMLDvFel: cannot open the EL decoder");
++    avcodec_free_context(&ctx);
++    return;
++  }
++  AVPacket* pkt = av_packet_alloc();
++  AVFrame* frame = av_frame_alloc();
++
++  // display order pairing: the pts of the packets whose EL pictures are in
++  // the decoder or were skipped, the metadata by packet pts, and how many
++  // skipped pictures still hold one of the earliest pts
++  std::multiset<int64_t> slots;
++  std::map<int64_t, std::shared_ptr<felgpu_meta>> metas;
++  int skipped = 0;
++  // Normally an EL picture belongs to the frame of the packet that carried
++  // it (frame->pts), which is immune to pictures FFmpeg drops and to odd
++  // packet timestamps. Once the carrying pts go backwards in output order,
++  // the EL is coded in another picture order than the base layer and the
++  // display order slots are used instead.
++  bool reordered = false;
++  int64_t lastLabel = INT64_MIN;
++  // after a flush FFmpeg needs an IRAP picture and drops the RASL pictures
++  // of a CRA it starts with; pictures FFmpeg drops never come out, so they
++  // are not sent either and give up their display slot. Both precede every
++  // picture that is output in display order.
++  bool needIrap = true, skipRasl = false;
++
++  while (!m_stop)
++  {
++    ElPacket in;
++    {
++      std::unique_lock<std::mutex> lock(m_lock);
++      // pace decoding by the display: stay at most EL_LEAD_US ahead of the
++      // last requested frame (before the first request: a few frames)
++      auto paced = [this] {
++        if (m_elFrames.size() >= MAX_EL_FRAMES)
++          return false;
++        if (m_lastJobPts == INT64_MIN)
++          return m_elFrames.size() < 12;
++        return m_elFrames.empty() || m_elFrames.rbegin()->first < m_lastJobPts + EL_LEAD_US;
++      };
++      m_elCond.wait(lock, [&] {
++        return m_stop || (!m_elQueue.empty() && (m_elQueue.front().flush || paced()));
++      });
++      if (m_stop)
++        break;
++      in = std::move(m_elQueue.front());
++      m_elQueue.pop_front();
++    }
++
++    if (in.flush)
++    {
++      avcodec_flush_buffers(ctx);
++      slots.clear();
++      metas.clear();
++      skipped = 0;
++      lastLabel = INT64_MIN;
++      needIrap = true;
++      skipRasl = false;
++      std::lock_guard<std::mutex> lock(m_lock);
++      for (auto& f : m_elFrames)
++        av_frame_free(&f.second.frame);
++      m_elFrames.clear();
++      continue;
++    }
++
++    int type;
++    bool endOfSeq;
++    ScanNals(in.data, type, endOfSeq);
++    if (type < 0)
++      continue;
++    bool decode = true;
++    if (type >= 16 && type <= 23) // IRAP: BLA 16-18, IDR 19-20, CRA 21
++    {
++      skipRasl = type <= 18 || (type == 21 && needIrap);
++      needIrap = false;
++    }
++    else if (needIrap || (skipRasl && (type == 8 || type == 9)))
++    {
++      decode = false;
++    }
++    if (endOfSeq)
++      needIrap = true;
++
++    slots.insert(in.pts);
++    if (!decode)
++    {
++      skipped++;
++      continue;
++    }
++    metas[in.pts] = std::move(in.meta);
++    while (metas.size() > 2 * MAX_EL_FRAMES) // never output, e.g. broken pictures
++      metas.erase(metas.begin());
++
++    if (av_new_packet(pkt, static_cast<int>(in.data.size())) < 0)
++      continue;
++    std::memcpy(pkt->data, in.data.data(), in.data.size());
++    pkt->pts = in.pts;
++    int ret = avcodec_send_packet(ctx, pkt);
++    av_packet_unref(pkt);
++    if (ret < 0 && ret != AVERROR(EAGAIN))
++      continue;
++
++    while (avcodec_receive_frame(ctx, frame) == 0)
++    {
++      for (; skipped > 0 && !slots.empty(); skipped--)
++        slots.erase(slots.begin());
++      if (slots.empty())
++      {
++        av_frame_unref(frame);
++        continue;
++      }
++      // output is in display order: the earliest pts is this picture's slot
++      const int64_t slot = *slots.begin();
++      slots.erase(slots.begin());
++      // frame->pts is the pts of the packet that carried the picture
++      if (!reordered && lastLabel != INT64_MIN && frame->pts < lastLabel)
++      {
++        reordered = true;
++        CLog::Log(LOGINFO,
++                  "CAMLDvFel: the EL picture order differs from the base layer, pairing by "
++                  "display order");
++        // what was filed by the carrying pts from here on is misplaced
++        std::lock_guard<std::mutex> lock(m_lock);
++        for (auto it = m_elFrames.lower_bound(slot); it != m_elFrames.end();)
++        {
++          av_frame_free(&it->second.frame);
++          it = m_elFrames.erase(it);
++        }
++      }
++      lastLabel = frame->pts;
++      const int64_t pts = reordered ? slot : frame->pts;
++      std::shared_ptr<felgpu_meta> meta;
++      auto m = metas.find(frame->pts);
++      if (m != metas.end())
++      {
++        meta = std::move(m->second);
++        metas.erase(m);
++      }
++      if (!meta || frame->format != AV_PIX_FMT_YUV420P10 || frame->width * 2 != m_width ||
++          frame->height * 2 != m_height)
++      {
++        av_frame_unref(frame);
++        continue;
++      }
++      AVFrame* keep = av_frame_clone(frame);
++      av_frame_unref(frame);
++      keep->pts = pts;
++      std::lock_guard<std::mutex> lock(m_lock);
++      // only frames the display has passed may go; never drop a future one
++      while (m_lastJobPts != INT64_MIN && m_elFrames.size() >= MAX_EL_FRAMES &&
++             m_elFrames.begin()->first < m_lastJobPts - PTS_TOLERANCE_US)
++      {
++        av_frame_free(&m_elFrames.begin()->second.frame);
++        m_elFrames.erase(m_elFrames.begin());
++      }
++      auto& entry = m_elFrames[pts];
++      if (entry.frame)
++        av_frame_free(&entry.frame);
++      entry = {keep, std::move(meta)};
++      m_elDecoded++;
++      m_readyCond.notify_all();
++    }
++  }
++
++  av_frame_free(&frame);
++  av_packet_free(&pkt);
++  avcodec_free_context(&ctx);
++}
++
++bool CAMLDvFel::WaitForFrame(int64_t pts, AVFrame*& frame, std::shared_ptr<felgpu_meta>& meta)
++{
++  std::unique_lock<std::mutex> lock(m_lock);
++  // the display reached pts: let the paced EL decoder run ahead of it
++  m_lastJobPts = pts;
++  while (!m_elFrames.empty() && m_elFrames.begin()->first < pts - PTS_TOLERANCE_US)
++  {
++    av_frame_free(&m_elFrames.begin()->second.frame);
++    m_elFrames.erase(m_elFrames.begin());
++  }
++  m_elCond.notify_all();
++
++  const bool found = m_readyCond.wait_for(lock, std::chrono::milliseconds(EL_WAIT_MS), [&] {
++    return m_stop || FindPts(m_elFrames, pts) != m_elFrames.end();
++  });
++  if (!found || m_stop)
++  {
++    if (!m_stop && m_noPairLogged < 10)
++    {
++      m_noPairLogged++;
++      auto el = m_elFrames.lower_bound(pts);
++      CLog::Log(LOGINFO, "CAMLDvFel: no EL for pts {} us: EL frames {} [{}..{}] next {}, EL queue {}",
++                pts, m_elFrames.size(), m_elFrames.empty() ? 0 : m_elFrames.begin()->first,
++                m_elFrames.empty() ? 0 : m_elFrames.rbegin()->first,
++                el == m_elFrames.end() ? -1 : el->first, m_elQueue.size());
++    }
++    return false;
++  }
++
++  auto f = FindPts(m_elFrames, pts);
++  frame = av_frame_clone(f->second.frame);
++  meta = f->second.meta;
++
++  // everything older is not needed any more
++  for (auto it = m_elFrames.begin(); it != f;)
++  {
++    av_frame_free(&it->second.frame);
++    it = m_elFrames.erase(it);
++  }
++  return frame != nullptr;
++}
++
++void CAMLDvFel::GpuThread(std::promise<bool> ready)
++{
++  bool announced = false;
++  auto fail = [&](const char* what) {
++    CLog::Log(LOGERROR, "CAMLDvFel: {}", what);
++    if (!announced)
++      ready.set_value(false);
++    announced = true;
++  };
++
++  int dev = -1, heap = -1, drm = -1;
++  struct gbm_device* gbm = nullptr;
++  EGLDisplay dpy = EGL_NO_DISPLAY;
++  EGLContext ctx = EGL_NO_CONTEXT;
++  struct felgpu* fel = nullptr;
++  dvfel_reg_bufs reg{};
++  GLuint tin[GPU_BUFFERS]{}, tout[GPU_BUFFERS]{}, fout[GPU_BUFFERS]{};
++  EGLImageKHR images[GPU_BUFFERS * 2]{};
++  int nimg = 0;
++
++  auto createImage = PFNEGLCREATEIMAGEKHRPROC(eglGetProcAddress("eglCreateImageKHR"));
++  auto destroyImage = PFNEGLDESTROYIMAGEKHRPROC(eglGetProcAddress("eglDestroyImageKHR"));
++  auto targetTexture =
++      PFNGLEGLIMAGETARGETTEXTURE2DOESPROC(eglGetProcAddress("glEGLImageTargetTexture2DOES"));
++  auto importTex = [&](int fd) -> GLuint {
++    const EGLint attr[] = {EGL_WIDTH, m_width, EGL_HEIGHT, m_height,
++                           EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_ABGR8888,
++                           EGL_DMA_BUF_PLANE0_FD_EXT, fd,
++                           EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
++                           EGL_DMA_BUF_PLANE0_PITCH_EXT, m_width * 4,
++                           EGL_NONE};
++    EGLImageKHR img = createImage(dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attr);
++    if (img == EGL_NO_IMAGE_KHR)
++      return 0;
++    images[nimg++] = img;
++    GLuint tex;
++    glGenTextures(1, &tex);
++    glBindTexture(GL_TEXTURE_2D, tex);
++    targetTexture(GL_TEXTURE_2D, img);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    return glGetError() == GL_NO_ERROR ? tex : 0;
++  };
++
++  do
++  {
++    if (!createImage || !destroyImage || !targetTexture)
++    {
++      fail("EGL image extensions missing");
++      break;
++    }
++    drm = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
++    gbm = drm >= 0 ? gbm_create_device(drm) : nullptr;
++    auto getPlatformDisplay =
++        PFNEGLGETPLATFORMDISPLAYEXTPROC(eglGetProcAddress("eglGetPlatformDisplayEXT"));
++    if (!gbm || !getPlatformDisplay)
++    {
++      fail("no GBM render device");
++      break;
++    }
++    dpy = getPlatformDisplay(EGL_PLATFORM_GBM_KHR, gbm, nullptr);
++    EGLint maj, min;
++    if (dpy == EGL_NO_DISPLAY || !eglInitialize(dpy, &maj, &min))
++    {
++      fail("eglInitialize failed");
++      break;
++    }
++    eglBindAPI(EGL_OPENGL_ES_API);
++    const EGLint ctxAttr[] = {EGL_CONTEXT_MAJOR_VERSION, 3, EGL_CONTEXT_MINOR_VERSION, 2, EGL_NONE};
++    ctx = eglCreateContext(dpy, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, ctxAttr);
++    if (ctx == EGL_NO_CONTEXT || !eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx))
++    {
++      fail("cannot create a surfaceless GLES 3.2 context");
++      break;
++    }
++
++    fel = felgpu_create(m_width, m_height, EL_TAPS);
++    if (!fel)
++    {
++      fail("felgpu_create failed");
++      break;
++    }
++
++    dev = open(DVFEL_DEV, O_RDWR | O_CLOEXEC);
++    heap = open("/dev/dma_heap/heap-codecmm", O_RDWR | O_CLOEXEC);
++    if (dev < 0 || heap < 0)
++    {
++      fail("cannot open /dev/dvfel or the codec_mm dma heap");
++      break;
++    }
++    reg.width = m_width;
++    reg.height = m_height;
++    reg.count = GPU_BUFFERS;
++    bool ok = true;
++    for (int i = 0; i < GPU_BUFFERS && ok; i++)
++    {
++      for (int o = 0; o < 2 && ok; o++)
++      {
++        dma_heap_allocation_data a{};
++        a.len = DVFEL_BUF_SIZE(m_width, m_height);
++        a.fd_flags = O_RDWR | O_CLOEXEC;
++        ok = ioctl(heap, DMA_HEAP_IOCTL_ALLOC, &a) == 0;
++        if (ok)
++          (o ? reg.out_fd : reg.in_fd)[i] = a.fd;
++      }
++      if (ok)
++      {
++        tin[i] = importTex(reg.in_fd[i]);
++        tout[i] = importTex(reg.out_fd[i]);
++        ok = tin[i] && tout[i];
++      }
++      if (ok)
++      {
++        glGenFramebuffers(1, &fout[i]);
++        glBindFramebuffer(GL_FRAMEBUFFER, fout[i]);
++        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tout[i], 0);
++        ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
++      }
++    }
++    if (!ok)
++    {
++      fail("cannot allocate or import the frame buffers");
++      break;
++    }
++    glFinish();
++    if (ioctl(dev, DVFEL_IOC_REG_BUFS, &reg) < 0)
++    {
++      fail("DVFEL_IOC_REG_BUFS failed");
++      break;
++    }
++    ready.set_value(true);
++    announced = true;
++    CLog::Log(LOGINFO, "CAMLDvFel: GPU compositor ready ({})",
++              reinterpret_cast<const char*>(glGetString(GL_RENDERER)));
++
++    std::shared_ptr<felgpu_meta> current;
++    const int64_t dumpPts = DumpPts();
++    while (!m_stop)
++    {
++      dvfel_job job{};
++      job.timeout_ms = 100;
++      if (ioctl(dev, DVFEL_IOC_WAIT_JOB, &job) < 0)
++      {
++        if (errno == ETIMEDOUT || errno == EINTR)
++          continue;
++        CLog::Log(LOGERROR, "CAMLDvFel: DVFEL_IOC_WAIT_JOB failed: {}", strerror(errno));
++        break;
++      }
++
++      dvfel_job_done done{};
++      done.id = job.id;
++      done.status = DVFEL_DONE_PASSTHROUGH;
++
++      AVFrame* el = nullptr;
++      std::shared_ptr<felgpu_meta> meta;
++      if (job.buf < GPU_BUFFERS && WaitForFrame(static_cast<int64_t>(job.pts_us), el, meta))
++      {
++        const auto t0 = std::chrono::steady_clock::now();
++        if (dumpPts >= 0 && static_cast<int64_t>(job.pts_us) == dumpPts)
++        {
++          DumpFrame(el, *meta);
++          CLog::Log(LOGINFO, "CAMLDvFel: dumped EL frame pts {} (EL frame pts {})", dumpPts, el->pts);
++        }
++        if (meta != current)
++        {
++          felgpu_set_meta(fel, meta.get());
++          current = meta;
++        }
++        felgpu_set_el(fel, reinterpret_cast<const uint16_t*>(el->data[0]), el->linesize[0] / 2,
++                      reinterpret_cast<const uint16_t*>(el->data[1]),
++                      reinterpret_cast<const uint16_t*>(el->data[2]), el->linesize[1] / 2);
++        felgpu_run(fel, tin[job.buf], fout[job.buf]);
++        glFinish();
++        m_gpuMsSum += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++        done.status = DVFEL_DONE_COMPOSED;
++        m_composed++;
++      }
++      else
++      {
++        m_passthrough++;
++      }
++      av_frame_free(&el);
++      ioctl(dev, DVFEL_IOC_JOB_DONE, &done);
++    }
++  } while (false);
++
++  if (dev >= 0)
++  {
++    ioctl(dev, DVFEL_IOC_UNREG_BUFS);
++    close(dev);
++  }
++  if (fel)
++    felgpu_destroy(fel);
++  if (ctx != EGL_NO_CONTEXT)
++  {
++    glDeleteFramebuffers(GPU_BUFFERS, fout);
++    glDeleteTextures(GPU_BUFFERS, tin);
++    glDeleteTextures(GPU_BUFFERS, tout);
++    for (int i = 0; i < nimg; i++)
++      destroyImage(dpy, images[i]);
++    eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++    eglDestroyContext(dpy, ctx);
++  }
++  if (dpy != EGL_NO_DISPLAY)
++    eglTerminate(dpy);
++  for (int i = 0; i < GPU_BUFFERS; i++)
++  {
++    if (reg.in_fd[i] > 0)
++      close(reg.in_fd[i]);
++    if (reg.out_fd[i] > 0)
++      close(reg.out_fd[i]);
++  }
++  if (heap >= 0)
++    close(heap);
++  if (gbm)
++    gbm_device_destroy(gbm);
++  if (drm >= 0)
++    close(drm);
++  if (!announced)
++    ready.set_value(false);
++}
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.h
+new file mode 100644
+index 0000000..eb6264f
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.h
+@@ -0,0 +1,119 @@
++/*
++ *  Copyright (C) 2026 Team CoreELEC
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include "utils/BitstreamConverter.h"
++
++#include <atomic>
++#include <condition_variable>
++#include <cstdint>
++#include <deque>
++#include <future>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <thread>
++#include <vector>
++
++struct AVFrame;
++struct felgpu_meta;
++
++/*
++ * Dolby Vision profile 7 FEL composition on Amlogic S5 (S928X), whose Dolby
++ * Vision hardware has no enhancement layer input.
++ *
++ * The hardware decoder still decodes the base layer and the bitstream
++ * converter rewrites the RPU to profile 8.1 with a no-op mapping. The dvfel
++ * kernel node (/dev/dvfel), inserted between the decoder and the display,
++ * hands every decoded base layer frame to this class, which composes it on
++ * the GPU with the enhancement layer (decoded here in software) and the
++ * original RPU mapping, so the display shows the full FEL reconstruction.
++ *
++ * Data flow per packet: the converter reports the original RPU and the EL
++ * NAL units through IDoviElSink while converting; CommitPacket() queues them
++ * for the EL decoder, and a decoded EL picture is filed with its RPU under
++ * the pts of the packet that carried it; the kernel reports the base layer
++ * pts with each frame. The EL may also be coded in another picture order
++ * than the base layer (e.g. B frames over an I/P base layer); once that
++ * shows, EL pictures are paired by display order like the hardware
++ * composers do: each takes the earliest packet pts not handed out yet.
++ */
++class CAMLDvFel : public IDoviElSink
++{
++public:
++  CAMLDvFel() = default;
++  ~CAMLDvFel() override;
++
++  // the dvfel kernel node is loaded
++  static bool IsAvailable();
++
++  // Starts EL decoding and the GPU compositor and routes the decoder output
++  // through dvfel. Must be called before the hardware decoder is opened.
++  bool Start(int width, int height);
++  void Stop();
++  bool IsStarted() const { return m_started; }
++
++  // seek / flush
++  void Reset();
++
++  // the data collected by the sink belongs to the packet with this pts
++  void CommitPacket(double pts);
++  // forget what the sink collected (packet not queued to the decoder)
++  void DropPacket();
++
++  // IDoviElSink
++  void OnDoviRpu(const uint8_t* nal, uint32_t size) override;
++  void OnDoviElNal(const uint8_t* nal, uint32_t size) override;
++
++private:
++  struct ElPacket
++  {
++    int64_t pts;
++    std::vector<uint8_t> data; // Annex-B
++    std::shared_ptr<felgpu_meta> meta; // the RPU travels with the EL picture
++    bool flush;
++  };
++  struct ElFrame
++  {
++    AVFrame* frame;
++    std::shared_ptr<felgpu_meta> meta;
++  };
++
++  void ElThread();
++  void GpuThread(std::promise<bool> ready);
++  bool WaitForFrame(int64_t pts, AVFrame*& frame, std::shared_ptr<felgpu_meta>& meta);
++  void RouteThroughDvfel(bool enable);
++
++  int m_width{0};
++  int m_height{0};
++  bool m_started{false};
++  std::atomic<bool> m_stop{false};
++
++  // per packet, filled by the sink (decode thread)
++  std::vector<uint8_t> m_pendingRpu;
++  std::vector<uint8_t> m_pendingEl;
++  std::shared_ptr<felgpu_meta> m_lastMeta;
++
++  std::mutex m_lock;
++  std::condition_variable m_elCond;    // EL input queue
++  std::condition_variable m_readyCond; // new EL frame
++  std::deque<ElPacket> m_elQueue;
++  std::map<int64_t, ElFrame> m_elFrames; // by display pts
++  int64_t m_lastJobPts{INT64_MIN}; // last frame the kernel asked for
++  int m_noPairLogged{0};           // since start or the last seek
++
++  std::thread m_elThread;
++  std::thread m_gpuThread;
++
++  // statistics
++  std::atomic<uint64_t> m_composed{0};
++  std::atomic<uint64_t> m_passthrough{0};
++  std::atomic<uint64_t> m_elDecoded{0};
++  double m_gpuMsSum{0};
++};
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/CMakeLists.txt b/xbmc/cores/VideoPlayer/DVDCodecs/Video/CMakeLists.txt
+index 6e8283c..4bdb078 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/CMakeLists.txt
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/CMakeLists.txt
+@@ -14,9 +14,14 @@ endif()
+ 
+ if(TARGET ${APP_NAME_LC}::AML)
+   list(APPEND SOURCES AMLCodec.cpp
+-                      DVDVideoCodecAmlogic.cpp)
++                      AMLDvFel.cpp
++                      DVDVideoCodecAmlogic.cpp
++                      felgpu.c)
+   list(APPEND HEADERS AMLCodec.h
+-                      DVDVideoCodecAmlogic.h)
++                      AMLDvFel.h
++                      DVDVideoCodecAmlogic.h
++                      dvfel_uapi.h
++                      felgpu.h)
+ endif()
+ 
+ if(CORE_SYSTEM_NAME STREQUAL windows OR CORE_SYSTEM_NAME STREQUAL windowsstore)
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.cpp
+index 1a79460..4d8bfe0 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.cpp
+@@ -348,6 +348,14 @@ bool CDVDVideoCodecAmlogic::Open(CDVDStreamInfo &hints, CDVDCodecOptions &option
+             m_hints.dovi.el_present_flag = false;
+             m_bitstream->SetConvertDovi(true);
+             m_streamMeta.flags.push_back("converted");
++
++            // compose the enhancement layer on the GPU instead of dropping it;
++            // started with the decoder once the stream is known to be FEL
++            if (hints.dovi.dv_profile == 7 && CAMLDvFel::IsAvailable())
++            {
++              m_dvFel = std::make_unique<CAMLDvFel>();
++              m_bitstream->SetDoviElSink(m_dvFel.get());
++            }
+           }
+         }
+       }
+@@ -476,6 +484,14 @@ void CDVDVideoCodecAmlogic::Close(void)
+   if (m_Codec)
+     m_Codec->CloseDecoder(), m_Codec = nullptr;
+ 
++  if (m_dvFel)
++  {
++    if (m_bitstream)
++      m_bitstream->SetDoviElSink(nullptr);
++    m_dvFel->Stop();
++    m_dvFel.reset();
++  }
++
+   m_videobuffer.iFlags = 0;
+ 
+   if (m_mpeg2_sequence)
+@@ -499,12 +515,18 @@ bool CDVDVideoCodecAmlogic::AddData(const DemuxPacket &packet)
+ 
+   DrainMetadataToClock();
+ 
++  // what the EL sink collects during this call belongs to this packet only
++  if (m_dvFel)
++    m_dvFel->DropPacket();
++
+   uint8_t *pData(packet.pData);
+   uint32_t iSize(packet.iSize);
+   bool doviIsFEL = false;
+   bool IsHdr10Plus = false;
+   int data_added = false;
+   bool dual_layer_converted = false;
++  // timestamps of the base layer, and of the layer carrying the RPU and EL
++  double blDts = packet.dts, blPts = packet.pts, elPts = packet.pts;
+ 
+   if (pData)
+   {
+@@ -564,6 +586,7 @@ bool CDVDVideoCodecAmlogic::AddData(const DemuxPacket &packet)
+               dual_layer_converted = m_bitstream->Convert(pData, iSize, pDataBackup, iSizeBackup);
+               if (dual_layer_converted)
+               {
++                elPts = std::get<4>(dual_layer_packet);
+                 m_pendingMeta = m_streamMeta;
+                 AMLLatchHevcDoviRpu(pDataBackup, iSizeBackup, m_nalLengthSize, m_pendingMeta);
+                 AMLLatchHevcSei(pData, iSize, m_nalLengthSize, m_pendingMeta);
+@@ -576,6 +599,10 @@ bool CDVDVideoCodecAmlogic::AddData(const DemuxPacket &packet)
+               dual_layer_converted = m_bitstream->Convert(pDataBackup, iSizeBackup, pData, iSize);
+               if (dual_layer_converted)
+               {
++                // the pair was completed by its EL: the decoder takes the
++                // base layer timestamps
++                blDts = std::get<3>(dual_layer_packet);
++                blPts = std::get<4>(dual_layer_packet);
+                 m_pendingMeta = m_streamMeta;
+                 AMLLatchHevcDoviRpu(packet.pData, packet.iSize, m_nalLengthSize, m_pendingMeta);
+                 AMLLatchHevcSei(pDataBackup, iSizeBackup, m_nalLengthSize, m_pendingMeta);
+@@ -589,7 +616,8 @@ bool CDVDVideoCodecAmlogic::AddData(const DemuxPacket &packet)
+           // backup package and don't send to decoder yet
+           uint8_t *pDataBackup = static_cast<uint8_t*>(KODI::MEMORY::AlignedMalloc(packet.iSize + AV_INPUT_BUFFER_PADDING_SIZE, 16));
+           memcpy(pDataBackup, packet.pData, packet.iSize);
+-          m_packages.push_back(std::make_tuple(pDataBackup, iSize, packet.isELPackage));
++          m_packages.push_back(
++              std::make_tuple(pDataBackup, iSize, packet.isELPackage, packet.dts, packet.pts));
+           CLog::Log(LOGDEBUG, LOGVIDEO, "CDVDVideoCodecAmlogic::{}: did add {} package with dts: {:.3f}, pts: {:.3f} and size {} in list", __FUNCTION__,
+             packet.isELPackage ? "EL" : "BL", packet.dts/DVD_TIME_BASE, packet.pts/DVD_TIME_BASE, packet.iSize);
+ 
+@@ -634,16 +662,25 @@ bool CDVDVideoCodecAmlogic::AddData(const DemuxPacket &packet)
+       else
+         m_has_keyframe = true;
+     }
+-    FrameRateTracking( pData, iSize, packet.dts, packet.pts);
++    FrameRateTracking( pData, iSize, blDts, blPts);
+ 
+     if (!m_opened)
+     {
+-      if (packet.pts == DVD_NOPTS_VALUE)
++      if (blPts == DVD_NOPTS_VALUE)
+         m_hints.ptsinvalid = true;
+ 
+       m_processInfo.SetDoviIsFEL(doviIsFEL);
+       m_processInfo.SetIsHdr10Plus(IsHdr10Plus);
+ 
++      // the dvfel node has to be routed in before the decoder registers
++      if (m_dvFel && !(doviIsFEL && m_dvFel->Start(m_hints.width, m_hints.height)))
++      {
++        m_bitstream->SetDoviElSink(nullptr);
++        m_dvFel.reset();
++      }
++      if (m_dvFel)
++        m_streamMeta.flags.push_back("fel-composed");
++
+       CLog::Log(LOGINFO, "CDVDVideoCodecAmlogic::{}: Open decoder: fps:{:d}/{:d}", __FUNCTION__, m_hints.fpsrate, m_hints.fpsscale);
+       if (m_Codec && !m_Codec->OpenDecoder(m_hints, doviIsFEL))
+         CLog::Log(LOGERROR, "CDVDVideoCodecAmlogic::{}: Failed to open Amlogic Codec", __FUNCTION__);
+@@ -680,18 +717,27 @@ bool CDVDVideoCodecAmlogic::AddData(const DemuxPacket &packet)
+     }
+   }
+ 
+-  data_added = m_Codec->AddData(pData, iSize, packet.dts, m_hints.ptsinvalid ? DVD_NOPTS_VALUE : packet.pts);
++  data_added = m_Codec->AddData(pData, iSize, blDts, m_hints.ptsinvalid ? DVD_NOPTS_VALUE : blPts);
++
++  if (m_dvFel)
++  {
++    if (data_added && packet.pData && !m_hints.ptsinvalid && blPts != DVD_NOPTS_VALUE &&
++        elPts != DVD_NOPTS_VALUE)
++      m_dvFel->CommitPacket(elPts);
++    else
++      m_dvFel->DropPacket();
++  }
+ 
+   if (data_added && packet.pData)
+   {
+     m_pendingMeta.Inherit(m_lastMeta);
+     m_lastMeta = m_pendingMeta;
+-    if (m_hints.ptsinvalid || packet.pts == DVD_NOPTS_VALUE)
++    if (m_hints.ptsinvalid || blPts == DVD_NOPTS_VALUE)
+       CAMLFrameMetadataStore::GetInstance().Publish(m_metadataToken, m_pendingMeta);
+     else
+     {
+-      m_metadataSequencer.Commit(packet.pts, m_pendingMeta);
+-      m_lastCommitPts = packet.pts;
++      m_metadataSequencer.Commit(blPts, m_pendingMeta);
++      m_lastCommitPts = blPts;
+     }
+     m_pendingMeta = m_streamMeta;
+   }
+@@ -760,6 +806,9 @@ void CDVDVideoCodecAmlogic::Reset(void)
+ {
+   m_Codec->Reset();
+ 
++  if (m_dvFel)
++    m_dvFel->Reset();
++
+   while (!m_packages.empty())
+   {
+     DLDemuxPacket dual_layer_packet= m_packages.front();
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.h
+index bea43af..a0626fa 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.h
+@@ -8,6 +8,7 @@
+ 
+ #pragma once
+ 
++#include "AMLDvFel.h"
+ #include "AMLFrameMetadata.h"
+ #include "DVDVideoCodec.h"
+ #include "DVDStreamInfo.h"
+@@ -26,7 +27,8 @@ class CBitstreamConverter;
+ 
+ class CDVDVideoCodecAmlogic;
+ 
+-typedef std::tuple<uint8_t*, uint32_t, bool> DLDemuxPacket;
++// data, size, is EL, dts, pts
++typedef std::tuple<uint8_t*, uint32_t, bool, double, double> DLDemuxPacket;
+ 
+ class CAMLVideoBuffer : public CVideoBuffer
+ {
+@@ -107,6 +109,8 @@ protected:
+ 
+   CBitstreamParser *m_bitparser;
+   CBitstreamConverter *m_bitstream;
++  // profile 7 FEL composition on S5 (dvfel kernel node + GPU)
++  std::unique_ptr<CAMLDvFel> m_dvFel;
+ private:
+   std::shared_ptr<CAMLVideoBufferPool> m_videoBufferPool;
+   static std::atomic<bool> m_InstanceGuard;
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/dvfel_uapi.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/dvfel_uapi.h
+new file mode 100644
+index 0000000..91c6636
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/dvfel_uapi.h
+@@ -0,0 +1,65 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later WITH Linux-syscall-note */
++/*
++ * dvfel userspace interface (/dev/dvfel)
++ *
++ * A compositor process (Kodi) registers pairs of linear frame buffers
++ * allocated from /dev/dma_heap/heap-codecmm. For every decoded frame dvfel
++ * decompresses the base layer into in[buf] and posts a job; the compositor
++ * writes the composed frame into out[buf] and reports completion. dvfel then
++ * compresses out[buf] for display. Jobs are posted in display order.
++ *
++ * Buffer layout (both directions): width x height pixels, one little-endian
++ * 32-bit word per pixel, stride = width * 4 bytes:
++ *   bits  0- 9  Cr (10-bit)
++ *   bits 10-19  Cb (10-bit)
++ *   bits 20-29  Y  (10-bit)
++ *   bits 30-31  0
++ * In in[buf], chroma at even x and even y is the original 4:2:0 sample; odd
++ * positions are interpolated. dvfel converts out[buf] back to 4:2:0 by
++ * keeping the chroma at even x/y.
++ */
++#ifndef _UAPI_DVFEL_H
++#define _UAPI_DVFEL_H
++
++#include <linux/ioctl.h>
++#include <linux/types.h>
++
++#define DVFEL_MAX_BUFS		4
++/* bytes needed per buffer (includes a write-MIF margin) */
++#define DVFEL_BUF_SIZE(w, h)	((((w) * 4 * (h) + 256 * 1024) + 4095) & ~4095)
++
++struct dvfel_reg_bufs {
++	__u32 width;
++	__u32 height;
++	__u32 count;			/* 1..DVFEL_MAX_BUFS */
++	__s32 in_fd[DVFEL_MAX_BUFS];	/* dma-buf fds */
++	__s32 out_fd[DVFEL_MAX_BUFS];
++};
++
++#define DVFEL_JOB_NEW_STREAM	(1 << 0)	/* first job after start/seek */
++
++struct dvfel_job {
++	__u32 timeout_ms;		/* in: max wait */
++	__u32 id;			/* out */
++	__u32 buf;			/* out: buffer pair index */
++	__u32 width;			/* out */
++	__u32 height;			/* out */
++	__u32 flags;			/* out: DVFEL_JOB_* */
++	__u64 pts_us;			/* out: vframe pts_us64 (Kodi packet pts) */
++};
++
++#define DVFEL_DONE_COMPOSED	0	/* out[buf] holds the frame */
++#define DVFEL_DONE_PASSTHROUGH	1	/* show in[buf] unchanged */
++
++struct dvfel_job_done {
++	__u32 id;
++	__s32 status;			/* DVFEL_DONE_* */
++};
++
++#define DVFEL_IOC_MAGIC		'F'
++#define DVFEL_IOC_REG_BUFS	_IOW(DVFEL_IOC_MAGIC, 1, struct dvfel_reg_bufs)
++#define DVFEL_IOC_WAIT_JOB	_IOWR(DVFEL_IOC_MAGIC, 2, struct dvfel_job)
++#define DVFEL_IOC_JOB_DONE	_IOW(DVFEL_IOC_MAGIC, 3, struct dvfel_job_done)
++#define DVFEL_IOC_UNREG_BUFS	_IO(DVFEL_IOC_MAGIC, 4)
++
++#endif
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.c b/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.c
+new file mode 100644
+index 0000000..b0b9fac
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.c
+@@ -0,0 +1,569 @@
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#endif
++/*
++ * felgpu - Dolby Vision FEL composition on OpenGL ES 3.2 (see felgpu.h)
++ *
++ * Passes per frame:
++ *   1. EL luma, vertical 2x Lanczos-3            (w/2 x h,   R32F)
++ *   2. EL chroma, vertical 2x Lanczos-3          (w/4 x h/2, RG32F)
++ *   3. chroma: horizontal EL step, NLQ, MMR or polynomial prediction on the
++ *      4:2:0 grid                                (w/2 x h/2, RG16UI)
++ *   4. luma: horizontal EL step, NLQ, polynomial prediction, pack the
++ *      output words                              (w x h, dma-buf)
++ *
++ * Luma prediction and the NLQ are functions of a single 10-bit code, so
++ * they are evaluated on the CPU into a lookup texture once per frame;
++ * polynomial-only chroma mappings use the same table.
++ */
++#include <math.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++
++#include "felgpu.h"
++
++#define LUT_W       1024
++#define LUT_ROWS    6       /* pred Y, NLQ Y, NLQ Cb, NLQ Cr, pred Cb, pred Cr */
++
++struct felgpu {
++    int w, h, taps;
++    GLuint p_vert1, p_vert2, p_chroma, p_luma;
++    GLuint el_y, el_cb, el_cr;      /* uploaded EL planes, R16UI */
++    GLuint el_yv, el_cv;            /* vertically upsampled, R32F / RG32F */
++    GLuint fbo_yv, fbo_cv;
++    GLuint chroma, fbo_chroma;      /* composed 4:2:0 chroma, RG16UI */
++    GLuint lut;                     /* R32F LUT_W x LUT_ROWS */
++    float vwt_y[12], vwt_c[12], hwt_y[12], hwt_c[12];
++    int vbase_y[2], vbase_c[2], hbase_y[2], hbase_c[2];
++
++    /* per frame uniforms */
++    int use_el;
++    float el_max, inv_bl;
++    float piv[27];
++    int npiv[3];
++    int cpoly[2];
++    float mmr[96][4];
++    float mmrc[16];
++    float lutbuf[LUT_ROWS][LUT_W];
++
++    int profile;
++    double prof_ms[4], prof_t;
++    long prof_n;
++};
++
++/* ------------------------------------------------------------------ */
++/* shaders                                                            */
++/* ------------------------------------------------------------------ */
++
++/* program() prepends "#version 320 es" and "#define TAPS n" */
++#define GLSL_HEAD \
++    "precision highp float;\n" \
++    "precision highp int;\n" \
++    "precision highp usampler2D;\n" \
++    "precision highp sampler2D;\n"
++
++/* the dma-buf is sampled as RGBA8 = one 32-bit pixel word Cr|Cb<<10|Y<<20 */
++#define GLSL_WORD \
++    "uint word_at(sampler2D t, ivec2 p) { return packUnorm4x8(texelFetch(t, p, 0)); }\n" \
++    "uint y_of(uint w) { return (w >> 20) & 1023u; }\n" \
++    "uint cb_of(uint w) { return (w >> 10) & 1023u; }\n" \
++    "uint cr_of(uint w) { return w & 1023u; }\n" \
++    "vec4 pack_px(uint y, uint cb, uint cr) { return unpackUnorm4x8(cr | (cb << 10) | (y << 20)); }\n" \
++    "uniform sampler2D lut;\n" \
++    "float lut_at(int row, uint i) { return texelFetch(lut, ivec2(int(min(i, 1023u)), row), 0).x; }\n" \
++    "uint out10(float v) { return uint(clamp(floor(v * 1024.0 + 0.5), 0.0, 1023.0)); }\n"
++
++/* horizontal 2x EL step + rounding to an integer EL code */
++#define GLSL_EL_H \
++    "uniform float hwt[12];\n" \
++    "uniform int hbase[2];\n" \
++    "uniform float el_max;\n" \
++    "vec2 el_h(sampler2D t, ivec2 p) {\n" \
++    "  int ph = p.x & 1;\n" \
++    "  int w = textureSize(t, 0).x;\n" \
++    "  int b = (p.x >> 1) + hbase[ph];\n" \
++    "  vec2 acc = vec2(0.0);\n" \
++    "  for (int k = 0; k < TAPS; k++)\n" \
++    "    acc += hwt[ph * TAPS + k] * texelFetch(t, ivec2(clamp(b + k, 0, w - 1), p.y), 0).xy;\n" \
++    "  return clamp(floor(acc + 0.5), 0.0, el_max);\n" \
++    "}\n"
++
++static const char *vs_src =
++    "#version 320 es\n"
++    "void main() {\n"
++    "  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));\n"
++    "  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
++    "}\n";
++
++/* vertical 2x upsampling of the EL chroma: src0 (Cb) -> .x, src1 (Cr) -> .y */
++static const char *fs_el_vert2 =
++    GLSL_HEAD
++    "uniform usampler2D src0;\n"
++    "uniform usampler2D src1;\n"
++    "uniform float wt[12];\n"
++    "uniform int base[2];\n"
++    "out vec2 o;\n"
++    "void main() {\n"
++    "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
++    "  int ph = p.y & 1;\n"
++    "  int h = textureSize(src0, 0).y;\n"
++    "  int b = (p.y >> 1) + base[ph];\n"
++    "  vec2 acc = vec2(0.0);\n"
++    "  for (int t = 0; t < TAPS; t++) {\n"
++    "    ivec2 q = ivec2(p.x, clamp(b + t, 0, h - 1));\n"
++    "    acc += wt[ph * TAPS + t] * vec2(float(texelFetch(src0, q, 0).x), float(texelFetch(src1, q, 0).x));\n"
++    "  }\n"
++    "  o = acc;\n"
++    "}\n";
++
++/* vertical 2x upsampling of the EL luma */
++static const char *fs_el_vert1 =
++    GLSL_HEAD
++    "uniform usampler2D src0;\n"
++    "uniform float wt[12];\n"
++    "uniform int base[2];\n"
++    "out float o;\n"
++    "void main() {\n"
++    "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
++    "  int ph = p.y & 1;\n"
++    "  int h = textureSize(src0, 0).y;\n"
++    "  int b = (p.y >> 1) + base[ph];\n"
++    "  float acc = 0.0;\n"
++    "  for (int t = 0; t < TAPS; t++)\n"
++    "    acc += wt[ph * TAPS + t] * float(texelFetch(src0, ivec2(p.x, clamp(b + t, 0, h - 1)), 0).x);\n"
++    "  o = acc;\n"
++    "}\n";
++
++/*
++ * chroma: one fragment per 4:2:0 sample. MMR coefficients per chroma
++ * component cc (0 Cb, 1 Cr) and piece k at mmr[(cc*8+k)*6 + 2*order + 0/1]:
++ * (y, cb, cr, 0) and (y*cb, y*cr, cb*cr, y*cb*cr); unused orders are zero.
++ * Polynomial pieces are converted to this form on the CPU.
++ */
++static const char *fs_chroma =
++    GLSL_HEAD GLSL_WORD GLSL_EL_H
++    "uniform sampler2D bl;\n"
++    "uniform sampler2D elc;\n"
++    "uniform float piv[27];\n"
++    "uniform int npiv[3];\n"
++    "uniform vec4 mmr[96];\n"
++    "uniform float mmrc[16];\n"
++    "uniform bool cpoly[2];\n"
++    "uniform bool use_el;\n"
++    "uniform float inv_bl;\n"
++    "out uvec2 o;\n"
++    "float predict_mmr(int cc, float s, vec3 sig) {\n"
++    "  int c = cc + 1, n = npiv[c], k = 0;\n"
++    "  s = clamp(s, piv[c * 9], piv[c * 9 + n - 1]);\n"
++    "  for (int i = 1; i < 8; i++)\n"
++    "    k += (i < n - 1 && s >= piv[c * 9 + i]) ? 1 : 0;\n"
++    "  int b = (cc * 8 + k) * 6;\n"
++    "  vec4 xx = vec4(sig.x * sig.y, sig.x * sig.z, sig.y * sig.z, sig.x * sig.y * sig.z);\n"
++    "  vec3 x2 = sig * sig; vec4 xx2 = xx * xx;\n"
++    "  return mmrc[cc * 8 + k]\n"
++    "       + dot(mmr[b].xyz, sig) + dot(mmr[b + 1], xx)\n"
++    "       + dot(mmr[b + 2].xyz, x2) + dot(mmr[b + 3], xx2)\n"
++    "       + dot(mmr[b + 4].xyz, x2 * sig) + dot(mmr[b + 5], xx2 * xx);\n"
++    "}\n"
++    "void main() {\n"
++    "  ivec2 c = ivec2(gl_FragCoord.xy);\n"
++    "  ivec2 p = c * 2;\n"
++    "  int W = textureSize(bl, 0).x;\n"
++    "  uint w0 = word_at(bl, p);\n"
++    "  uint cb = cb_of(w0), cr = cr_of(w0);\n"
++    "  float vcb, vcr;\n"
++    "  if (cpoly[0] && cpoly[1]) {\n"
++    "    vcb = lut_at(4, cb);\n"
++    "    vcr = lut_at(5, cr);\n"
++    "  } else {\n"
++    /* luma for MMR: h (y[2n-1] + 2 y[2n] + y[2n+1] + 2) >> 2 on 2 rows, v (a + b + 1) >> 1 */
++    "    int xl = max(p.x - 1, 0), xr = min(p.x + 1, W - 1);\n"
++    "    uint h0 = (y_of(word_at(bl, ivec2(xl, p.y))) + 2u * y_of(w0) +\n"
++    "               y_of(word_at(bl, ivec2(xr, p.y))) + 2u) >> 2;\n"
++    "    uint h1 = (y_of(word_at(bl, ivec2(xl, p.y + 1))) + 2u * y_of(word_at(bl, ivec2(p.x, p.y + 1))) +\n"
++    "               y_of(word_at(bl, ivec2(xr, p.y + 1))) + 2u) >> 2;\n"
++    "    vec3 sig = vec3(float(min((h0 + h1 + 1u) >> 1, 1023u)), float(cb), float(cr)) * inv_bl;\n"
++    "    vcb = cpoly[0] ? lut_at(4, cb) : predict_mmr(0, sig.y, sig);\n"
++    "    vcr = cpoly[1] ? lut_at(5, cr) : predict_mmr(1, sig.z, sig);\n"
++    "  }\n"
++    "  if (use_el) {\n"
++    "    vec2 el = el_h(elc, c);\n"
++    "    vcb += lut_at(2, uint(el.x));\n"
++    "    vcr += lut_at(3, uint(el.y));\n"
++    "  }\n"
++    "  o = uvec2(out10(vcb), out10(vcr));\n"
++    "}\n";
++
++/* luma + packing: one fragment per output pixel word */
++static const char *fs_luma =
++    GLSL_HEAD GLSL_WORD GLSL_EL_H
++    "uniform sampler2D bl;\n"
++    "uniform sampler2D ely;\n"
++    "uniform usampler2D chroma;\n"
++    "uniform bool use_el;\n"
++    "out vec4 o;\n"
++    "void main() {\n"
++    "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
++    "  uint w = word_at(bl, p);\n"
++    "  uvec2 c = texelFetch(chroma, p >> 1, 0).xy;\n"
++    "  float v = lut_at(0, y_of(w));\n"
++    "  if (use_el)\n"
++    "    v += lut_at(1, uint(el_h(ely, p).x));\n"
++    "  o = pack_px(out10(v), c.x, c.y);\n"
++    "}\n";
++
++/* ------------------------------------------------------------------ */
++/* GL helpers                                                         */
++/* ------------------------------------------------------------------ */
++
++static GLuint compile(GLenum type, const char *src)
++{
++    GLuint s = glCreateShader(type);
++    glShaderSource(s, 1, &src, NULL);
++    glCompileShader(s);
++    GLint ok;
++    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
++    if (!ok) {
++        char log[4096];
++        glGetShaderInfoLog(s, sizeof(log), NULL, log);
++        fprintf(stderr, "felgpu: shader compile failed:\n%s\n", log);
++        return 0;
++    }
++    return s;
++}
++
++static GLuint program(const char *fs, int taps)
++{
++    char *src = NULL;
++    if (asprintf(&src, "#version 320 es\n#define TAPS %d\n%s", taps, fs) < 0)
++        return 0;
++    GLuint v = compile(GL_VERTEX_SHADER, vs_src), f = compile(GL_FRAGMENT_SHADER, src);
++    free(src);
++    if (!v || !f)
++        return 0;
++    GLuint p = glCreateProgram();
++    glAttachShader(p, v);
++    glAttachShader(p, f);
++    glLinkProgram(p);
++    glDeleteShader(v);
++    glDeleteShader(f);
++    GLint ok;
++    glGetProgramiv(p, GL_LINK_STATUS, &ok);
++    if (!ok) {
++        char log[4096];
++        glGetProgramInfoLog(p, sizeof(log), NULL, log);
++        fprintf(stderr, "felgpu: link failed:\n%s\n", log);
++        return 0;
++    }
++    return p;
++}
++
++static GLuint make_tex(GLenum ifmt, int w, int h)
++{
++    GLuint tex;
++    glGenTextures(1, &tex);
++    glBindTexture(GL_TEXTURE_2D, tex);
++    glTexStorage2D(GL_TEXTURE_2D, 1, ifmt, w, h);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    return tex;
++}
++
++static GLuint make_fbo(GLuint tex)
++{
++    GLuint fbo;
++    glGenFramebuffers(1, &fbo);
++    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
++    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
++    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
++        fprintf(stderr, "felgpu: framebuffer incomplete\n");
++    return fbo;
++}
++
++static void bind_tex(GLuint p, const char *name, int unit, GLuint tex)
++{
++    glActiveTexture(GL_TEXTURE0 + unit);
++    glBindTexture(GL_TEXTURE_2D, tex);
++    glUniform1i(glGetUniformLocation(p, name), unit);
++}
++
++static void draw(GLuint fbo, int w, int h)
++{
++    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
++    glViewport(0, 0, w, h);
++    glDrawArrays(GL_TRIANGLES, 0, 3);
++}
++
++/* Lanczos with radius a (taps = 2a) */
++static double lanczos(double x, double a)
++{
++    x = fabs(x);
++    if (x < 1e-9) return 1.0;
++    if (x >= a) return 0.0;
++    return a * sin(M_PI * x) * sin(M_PI * x / a) / (M_PI * M_PI * x * x);
++}
++
++/* output index o maps to source position o / 2 + off */
++static void kernel(double off, int taps, float wt[12], int base[2])
++{
++    int r = taps / 2;
++    for (int ph = 0; ph < 2; ph++) {
++        double p = ph * 0.5 + off, sum = 0, w[6];
++        int i0 = (int)floor(p);
++        double f = p - i0;
++        base[ph] = i0 - (r - 1);
++        for (int t = 0; t < taps; t++)
++            sum += w[t] = lanczos((t - (r - 1)) - f, r);
++        for (int t = 0; t < taps; t++)
++            wt[ph * taps + t] = (float)(w[t] / sum);
++    }
++}
++
++static double now_ms(void)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
++}
++
++static void prof_mark(struct felgpu *f, int pass)
++{
++    if (!f->profile)
++        return;
++    glFinish();
++    double t = now_ms();
++    if (pass >= 0)
++        f->prof_ms[pass] += t - f->prof_t;
++    f->prof_t = t;
++}
++
++/* ------------------------------------------------------------------ */
++
++struct felgpu *felgpu_create(int w, int h, int taps)
++{
++    struct felgpu *f = calloc(1, sizeof(*f));
++    if (!f)
++        return NULL;
++    if (taps != 4 && taps != 6)
++        taps = 6;
++    f->w = w;
++    f->h = h;
++    f->taps = taps;
++    f->p_vert1 = program(fs_el_vert1, taps);
++    f->p_vert2 = program(fs_el_vert2, taps);
++    f->p_chroma = program(fs_chroma, taps);
++    f->p_luma = program(fs_luma, taps);
++    if (!f->p_vert1 || !f->p_vert2 || !f->p_chroma || !f->p_luma) {
++        free(f);
++        return NULL;
++    }
++    f->el_y = make_tex(GL_R16UI, w / 2, h / 2);
++    f->el_cb = make_tex(GL_R16UI, w / 4, h / 4);
++    f->el_cr = make_tex(GL_R16UI, w / 4, h / 4);
++    f->el_yv = make_tex(GL_R32F, w / 2, h);
++    f->el_cv = make_tex(GL_RG32F, w / 4, h / 2);
++    f->chroma = make_tex(GL_RG16UI, w / 2, h / 2);
++    f->lut = make_tex(GL_R32F, LUT_W, LUT_ROWS);
++    f->fbo_yv = make_fbo(f->el_yv);
++    f->fbo_cv = make_fbo(f->el_cv);
++    f->fbo_chroma = make_fbo(f->chroma);
++
++    /* EL sample phase: centered 2x (see fel_compose.c); chroma top-left sited */
++    const double ce = 0.5;
++    kernel(-ce / 2, taps, f->vwt_y, f->vbase_y);
++    kernel(-ce / 2, taps, f->hwt_y, f->hbase_y);
++    kernel(-ce / 4, taps, f->vwt_c, f->vbase_c);
++    kernel(-ce / 4, taps, f->hwt_c, f->hbase_c);
++    return f;
++}
++
++void felgpu_destroy(struct felgpu *f)
++{
++    if (!f)
++        return;
++    GLuint tex[] = { f->el_y, f->el_cb, f->el_cr, f->el_yv, f->el_cv, f->chroma, f->lut };
++    GLuint fbo[] = { f->fbo_yv, f->fbo_cv, f->fbo_chroma };
++    glDeleteTextures(7, tex);
++    glDeleteFramebuffers(3, fbo);
++    glDeleteProgram(f->p_vert1);
++    glDeleteProgram(f->p_vert2);
++    glDeleteProgram(f->p_chroma);
++    glDeleteProgram(f->p_luma);
++    free(f);
++}
++
++void felgpu_set_el(struct felgpu *f, const uint16_t *y, int y_stride,
++                   const uint16_t *cb, const uint16_t *cr, int c_stride)
++{
++    glPixelStorei(GL_UNPACK_ALIGNMENT, 2);
++    glPixelStorei(GL_UNPACK_ROW_LENGTH, y_stride);
++    glBindTexture(GL_TEXTURE_2D, f->el_y);
++    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, f->w / 2, f->h / 2, GL_RED_INTEGER, GL_UNSIGNED_SHORT, y);
++    glPixelStorei(GL_UNPACK_ROW_LENGTH, c_stride);
++    glBindTexture(GL_TEXTURE_2D, f->el_cb);
++    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, f->w / 4, f->h / 4, GL_RED_INTEGER, GL_UNSIGNED_SHORT, cb);
++    glBindTexture(GL_TEXTURE_2D, f->el_cr);
++    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, f->w / 4, f->h / 4, GL_RED_INTEGER, GL_UNSIGNED_SHORT, cr);
++    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
++    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
++}
++
++static int piece_of(const struct felgpu_meta *m, int c, int code)
++{
++    int n = m->npiv[c], k = 0;
++    for (int i = 1; i < n - 1; i++)
++        if (code >= m->pivots[c][i])
++            k = i;
++    return k;
++}
++
++/* polynomial prediction of a single component code (luma, or poly chroma) */
++static float predict_poly(const struct felgpu_meta *m, int c, int code)
++{
++    int n = m->npiv[c];
++    if (code < m->pivots[c][0]) code = m->pivots[c][0];
++    if (code > m->pivots[c][n - 1]) code = m->pivots[c][n - 1];
++    int k = piece_of(m, c, code);
++    double s = code / (double)(1 << m->bl_bits);
++    const double *a = m->poly[c][k];
++    return (float)((a[2] * s + a[1]) * s + a[0]);
++}
++
++static float nlq_res(const struct felgpu_meta *m, int c, int R)
++{
++    int d = R - m->nlq_offset[c];
++    if (d == 0)
++        return 0.0f;
++    double sg = d < 0 ? -1.0 : 1.0;
++    double r = m->nlq_slope[c] * (d - 0.5 * sg) + m->nlq_thresh[c] * sg;
++    if (r > m->nlq_max[c]) r = m->nlq_max[c];
++    if (r < -m->nlq_max[c]) r = -m->nlq_max[c];
++    return (float)r;
++}
++
++void felgpu_set_meta(struct felgpu *f, const struct felgpu_meta *m)
++{
++    double scale = 1.0 / (1 << m->bl_bits);
++
++    f->use_el = m->use_el;
++    f->el_max = (float)((1 << m->el_bits) - 1);
++    f->inv_bl = (float)scale;
++    memset(f->piv, 0, sizeof(f->piv));
++    for (int c = 0; c < 3; c++) {
++        f->npiv[c] = m->npiv[c];
++        for (int i = 0; i < m->npiv[c] && i < 9; i++)
++            f->piv[c * 9 + i] = (float)(m->pivots[c][i] * scale);
++    }
++
++    /* chroma: all polynomial -> LUT, otherwise MMR form for every piece */
++    memset(f->mmr, 0, sizeof(f->mmr));
++    memset(f->mmrc, 0, sizeof(f->mmrc));
++    for (int cc = 0; cc < 2; cc++) {
++        int c = cc + 1;
++        f->cpoly[cc] = 1;
++        for (int k = 0; k < m->npiv[c] - 1; k++) {
++            float *v = f->mmr[(cc * 8 + k) * 6];
++            if (m->mapping[c][k] == 0) {
++                /* a0 + a1 s + a2 s^2 on the own component */
++                f->mmrc[cc * 8 + k] = (float)m->poly[c][k][0];
++                v[c] = (float)m->poly[c][k][1];
++                v[8 + c] = (float)m->poly[c][k][2];
++            } else {
++                f->cpoly[cc] = 0;
++                f->mmrc[cc * 8 + k] = (float)m->mmr_const[c][k];
++                for (int o = 0; o < m->mmr_order[c][k] && o < 3; o++) {
++                    float *lin = v + o * 8, *x = v + o * 8 + 4;
++                    lin[0] = (float)m->mmr[c][k][o][0];
++                    lin[1] = (float)m->mmr[c][k][o][1];
++                    lin[2] = (float)m->mmr[c][k][o][2];
++                    x[0] = (float)m->mmr[c][k][o][3];
++                    x[1] = (float)m->mmr[c][k][o][4];
++                    x[2] = (float)m->mmr[c][k][o][5];
++                    x[3] = (float)m->mmr[c][k][o][6];
++                }
++            }
++        }
++    }
++
++    /* lookup tables */
++    for (int i = 0; i < LUT_W; i++) {
++        f->lutbuf[0][i] = predict_poly(m, 0, i);
++        f->lutbuf[4][i] = f->cpoly[0] ? predict_poly(m, 1, i) : 0.0f;
++        f->lutbuf[5][i] = f->cpoly[1] ? predict_poly(m, 2, i) : 0.0f;
++        for (int c = 0; c < 3; c++)
++            f->lutbuf[1 + c][i] = m->use_el ? nlq_res(m, c, i) : 0.0f;
++    }
++    glBindTexture(GL_TEXTURE_2D, f->lut);
++    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, LUT_W, LUT_ROWS, GL_RED, GL_FLOAT, f->lutbuf);
++}
++
++void felgpu_run(struct felgpu *f, GLuint bl_tex, GLuint out_fbo)
++{
++    GLuint p;
++
++    prof_mark(f, -1);
++    if (f->use_el) {
++        p = f->p_vert1;
++        glUseProgram(p);
++        glUniform1fv(glGetUniformLocation(p, "wt"), 12, f->vwt_y);
++        glUniform1iv(glGetUniformLocation(p, "base"), 2, f->vbase_y);
++        bind_tex(p, "src0", 0, f->el_y);
++        draw(f->fbo_yv, f->w / 2, f->h);
++        prof_mark(f, 0);
++        p = f->p_vert2;
++        glUseProgram(p);
++        glUniform1fv(glGetUniformLocation(p, "wt"), 12, f->vwt_c);
++        glUniform1iv(glGetUniformLocation(p, "base"), 2, f->vbase_c);
++        bind_tex(p, "src0", 0, f->el_cb);
++        bind_tex(p, "src1", 1, f->el_cr);
++        draw(f->fbo_cv, f->w / 4, f->h / 2);
++        prof_mark(f, 1);
++    }
++
++    p = f->p_chroma;
++    glUseProgram(p);
++    glUniform1fv(glGetUniformLocation(p, "piv"), 27, f->piv);
++    glUniform1iv(glGetUniformLocation(p, "npiv"), 3, f->npiv);
++    glUniform4fv(glGetUniformLocation(p, "mmr"), 96, &f->mmr[0][0]);
++    glUniform1fv(glGetUniformLocation(p, "mmrc"), 16, f->mmrc);
++    glUniform1iv(glGetUniformLocation(p, "cpoly"), 2, f->cpoly);
++    glUniform1i(glGetUniformLocation(p, "use_el"), f->use_el);
++    glUniform1f(glGetUniformLocation(p, "inv_bl"), f->inv_bl);
++    glUniform1f(glGetUniformLocation(p, "el_max"), f->el_max);
++    glUniform1fv(glGetUniformLocation(p, "hwt"), 12, f->hwt_c);
++    glUniform1iv(glGetUniformLocation(p, "hbase"), 2, f->hbase_c);
++    bind_tex(p, "bl", 0, bl_tex);
++    bind_tex(p, "elc", 1, f->el_cv);
++    bind_tex(p, "lut", 2, f->lut);
++    draw(f->fbo_chroma, f->w / 2, f->h / 2);
++    prof_mark(f, 2);
++
++    p = f->p_luma;
++    glUseProgram(p);
++    glUniform1i(glGetUniformLocation(p, "use_el"), f->use_el);
++    glUniform1f(glGetUniformLocation(p, "el_max"), f->el_max);
++    glUniform1fv(glGetUniformLocation(p, "hwt"), 12, f->hwt_y);
++    glUniform1iv(glGetUniformLocation(p, "hbase"), 2, f->hbase_y);
++    bind_tex(p, "bl", 0, bl_tex);
++    bind_tex(p, "ely", 1, f->el_yv);
++    bind_tex(p, "chroma", 2, f->chroma);
++    bind_tex(p, "lut", 3, f->lut);
++    draw(out_fbo, f->w, f->h);
++    prof_mark(f, 3);
++    f->prof_n++;
++}
++
++void felgpu_set_profile(struct felgpu *f, int on)
++{
++    f->profile = on;
++}
++
++void felgpu_print_profile(struct felgpu *f)
++{
++    long n = f->prof_n ? f->prof_n : 1;
++    if (f->profile)
++        printf("per pass avg: EL-V luma %.2f, EL-V chroma %.2f, chroma %.2f, luma+pack %.2f ms\n",
++               f->prof_ms[0] / n, f->prof_ms[1] / n, f->prof_ms[2] / n, f->prof_ms[3] / n);
++}
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.h
+new file mode 100644
+index 0000000..a62722c
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.h
+@@ -0,0 +1,67 @@
++/*
++ * felgpu - Dolby Vision FEL composition on OpenGL ES 3.2
++ *
++ * Composes a decoded base layer (dvfel linear 10-bit 4:4:4 buffer, see
++ * dvfel_uapi.h) with the enhancement layer and the RPU mapping into the
++ * same buffer format:
++ *
++ *   VDR = predict(BL) + NLQ^-1(upsample(EL))
++ *
++ * followed by quantization to 10 bits for display through a profile 8.1
++ * RPU with no-op mapping. The math follows fel_compose.c (Dolby layered HDR
++ * patent US10701399B2); the EL upsampling filter is Lanczos-3.
++ *
++ * All calls need the caller's GLES 3.2 context to be current.
++ */
++#ifndef FELGPU_H
++#define FELGPU_H
++
++#include <stdint.h>
++#include <GLES3/gl32.h>
++
++#define FELGPU_MAX_PIECES 8
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* composition metadata of one frame, as carried by the RPU */
++struct felgpu_meta {
++    int bl_bits;                       /* bl_bit_depth */
++    int el_bits;                       /* el_bit_depth */
++    int use_el;                        /* residual present and EL available */
++    int npiv[3];                       /* per component Y, Cb, Cr */
++    int pivots[3][FELGPU_MAX_PIECES + 1];              /* BL codewords */
++    int mapping[3][FELGPU_MAX_PIECES];                 /* 0 polynomial, 1 MMR */
++    double poly[3][FELGPU_MAX_PIECES][3];              /* x^0, x^1, x^2 */
++    int mmr_order[3][FELGPU_MAX_PIECES];
++    double mmr_const[3][FELGPU_MAX_PIECES];
++    double mmr[3][FELGPU_MAX_PIECES][3][7];            /* [order][term] */
++    int nlq_offset[3];                 /* EL codewords */
++    double nlq_slope[3], nlq_thresh[3], nlq_max[3];    /* normalized */
++};
++
++struct felgpu;
++
++/* w, h: base layer size; the EL is w/2 x h/2 */
++/* taps: EL upsampling filter, 6 (Lanczos-3) or 4 (Lanczos-2) */
++struct felgpu *felgpu_create(int w, int h, int taps);
++void felgpu_destroy(struct felgpu *f);
++
++/* EL planes, yuv420p10 (16-bit samples), strides in samples */
++void felgpu_set_el(struct felgpu *f, const uint16_t *y, int y_stride,
++                   const uint16_t *cb, const uint16_t *cr, int c_stride);
++void felgpu_set_meta(struct felgpu *f, const struct felgpu_meta *m);
++
++/* compose bl_tex (dma-buf import, RGBA8) into out_fbo (dma-buf, RGBA8) */
++void felgpu_run(struct felgpu *f, GLuint bl_tex, GLuint out_fbo);
++
++/* per pass timings (ms, averaged) if profiling is enabled; forces glFinish */
++void felgpu_set_profile(struct felgpu *f, int on);
++void felgpu_print_profile(struct felgpu *f);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/xbmc/utils/BitstreamConverter.cpp b/xbmc/utils/BitstreamConverter.cpp
+index afe25d4..2ed0bd6 100644
+--- a/xbmc/utils/BitstreamConverter.cpp
++++ b/xbmc/utils/BitstreamConverter.cpp
+@@ -659,17 +659,19 @@ bool CBitstreamConverter::Convert(uint8_t* pData, int iSize)
+               else if (nal_type == HEVC_NAL_UNSPEC62)
+               {
+                 const uint8_t *nalu_62_data = buf;
++                // the converted RPU may differ in size; buf still advances by the original
++                uint32_t nalu_62_size = size;
+ #ifdef HAVE_LIBDOVI
+                 const DoviData* rpu_data = processDoviRpu(buf, size);
+ 
+                 if (rpu_data)
+                 {
+                   nalu_62_data = rpu_data->data;
+-                  size = rpu_data->len;
++                  nalu_62_size = rpu_data->len;
+                 }
+ #endif
+ 
+-                BitstreamAllocAndCopy(&m_convertBuffer, &offset, nalu_62_data, size, nal_type);
++                BitstreamAllocAndCopy(&m_convertBuffer, &offset, nalu_62_data, nalu_62_size, nal_type);
+ 
+ #ifdef HAVE_LIBDOVI
+                 if (rpu_data)
+@@ -680,6 +682,8 @@ bool CBitstreamConverter::Convert(uint8_t* pData, int iSize)
+               {
+                 if (nal_type != HEVC_NAL_UNSPEC63)
+                   BitstreamAllocAndCopy(&m_convertBuffer, &offset, buf, size, nal_type);
++                else
++                  SinkElNal63(buf, size);
+               }
+ 
+               if (nal_type != HEVC_NAL_UNSPEC63)
+@@ -890,17 +894,19 @@ bool CBitstreamConverter::Convert(uint8_t *pData_bl, int iSize_bl, uint8_t *pDat
+       if (nal_type == HEVC_NAL_UNSPEC62)
+       {
+         const uint8_t *nalu_62_data = buf;
++        // the converted RPU may differ in size; buf still advances by the original
++        uint32_t nalu_62_size = size;
+ #ifdef HAVE_LIBDOVI
+         const DoviData* rpu_data = processDoviRpu(buf, size);
+ 
+         if (rpu_data)
+         {
+           nalu_62_data = rpu_data->data;
+-          size = rpu_data->len;
++          nalu_62_size = rpu_data->len;
+         }
+ #endif
+ 
+-        BitstreamAllocAndCopy(&m_convertBuffer, &offset, nalu_62_data, size, nal_type);
++        BitstreamAllocAndCopy(&m_convertBuffer, &offset, nalu_62_data, nalu_62_size, nal_type);
+ 
+ #ifdef HAVE_LIBDOVI
+         if (rpu_data)
+@@ -911,6 +917,8 @@ bool CBitstreamConverter::Convert(uint8_t *pData_bl, int iSize_bl, uint8_t *pDat
+       {
+         if (!m_convert_dovi)
+           BitstreamAllocAndCopy(&m_convertBuffer, &offset, buf, size, HEVC_NAL_UNSPEC63);
++        else if (m_doviElSink)
++          m_doviElSink->OnDoviElNal(buf, size); // raw EL NAL of the EL track
+       }
+       if (!m_convert_dovi || nal_type == HEVC_NAL_UNSPEC62)
+         CLog::Log(LOGDEBUG, LOGVIDEO, "CBitstreamConverter::Convert: EL nal_type: {}, size: {}",
+@@ -1443,6 +1451,7 @@ bool CBitstreamConverter::BitstreamConvert(uint8_t* pData,
+         {
+           // Ignore the enhancement layer, may or may not help
+           write_buf = false;
++          SinkElNal63(buf, nal_size);
+         }
+       }
+ 
+@@ -2130,6 +2139,10 @@ bool CBitstreamConverter::h264_sequence_header(const uint8_t *data, const uint32
+ // May be NULL if no processing was done or if parsing errored
+ const DoviData* CBitstreamConverter::processDoviRpu(uint8_t* buf, uint32_t nalSize)
+ {
++  // the original RPU, before any conversion below
++  if (m_doviElSink)
++    m_doviElSink->OnDoviRpu(buf, nalSize);
++
+   // early exit if no processing option is enabled and EL type is alredy tested
+   if (m_doviELTested && !m_convert_dovi && !m_setDoviZeroLevel5)
+     return NULL;
+diff --git a/xbmc/utils/BitstreamConverter.h b/xbmc/utils/BitstreamConverter.h
+index 3e3b182..4b167ae 100644
+--- a/xbmc/utils/BitstreamConverter.h
++++ b/xbmc/utils/BitstreamConverter.h
+@@ -95,6 +95,17 @@ public:
+   static bool CanStartDecode(const uint8_t* buf, int buf_size);
+ };
+ 
++// Receives the Dolby Vision data the converter rewrites or drops: the
++// original (unconverted) RPU NAL and every enhancement layer NAL. Both are
++// passed as escaped HEVC NAL units starting with their 2-byte header.
++class IDoviElSink
++{
++public:
++  virtual ~IDoviElSink() = default;
++  virtual void OnDoviRpu(const uint8_t* nal, uint32_t size) = 0;
++  virtual void OnDoviElNal(const uint8_t* nal, uint32_t size) = 0;
++};
++
+ class CBitstreamConverter
+ {
+ public:
+@@ -119,6 +130,7 @@ public:
+   void SetDoviZeroLevel5(bool value) { m_setDoviZeroLevel5 = value; }
+   bool GetDoviIsFEL() const { return m_doviIsFEL; }
+   bool GetIsHdrPlus() const { return m_IsHdr10Plus; }
++  void SetDoviElSink(IDoviElSink* sink) { m_doviElSink = sink; }
+ 
+   static bool mpeg2_sequence_header(const uint8_t* data,
+                                     const uint32_t size,
+@@ -187,4 +199,12 @@ protected:
+   bool m_doviELTested{false};
+   bool m_IsHdr10Plus{false};
+   bool m_Hdr10PlusTested{false};
++  IDoviElSink* m_doviElSink{nullptr};
++
++  // a NAL 63 carries an EL NAL behind its own 2-byte header
++  void SinkElNal63(const uint8_t* nal, uint32_t size)
++  {
++    if (m_doviElSink && size > 4)
++      m_doviElSink->OnDoviElNal(nal + 2, size - 2);
++  }
+ };
