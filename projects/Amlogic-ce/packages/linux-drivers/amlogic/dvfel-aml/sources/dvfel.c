@@ -83,6 +83,16 @@ MODULE_PARM_DESC(gpu_timeout_ms, "max wait for the compositor before showing the
 static int debug;
 module_param(debug, int, 0644);
 
+/*
+ * Experiment: can the display take 12-bit 4:2:2 linear frames (24 bits per
+ * pixel, the "old mode" 422 of the VD MIF)? In mode 1 every frame is
+ * replaced by a static pattern Y 0x5a7, Cb 0x8c3, Cr 0x3d5 (12 bit) that the
+ * VPP probe can read back. 1: word = Y << 12 | C, 2: word = C << 12 | Y.
+ */
+static int test422;
+module_param(test422, int, 0644);
+MODULE_PARM_DESC(test422, "debug: static 12-bit 4:2:2 linear test frame in mode 1 (1: Y high, 2: Y low)");
+
 #define dvfel_dbg(fmt, ...) \
 	do { if (debug) pr_info(DRV_NAME ": " fmt, ##__VA_ARGS__); } while (0)
 
@@ -740,12 +750,78 @@ static bool ensure_bufs(struct dvfel_dev *d, u32 w, u32 h)
 }
 
 /* phase 1 path: (A) and (B) through the internal linear buffer */
+static void test422_frame(struct dvfel_dev *d, struct dvfel_slot *s,
+			  struct vframe_s *orig, u32 w, u32 h)
+{
+	static int filled;
+	struct vframe_s *o = &s->out_vf;
+
+	if (filled != test422) {
+		u8 *va = codec_mm_phys_to_virt(d->lin_phys);
+		u32 i, j;
+
+		if (!va)
+			return;
+		for (j = 0; j < h; j++)
+			for (i = 0; i < w; i++) {
+				u32 y = 0x5a7, c = (i & 1) ? 0x3d5 : 0x8c3;
+				u32 px = test422 == 1 ? (y << 12) | c : (c << 12) | y;
+				u8 *p = va + ((size_t)j * w + i) * 3;
+
+				p[0] = px;
+				p[1] = px >> 8;
+				p[2] = px >> 16;
+			}
+		codec_mm_dma_flush(va, (size_t)w * h * 3, DMA_TO_DEVICE);
+		filled = test422;
+		pr_info(DRV_NAME ": test422 pattern %d written\n", test422);
+	}
+
+	*o = *orig;
+	INIT_LIST_HEAD(&o->list);
+	o->type = VIDTYPE_VIU_422 | VIDTYPE_VIU_SINGLE_PLANE | VIDTYPE_VIU_FIELD;
+	o->type_backup = o->type;
+	o->type_original = o->type;
+	o->bitdepth = BITDEPTH_Y10 | BITDEPTH_U10 | BITDEPTH_V10;	/* 422 old mode */
+	o->flag |= VFRAME_FLAG_VIDEO_LINEAR;
+	o->compHeadAddr = 0;
+	o->compBodyAddr = 0;
+	o->width = w;
+	o->height = h;
+	o->canvas0Addr = (u32)-1;
+	o->canvas1Addr = (u32)-1;
+	o->plane_num = 1;
+	memset(o->canvas0_config, 0, sizeof(o->canvas0_config));
+	o->canvas0_config[0].phy_addr = d->lin_phys;
+	o->canvas0_config[0].width = w * 3;
+	o->canvas0_config[0].height = h;
+	memcpy(o->canvas1_config, o->canvas0_config, sizeof(o->canvas1_config));
+	o->mem_handle = NULL;
+	o->mem_handle_1 = NULL;
+	o->mem_head_handle = NULL;
+	o->mem_dw_handle = NULL;
+	o->vf_ext = NULL;
+	o->uvm_vf = NULL;
+	o->early_process_fun = NULL;
+	o->process_fun = NULL;
+	o->private_data = NULL;
+	o->fence = NULL;
+	o->fgs_valid = false;
+}
+
 static bool process_direct(struct dvfel_dev *d, struct dvfel_slot *s,
 			   struct vframe_s *vf, bool capture)
 {
 	u32 w = vf->compWidth, h = vf->compHeight;
 	ktime_t t0, t1, t2;
 	bool ok;
+
+	if (test422) {
+		mutex_lock(&d->buf_lock);
+		test422_frame(d, s, vf, w, h);
+		mutex_unlock(&d->buf_lock);
+		return true;
+	}
 
 	mutex_lock(&d->buf_lock);
 	t0 = ktime_get();
