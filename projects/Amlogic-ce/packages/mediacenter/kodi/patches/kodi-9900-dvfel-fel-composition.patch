@@ -1,6 +1,6 @@
 diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp
 new file mode 100644
-index 0000000..7efafe4
+index 0000000..d9f864f
 --- /dev/null
 +++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp
 @@ -0,0 +1,815 @@
@@ -49,7 +49,7 @@ index 0000000..7efafe4
 +{
 +constexpr const char* DVFEL_DEV = "/dev/dvfel";
 +constexpr int GPU_BUFFERS = 3;
-+constexpr int EL_TAPS = 4;             // Lanczos-2, see felgpu.h
++constexpr int EL_TAPS = 6;             // Lanczos-3, see felgpu.h
 +constexpr int EL_WAIT_MS = 40;         // wait for the EL frame of a job
 +// Kodi feeds packets ~1.2 s ahead of display; EL decoding is paced to stay
 +// at most EL_LEAD_US ahead of the frame the kernel asked for last
@@ -1221,10 +1221,10 @@ index 0000000..91c6636
 +#endif
 diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.c b/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.c
 new file mode 100644
-index 0000000..bc78b3b
+index 0000000..fc7fa92
 --- /dev/null
 +++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.c
-@@ -0,0 +1,608 @@
+@@ -0,0 +1,598 @@
 +#ifndef _GNU_SOURCE
 +#define _GNU_SOURCE
 +#endif
@@ -1323,15 +1323,16 @@ index 0000000..bc78b3b
 +    "    acc += WSEL(hwt, ph, k) * texelFetch(t, ivec2(clamp(b + k, 0, w - 1), p.y), 0).xy;\n" \
 +    "  return clamp(floor(acc + 0.5), 0.0, el_max);\n" \
 +    "}\n" \
-+    /* one component, 4 taps: two gathers (the textures clamp to edge) */ \
-+    "float el_h4(sampler2D t, ivec2 p) {\n" \
++    /* one component: a gather per tap pair (the textures clamp to edge) */ \
++    "float el_hg(sampler2D t, ivec2 p) {\n" \
 +    "  int ph = p.x & 1, b = (p.x >> 1) + BSEL(hbase, ph);\n" \
 +    "  vec2 sz = vec2(textureSize(t, 0));\n" \
-+    /* footprint lower-left (b, y): .w (b, y), .z (b + 1, y) */ \
-+    "  vec4 g0 = textureGather(t, (vec2(b, p.y) + 1.0) / sz, 0);\n" \
-+    "  vec4 g1 = textureGather(t, (vec2(b + 2, p.y) + 1.0) / sz, 0);\n" \
-+    "  float acc = WSEL(hwt, ph, 0) * g0.w + WSEL(hwt, ph, 1) * g0.z +\n" \
-+    "              WSEL(hwt, ph, 2) * g1.w + WSEL(hwt, ph, 3) * g1.z;\n" \
++    "  float acc = 0.0;\n" \
++    "  for (int k = 0; k < TAPS; k += 2) {\n" \
++    /* footprint lower-left (b + k, y): .w (b + k, y), .z (b + k + 1, y) */ \
++    "    vec4 g = textureGather(t, (vec2(b + k, p.y) + 1.0) / sz, 0);\n" \
++    "    acc += WSEL(hwt, ph, k) * g.w + WSEL(hwt, ph, k + 1) * g.z;\n" \
++    "  }\n" \
 +    "  return clamp(floor(acc + 0.5), 0.0, el_max);\n" \
 +    "}\n"
 +
@@ -1374,20 +1375,14 @@ index 0000000..bc78b3b
 +    "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
 +    "  int ph = p.y & 1;\n"
 +    "  int b = (p.y >> 1) + BSEL(base, ph);\n"
-+    "#if TAPS == 4\n"
 +    "  vec2 sz = vec2(textureSize(src0, 0));\n"
-+    /* footprint lower-left (x, b): .w (x, b), .x (x, b + 1) */
-+    "  uvec4 g0 = textureGather(src0, (vec2(p.x, b) + 1.0) / sz, 0);\n"
-+    "  uvec4 g1 = textureGather(src0, (vec2(p.x, b + 2) + 1.0) / sz, 0);\n"
-+    "  o = WSEL(wt, ph, 0) * float(g0.w) + WSEL(wt, ph, 1) * float(g0.x) +\n"
-+    "      WSEL(wt, ph, 2) * float(g1.w) + WSEL(wt, ph, 3) * float(g1.x);\n"
-+    "#else\n"
-+    "  int h = textureSize(src0, 0).y;\n"
 +    "  float acc = 0.0;\n"
-+    "  for (int t = 0; t < TAPS; t++)\n"
-+    "    acc += WSEL(wt, ph, t) * float(texelFetch(src0, ivec2(p.x, clamp(b + t, 0, h - 1)), 0).x);\n"
++    /* a gather per tap pair, footprint lower-left (x, b + t): .w (x, b + t), .x (x, b + t + 1) */
++    "  for (int t = 0; t < TAPS; t += 2) {\n"
++    "    uvec4 g = textureGather(src0, (vec2(p.x, b + t) + 1.0) / sz, 0);\n"
++    "    acc += WSEL(wt, ph, t) * float(g.w) + WSEL(wt, ph, t + 1) * float(g.x);\n"
++    "  }\n"
 +    "  o = acc;\n"
-+    "#endif\n"
 +    "}\n";
 +
 +/*
@@ -1468,13 +1463,8 @@ index 0000000..bc78b3b
 +    "  uint w = word_at(bl, p);\n"
 +    "  uvec2 c = texelFetch(chroma, p >> 1, 0).xy;\n"
 +    "  float v = lut_at(0, y_of(w));\n"
-+    "  if (use_el) {\n"
-+    "#if TAPS == 4\n"
-+    "    v += lut_at(1, uint(el_h4(ely, p)));\n"
-+    "#else\n"
-+    "    v += lut_at(1, uint(el_h(ely, p).x));\n"
-+    "#endif\n"
-+    "  }\n"
++    "  if (use_el)\n"
++    "    v += lut_at(1, uint(el_hg(ely, p)));\n"
 +    "  o = pack_px(out10(v), c.x, c.y);\n"
 +    "}\n";
 +
