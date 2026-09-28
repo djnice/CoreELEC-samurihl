@@ -1,9 +1,9 @@
 diff --git a/addons/resource.language.en_gb/resources/strings.po b/addons/resource.language.en_gb/resources/strings.po
-index 592ba93..a223b76 100644
+index 912ce7ce41..7fdc76f490 100644
 --- a/addons/resource.language.en_gb/resources/strings.po
 +++ b/addons/resource.language.en_gb/resources/strings.po
-@@ -9123,6 +9123,16 @@ msgctxt "#14427"
- msgid "Player-Led"
+@@ -9139,6 +9139,16 @@ msgctxt "#14433"
+ msgid "If the hardware vsync stalls for longer than any plausible HDMI mode switch (e.g. chronically wedged sink), stop re-probing and stay on software timing for the rest of playback instead of paying the periodic re-probe hiccup. Resets on stop. Leave off unless you see repeated vsync-stall warnings in the log."
  msgstr ""
  
 +#: system/settings/settings.xml
@@ -20,10 +20,10 @@ index 592ba93..a223b76 100644
  #: xbmc/video/VideoDatabase.cpp
  msgctxt "#15011"
 diff --git a/system/settings/settings.xml b/system/settings/settings.xml
-index 90289a5..399230d 100755
+index 8c0702785a..f1ef985be4 100755
 --- a/system/settings/settings.xml
 +++ b/system/settings/settings.xml
-@@ -4035,6 +4035,12 @@
+@@ -4122,6 +4122,12 @@
            <default>false</default>
            <control type="toggle" />
          </setting>
@@ -38,7 +38,7 @@ index 90289a5..399230d 100755
            <default>false</default>
 diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp
 new file mode 100644
-index 0000000..3dd335f
+index 0000000000..3dd335f685
 --- /dev/null
 +++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp
 @@ -0,0 +1,865 @@
@@ -909,7 +909,7 @@ index 0000000..3dd335f
 +}
 diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.h
 new file mode 100644
-index 0000000..eb6264f
+index 0000000000..eb6264f1f6
 --- /dev/null
 +++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.h
 @@ -0,0 +1,119 @@
@@ -1033,7 +1033,7 @@ index 0000000..eb6264f
 +  double m_gpuMsSum{0};
 +};
 diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/CMakeLists.txt b/xbmc/cores/VideoPlayer/DVDCodecs/Video/CMakeLists.txt
-index 6e8283c..4bdb078 100644
+index 6e8283c395..4bdb0781d0 100644
 --- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/CMakeLists.txt
 +++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/CMakeLists.txt
 @@ -14,9 +14,14 @@ endif()
@@ -1054,10 +1054,10 @@ index 6e8283c..4bdb078 100644
  
  if(CORE_SYSTEM_NAME STREQUAL windows OR CORE_SYSTEM_NAME STREQUAL windowsstore)
 diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.cpp
-index 1a79460..4d8bfe0 100644
+index 231a62f381..ca126015fd 100644
 --- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.cpp
 +++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.cpp
-@@ -348,6 +348,14 @@ bool CDVDVideoCodecAmlogic::Open(CDVDStreamInfo &hints, CDVDCodecOptions &option
+@@ -420,6 +420,14 @@ bool CDVDVideoCodecAmlogic::Open(CDVDStreamInfo &hints, CDVDCodecOptions &option
              m_hints.dovi.el_present_flag = false;
              m_bitstream->SetConvertDovi(true);
              m_streamMeta.flags.push_back("converted");
@@ -1070,9 +1070,9 @@ index 1a79460..4d8bfe0 100644
 +              m_bitstream->SetDoviElSink(m_dvFel.get());
 +            }
            }
-         }
-       }
-@@ -476,6 +484,14 @@ void CDVDVideoCodecAmlogic::Close(void)
+ 
+           // Smart CMv4.0 append: push mode + smart-bypass inputs to the
+@@ -620,6 +628,14 @@ void CDVDVideoCodecAmlogic::Close(void)
    if (m_Codec)
      m_Codec->CloseDecoder(), m_Codec = nullptr;
  
@@ -1087,9 +1087,9 @@ index 1a79460..4d8bfe0 100644
    m_videobuffer.iFlags = 0;
  
    if (m_mpeg2_sequence)
-@@ -499,12 +515,18 @@ bool CDVDVideoCodecAmlogic::AddData(const DemuxPacket &packet)
- 
-   DrainMetadataToClock();
+@@ -784,6 +800,10 @@ bool CDVDVideoCodecAmlogic::AddData(const DemuxPacket &packet)
+     }
+   }
  
 +  // what the EL sink collects during this call belongs to this packet only
 +  if (m_dvFel)
@@ -1098,58 +1098,23 @@ index 1a79460..4d8bfe0 100644
    uint8_t *pData(packet.pData);
    uint32_t iSize(packet.iSize);
    bool doviIsFEL = false;
-   bool IsHdr10Plus = false;
-   int data_added = false;
-   bool dual_layer_converted = false;
-+  // timestamps of the base layer, and of the layer carrying the RPU and EL
-+  double blDts = packet.dts, blPts = packet.pts, elPts = packet.pts;
- 
-   if (pData)
-   {
-@@ -564,6 +586,7 @@ bool CDVDVideoCodecAmlogic::AddData(const DemuxPacket &packet)
-               dual_layer_converted = m_bitstream->Convert(pData, iSize, pDataBackup, iSizeBackup);
-               if (dual_layer_converted)
-               {
-+                elPts = std::get<4>(dual_layer_packet);
-                 m_pendingMeta = m_streamMeta;
-                 AMLLatchHevcDoviRpu(pDataBackup, iSizeBackup, m_nalLengthSize, m_pendingMeta);
-                 AMLLatchHevcSei(pData, iSize, m_nalLengthSize, m_pendingMeta);
-@@ -576,6 +599,10 @@ bool CDVDVideoCodecAmlogic::AddData(const DemuxPacket &packet)
-               dual_layer_converted = m_bitstream->Convert(pDataBackup, iSizeBackup, pData, iSize);
-               if (dual_layer_converted)
-               {
-+                // the pair was completed by its EL: the decoder takes the
-+                // base layer timestamps
-+                blDts = std::get<3>(dual_layer_packet);
-+                blPts = std::get<4>(dual_layer_packet);
-                 m_pendingMeta = m_streamMeta;
-                 AMLLatchHevcDoviRpu(packet.pData, packet.iSize, m_nalLengthSize, m_pendingMeta);
-                 AMLLatchHevcSei(pDataBackup, iSizeBackup, m_nalLengthSize, m_pendingMeta);
-@@ -589,7 +616,8 @@ bool CDVDVideoCodecAmlogic::AddData(const DemuxPacket &packet)
-           // backup package and don't send to decoder yet
-           uint8_t *pDataBackup = static_cast<uint8_t*>(KODI::MEMORY::AlignedMalloc(packet.iSize + AV_INPUT_BUFFER_PADDING_SIZE, 16));
-           memcpy(pDataBackup, packet.pData, packet.iSize);
--          m_packages.push_back(std::make_tuple(pDataBackup, iSize, packet.isELPackage));
-+          m_packages.push_back(
-+              std::make_tuple(pDataBackup, iSize, packet.isELPackage, packet.dts, packet.pts));
-           CLog::Log(LOGDEBUG, LOGVIDEO, "CDVDVideoCodecAmlogic::{}: did add {} package with dts: {:.3f}, pts: {:.3f} and size {} in list", __FUNCTION__,
-             packet.isELPackage ? "EL" : "BL", packet.dts/DVD_TIME_BASE, packet.pts/DVD_TIME_BASE, packet.iSize);
- 
-@@ -634,16 +662,25 @@ bool CDVDVideoCodecAmlogic::AddData(const DemuxPacket &packet)
+@@ -1061,11 +1081,11 @@ bool CDVDVideoCodecAmlogic::AddData(const DemuxPacket &packet)
        else
          m_has_keyframe = true;
      }
 -    FrameRateTracking( pData, iSize, packet.dts, packet.pts);
-+    FrameRateTracking( pData, iSize, blDts, blPts);
++    FrameRateTracking( pData, iSize, mergedDts, mergedPts);
  
      if (!m_opened)
      {
 -      if (packet.pts == DVD_NOPTS_VALUE)
-+      if (blPts == DVD_NOPTS_VALUE)
++      if (mergedPts == DVD_NOPTS_VALUE)
          m_hints.ptsinvalid = true;
  
        m_processInfo.SetDoviIsFEL(doviIsFEL);
-       m_processInfo.SetIsHdr10Plus(IsHdr10Plus);
+@@ -1116,6 +1136,15 @@ bool CDVDVideoCodecAmlogic::AddData(const DemuxPacket &packet)
+         m_hdr10plusToDvCandidate = false;
+       }
  
 +      // the dvfel node has to be routed in before the decoder registers
 +      if (m_dvFel && !(doviIsFEL && m_dvFel->Start(m_hints.width, m_hints.height)))
@@ -1161,52 +1126,37 @@ index 1a79460..4d8bfe0 100644
 +        m_streamMeta.flags.push_back("fel-composed");
 +
        CLog::Log(LOGINFO, "CDVDVideoCodecAmlogic::{}: Open decoder: fps:{:d}/{:d}", __FUNCTION__, m_hints.fpsrate, m_hints.fpsscale);
-       if (m_Codec && !m_Codec->OpenDecoder(m_hints, doviIsFEL))
+       if (m_Codec && !m_Codec->OpenDecoder(m_hints, doviIsFEL, packet.isDualStream))
          CLog::Log(LOGERROR, "CDVDVideoCodecAmlogic::{}: Failed to open Amlogic Codec", __FUNCTION__);
-@@ -680,18 +717,27 @@ bool CDVDVideoCodecAmlogic::AddData(const DemuxPacket &packet)
-     }
-   }
+@@ -1186,6 +1215,16 @@ bool CDVDVideoCodecAmlogic::AddData(const DemuxPacket &packet)
+   data_added = m_Codec->AddData(pData, iSize, mergedDts,
+                                 m_hints.ptsinvalid ? DVD_NOPTS_VALUE : mergedPts);
  
--  data_added = m_Codec->AddData(pData, iSize, packet.dts, m_hints.ptsinvalid ? DVD_NOPTS_VALUE : packet.pts);
-+  data_added = m_Codec->AddData(pData, iSize, blDts, m_hints.ptsinvalid ? DVD_NOPTS_VALUE : blPts);
-+
++  // the EL/RPU go under the pts the decoder got: the pair is matched by the
++  // demuxer's dts, and only the base layer is on the player's timeline
 +  if (m_dvFel)
 +  {
-+    if (data_added && packet.pData && !m_hints.ptsinvalid && blPts != DVD_NOPTS_VALUE &&
-+        elPts != DVD_NOPTS_VALUE)
-+      m_dvFel->CommitPacket(elPts);
++    if (data_added && packet.pData && !m_hints.ptsinvalid && mergedPts != DVD_NOPTS_VALUE)
++      m_dvFel->CommitPacket(mergedPts);
 +    else
 +      m_dvFel->DropPacket();
 +  }
- 
++
    if (data_added && packet.pData)
    {
      m_pendingMeta.Inherit(m_lastMeta);
-     m_lastMeta = m_pendingMeta;
--    if (m_hints.ptsinvalid || packet.pts == DVD_NOPTS_VALUE)
-+    if (m_hints.ptsinvalid || blPts == DVD_NOPTS_VALUE)
-       CAMLFrameMetadataStore::GetInstance().Publish(m_metadataToken, m_pendingMeta);
-     else
-     {
--      m_metadataSequencer.Commit(packet.pts, m_pendingMeta);
--      m_lastCommitPts = packet.pts;
-+      m_metadataSequencer.Commit(blPts, m_pendingMeta);
-+      m_lastCommitPts = blPts;
-     }
-     m_pendingMeta = m_streamMeta;
-   }
-@@ -760,6 +806,9 @@ void CDVDVideoCodecAmlogic::Reset(void)
- {
-   m_Codec->Reset();
+@@ -1286,6 +1325,9 @@ void CDVDVideoCodecAmlogic::Reset(void)
+ 
+   m_pendingTimelineRestart = false;
  
 +  if (m_dvFel)
 +    m_dvFel->Reset();
 +
    while (!m_packages.empty())
    {
-     DLDemuxPacket dual_layer_packet= m_packages.front();
+     PopPackageFront();
 diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.h
-index bea43af..a0626fa 100644
+index 53344fb708..d2b0684323 100644
 --- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.h
 +++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.h
 @@ -8,6 +8,7 @@
@@ -1217,17 +1167,7 @@ index bea43af..a0626fa 100644
  #include "AMLFrameMetadata.h"
  #include "DVDVideoCodec.h"
  #include "DVDStreamInfo.h"
-@@ -26,7 +27,8 @@ class CBitstreamConverter;
- 
- class CDVDVideoCodecAmlogic;
- 
--typedef std::tuple<uint8_t*, uint32_t, bool> DLDemuxPacket;
-+// data, size, is EL, dts, pts
-+typedef std::tuple<uint8_t*, uint32_t, bool, double, double> DLDemuxPacket;
- 
- class CAMLVideoBuffer : public CVideoBuffer
- {
-@@ -107,6 +109,8 @@ protected:
+@@ -150,6 +151,8 @@ protected:
  
    CBitstreamParser *m_bitparser;
    CBitstreamConverter *m_bitstream;
@@ -1238,7 +1178,7 @@ index bea43af..a0626fa 100644
    static std::atomic<bool> m_InstanceGuard;
 diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/dvfel_uapi.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/dvfel_uapi.h
 new file mode 100644
-index 0000000..91c6636
+index 0000000000..91c663650a
 --- /dev/null
 +++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/dvfel_uapi.h
 @@ -0,0 +1,65 @@
@@ -1309,7 +1249,7 @@ index 0000000..91c6636
 +#endif
 diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.c b/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.c
 new file mode 100644
-index 0000000..012d132
+index 0000000000..012d1328c9
 --- /dev/null
 +++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.c
 @@ -0,0 +1,741 @@
@@ -2056,7 +1996,7 @@ index 0000000..012d132
 +}
 diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.h
 new file mode 100644
-index 0000000..749ea2f
+index 0000000000..749ea2f26b
 --- /dev/null
 +++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.h
 @@ -0,0 +1,80 @@
@@ -2141,10 +2081,10 @@ index 0000000..749ea2f
 +
 +#endif
 diff --git a/xbmc/settings/Settings.h b/xbmc/settings/Settings.h
-index 2b2da5d..92ff4aa 100644
+index c466975d9f..e499968605 100644
 --- a/xbmc/settings/Settings.h
 +++ b/xbmc/settings/Settings.h
-@@ -467,6 +467,7 @@ public:
+@@ -474,6 +474,7 @@ public:
    static constexpr auto SETTING_MASTERLOCK_STARTUPLOCK = "masterlock.startuplock";
    static constexpr auto SETTING_MASTERLOCK_MAXRETRIES = "masterlock.maxretries";
    static constexpr auto SETTING_COREELEC_AMLOGIC_NOISEREDUCTION = "coreelec.amlogic.noisereduction";
@@ -2153,10 +2093,10 @@ index 2b2da5d..92ff4aa 100644
    static constexpr auto SETTING_COREELEC_AMLOGIC_HDR2SDR = "coreelec.amlogic.hdr2sdr";
    static constexpr auto SETTING_COREELEC_AMLOGIC_SDR2DV = "coreelec.amlogic.sdr2dv";
 diff --git a/xbmc/utils/BitstreamConverter.cpp b/xbmc/utils/BitstreamConverter.cpp
-index afe25d4..2ed0bd6 100644
+index ee0664cca6..37c5fc2018 100644
 --- a/xbmc/utils/BitstreamConverter.cpp
 +++ b/xbmc/utils/BitstreamConverter.cpp
-@@ -659,17 +659,19 @@ bool CBitstreamConverter::Convert(uint8_t* pData, int iSize)
+@@ -1020,17 +1020,19 @@ bool CBitstreamConverter::Convert(uint8_t* pData, int iSize)
                else if (nal_type == HEVC_NAL_UNSPEC62)
                {
                  const uint8_t *nalu_62_data = buf;
@@ -2178,16 +2118,16 @@ index afe25d4..2ed0bd6 100644
  
  #ifdef HAVE_LIBDOVI
                  if (rpu_data)
-@@ -680,6 +682,8 @@ bool CBitstreamConverter::Convert(uint8_t* pData, int iSize)
-               {
-                 if (nal_type != HEVC_NAL_UNSPEC63)
+@@ -1044,6 +1046,8 @@ bool CBitstreamConverter::Convert(uint8_t* pData, int iSize)
+                 // annex-b stream) the in-band EL must survive for FEL/MEL.
+                 if (nal_type != HEVC_NAL_UNSPEC63 || !m_convert_dovi)
                    BitstreamAllocAndCopy(&m_convertBuffer, &offset, buf, size, nal_type);
 +                else
 +                  SinkElNal63(buf, size);
                }
  
-               if (nal_type != HEVC_NAL_UNSPEC63)
-@@ -890,17 +894,19 @@ bool CBitstreamConverter::Convert(uint8_t *pData_bl, int iSize_bl, uint8_t *pDat
+               if (nal_type != HEVC_NAL_UNSPEC63 || !m_convert_dovi)
+@@ -1341,17 +1345,19 @@ bool CBitstreamConverter::Convert(uint8_t *pData_bl, int iSize_bl, uint8_t *pDat
        if (nal_type == HEVC_NAL_UNSPEC62)
        {
          const uint8_t *nalu_62_data = buf;
@@ -2209,7 +2149,7 @@ index afe25d4..2ed0bd6 100644
  
  #ifdef HAVE_LIBDOVI
          if (rpu_data)
-@@ -911,6 +917,8 @@ bool CBitstreamConverter::Convert(uint8_t *pData_bl, int iSize_bl, uint8_t *pDat
+@@ -1371,6 +1377,8 @@ bool CBitstreamConverter::Convert(uint8_t *pData_bl, int iSize_bl, uint8_t *pDat
        {
          if (!m_convert_dovi)
            BitstreamAllocAndCopy(&m_convertBuffer, &offset, buf, size, HEVC_NAL_UNSPEC63);
@@ -2218,7 +2158,7 @@ index afe25d4..2ed0bd6 100644
        }
        if (!m_convert_dovi || nal_type == HEVC_NAL_UNSPEC62)
          CLog::Log(LOGDEBUG, LOGVIDEO, "CBitstreamConverter::Convert: EL nal_type: {}, size: {}",
-@@ -1443,6 +1451,7 @@ bool CBitstreamConverter::BitstreamConvert(uint8_t* pData,
+@@ -1968,6 +1976,7 @@ bool CBitstreamConverter::BitstreamConvert(uint8_t* pData,
          {
            // Ignore the enhancement layer, may or may not help
            write_buf = false;
@@ -2226,7 +2166,7 @@ index afe25d4..2ed0bd6 100644
          }
        }
  
-@@ -2130,6 +2139,10 @@ bool CBitstreamConverter::h264_sequence_header(const uint8_t *data, const uint32
+@@ -2838,6 +2847,10 @@ const char* Cmv40AppendResultName(DOVICMv40AppendResult r)
  // May be NULL if no processing was done or if parsing errored
  const DoviData* CBitstreamConverter::processDoviRpu(uint8_t* buf, uint32_t nalSize)
  {
@@ -2234,15 +2174,15 @@ index afe25d4..2ed0bd6 100644
 +  if (m_doviElSink)
 +    m_doviElSink->OnDoviRpu(buf, nalSize);
 +
-   // early exit if no processing option is enabled and EL type is alredy tested
-   if (m_doviELTested && !m_convert_dovi && !m_setDoviZeroLevel5)
-     return NULL;
+   // L5 "osdst": while an overlay is shown, zero L5 so the bars are not masked over
+   // the OSD/subtitles. Takes priority over the L5 mode; forces processing even in
+   // SOURCE mode (so the source L5 is suppressed while the overlay is up, and
 diff --git a/xbmc/utils/BitstreamConverter.h b/xbmc/utils/BitstreamConverter.h
-index 3e3b182..4b167ae 100644
+index 1c95df6d38..288247be37 100644
 --- a/xbmc/utils/BitstreamConverter.h
 +++ b/xbmc/utils/BitstreamConverter.h
-@@ -95,6 +95,17 @@ public:
-   static bool CanStartDecode(const uint8_t* buf, int buf_size);
+@@ -155,6 +155,17 @@ enum DOVIL5Mode : int
+   DOVI_L5_DETECT,     // inject detected active-area offsets when source L5 is empty
  };
  
 +// Receives the Dolby Vision data the converter rewrites or drops: the
@@ -2259,18 +2199,19 @@ index 3e3b182..4b167ae 100644
  class CBitstreamConverter
  {
  public:
-@@ -119,6 +130,7 @@ public:
-   void SetDoviZeroLevel5(bool value) { m_setDoviZeroLevel5 = value; }
-   bool GetDoviIsFEL() const { return m_doviIsFEL; }
+@@ -241,6 +252,7 @@ public:
+     return m_lastAuIsIrap;
+   }
    bool GetIsHdrPlus() const { return m_IsHdr10Plus; }
 +  void SetDoviElSink(IDoviElSink* sink) { m_doviElSink = sink; }
  
-   static bool mpeg2_sequence_header(const uint8_t* data,
-                                     const uint32_t size,
-@@ -187,4 +199,12 @@ protected:
-   bool m_doviELTested{false};
-   bool m_IsHdr10Plus{false};
-   bool m_Hdr10PlusTested{false};
+   // Profile-7 FEL tiny-IDR padding (see AppendHEVCFillerNAL). Public because
+   // CAMLCodec has to widen its idle-input wedge detector by exactly this much:
+@@ -369,4 +381,13 @@ protected:
+   // SEI mid-stream (e.g. AMZN encodes omit it for end credits).
+   Hdr10PlusMetadata m_lastHdr10PlusMeta{};
+   bool m_lastHdr10PlusMetaValid{false};
++
 +  IDoviElSink* m_doviElSink{nullptr};
 +
 +  // a NAL 63 carries an EL NAL behind its own 2-byte header
