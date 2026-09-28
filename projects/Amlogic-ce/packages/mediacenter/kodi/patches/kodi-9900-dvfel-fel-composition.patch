@@ -1,9 +1,47 @@
+diff --git a/addons/resource.language.en_gb/resources/strings.po b/addons/resource.language.en_gb/resources/strings.po
+index 592ba93..a223b76 100644
+--- a/addons/resource.language.en_gb/resources/strings.po
++++ b/addons/resource.language.en_gb/resources/strings.po
+@@ -9123,6 +9123,16 @@ msgctxt "#14427"
+ msgid "Player-Led"
+ msgstr ""
+ 
++#: system/settings/settings.xml
++msgctxt "#14428"
++msgid "Dither Dolby Vision FEL output"
++msgstr ""
++
++#: system/settings/settings.xml
++msgctxt "#14429"
++msgid "Quantize the composed Dolby Vision profile 7 FEL picture to the 10-bit video output with a fine blue noise dither instead of rounding, which keeps smooth gradients free of banding. S928X only."
++msgstr ""
++
+ #: xbmc/music/MusicDatabase.cpp
+ #: xbmc/video/VideoDatabase.cpp
+ msgctxt "#15011"
+diff --git a/system/settings/settings.xml b/system/settings/settings.xml
+index 90289a5..399230d 100755
+--- a/system/settings/settings.xml
++++ b/system/settings/settings.xml
+@@ -4035,6 +4035,12 @@
+           <default>false</default>
+           <control type="toggle" />
+         </setting>
++        <setting id="coreelec.amlogic.dvfeldither" type="boolean" label="14428" help="14429">
++          <requirement>HAVE_AMCODEC</requirement>
++          <level>3</level>
++          <default>true</default>
++          <control type="toggle" />
++        </setting>
+         <setting id="coreelec.amlogic.sdr2hdr" type="boolean" label="14404" help="14405">
+           <requirement>HAVE_AMCODEC</requirement>
+           <default>false</default>
 diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp
 new file mode 100644
-index 0000000..d212812
+index 0000000..3dd335f
 --- /dev/null
 +++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp
-@@ -0,0 +1,857 @@
+@@ -0,0 +1,865 @@
 +/*
 + *  Copyright (C) 2026 Team CoreELEC
 + *  This file is part of Kodi - https://kodi.tv
@@ -16,6 +54,9 @@ index 0000000..d212812
 +
 +#include "felgpu.h"
 +#include "dvfel_uapi.h"
++#include "ServiceBroker.h"
++#include "settings/Settings.h"
++#include "settings/SettingsComponent.h"
 +#include "utils/log.h"
 +
 +#include <cmath>
@@ -169,15 +210,20 @@ index 0000000..d212812
 +  return v;
 +}
 +
-+// /storage/dvfel_dither: 0 off, 1 blue noise dither to 10 bits (default), 2
-+// dither on the left half only (to compare); read about once a second
++// blue noise dither to 10 bits from the CoreELEC setting; /storage/dvfel_dither
++// overrides it for tests: 0 off, 1 on, 2 left half only. Read about once a second
 +int DitherMode()
 +{
 +  std::ifstream f("/storage/dvfel_dither");
-+  int v = 1;
++  int v = -1;
 +  if (f)
 +    f >> v;
-+  return v >= 0 && v <= 2 ? v : 1;
++  if (v >= 0 && v <= 2)
++    return v;
++  return CServiceBroker::GetSettingsComponent()->GetSettings()->GetBool(
++             CSettings::SETTING_COREELEC_AMLOGIC_DVFEL_DITHER)
++             ? 1
++             : 0;
 +}
 +
 +// /storage/dvfel_pattern: 1 shows a 12-bit grey ramp test pattern
@@ -2094,6 +2140,18 @@ index 0000000..749ea2f
 +#endif
 +
 +#endif
+diff --git a/xbmc/settings/Settings.h b/xbmc/settings/Settings.h
+index 2b2da5d..92ff4aa 100644
+--- a/xbmc/settings/Settings.h
++++ b/xbmc/settings/Settings.h
+@@ -467,6 +467,7 @@ public:
+   static constexpr auto SETTING_MASTERLOCK_STARTUPLOCK = "masterlock.startuplock";
+   static constexpr auto SETTING_MASTERLOCK_MAXRETRIES = "masterlock.maxretries";
+   static constexpr auto SETTING_COREELEC_AMLOGIC_NOISEREDUCTION = "coreelec.amlogic.noisereduction";
++  static constexpr auto SETTING_COREELEC_AMLOGIC_DVFEL_DITHER = "coreelec.amlogic.dvfeldither";
+   static constexpr auto SETTING_COREELEC_AMLOGIC_SDR2HDR = "coreelec.amlogic.sdr2hdr";
+   static constexpr auto SETTING_COREELEC_AMLOGIC_HDR2SDR = "coreelec.amlogic.hdr2sdr";
+   static constexpr auto SETTING_COREELEC_AMLOGIC_SDR2DV = "coreelec.amlogic.sdr2dv";
 diff --git a/xbmc/utils/BitstreamConverter.cpp b/xbmc/utils/BitstreamConverter.cpp
 index afe25d4..2ed0bd6 100644
 --- a/xbmc/utils/BitstreamConverter.cpp
