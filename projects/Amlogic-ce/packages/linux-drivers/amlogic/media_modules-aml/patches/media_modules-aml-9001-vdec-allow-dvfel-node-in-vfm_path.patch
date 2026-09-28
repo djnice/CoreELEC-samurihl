@@ -1,0 +1,12 @@
+diff --git drivers/frame_provider/decoder/utils/vdec.c drivers/frame_provider/decoder/utils/vdec.c
+index 95deddf..8ae2a62 100644
+--- a/drivers/frame_provider/decoder/utils/vdec.c
++++ b/drivers/frame_provider/decoder/utils/vdec.c
+@@ -407,6 +407,7 @@ static const char vfm_path_node[][VDEC_MAP_NAME_SIZE] =
+ 	"v4lvideo.7",
+ 	"v4lvideo.8",
+ 	"fake-amvideo",
++	"dvfel",
+ 	"disable",
+ 	"reserved",
+ };
