@@ -21,4 +21,8 @@ make_target() {
 makeinstall_target() {
   mkdir -p ${INSTALL}/$(get_full_module_dir)/${PKG_NAME}
     cp ${PKG_BUILD}/*.ko ${INSTALL}/$(get_full_module_dir)/${PKG_NAME}
+
+  # loaded at boot; Kodi composes P7 FEL when /dev/dvfel exists
+  mkdir -p ${INSTALL}/usr/lib/modules-load.d
+    echo "dvfel" > ${INSTALL}/usr/lib/modules-load.d/dvfel.conf
 }

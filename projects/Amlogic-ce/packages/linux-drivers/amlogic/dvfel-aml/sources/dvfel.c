@@ -76,7 +76,7 @@ static unsigned long long capture_pts;
 module_param(capture_pts, ullong, 0644);
 MODULE_PARM_DESC(capture_pts, "debug: capture the frame with this pts_us64 (0: off)");
 
-static int gpu_timeout_ms = 100;
+static int gpu_timeout_ms = 150;
 module_param(gpu_timeout_ms, int, 0644);
 MODULE_PARM_DESC(gpu_timeout_ms, "max wait for the compositor before showing the base layer");
 
