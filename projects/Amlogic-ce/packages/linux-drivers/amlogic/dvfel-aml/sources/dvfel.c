@@ -639,8 +639,9 @@ static void build_out_vf(struct dvfel_slot *s, struct vframe_s *orig, u32 w, u32
 	o->compHeight = h;
 	o->width = w;
 	o->height = h;
-	o->canvas0Addr = (u32)-1;
-	o->canvas1Addr = (u32)-1;
+	/* AFBC only, like a decoder without double write: no MIF canvases */
+	o->canvas0Addr = 0;
+	o->canvas1Addr = 0;
 	o->plane_num = 0;
 	memset(o->canvas0_config, 0, sizeof(o->canvas0_config));
 	memset(o->canvas1_config, 0, sizeof(o->canvas1_config));
