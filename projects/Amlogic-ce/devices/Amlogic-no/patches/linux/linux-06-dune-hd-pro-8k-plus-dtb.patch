@@ -1,0 +1,56 @@
+From: djnice <djnice@freemail.hu>
+Subject: arm64: dts: amlogic: add Dune HD Pro 8K Plus
+
+S928X box on the AX201-v2 reference design. The Ugoos SK1 tree runs it;
+on top of that, the internal HDD bay is powered through GPIOT_13 like the
+vendor tree does, and the TCA6507 LED controller of the SK1 is disabled.
+---
+--- a/common_drivers/arch/arm64/boot/dts/amlogic/Makefile	2026-09-28 17:48:33.753522414 +0200
++++ b/common_drivers/arch/arm64/boot/dts/amlogic/Makefile	2026-09-28 17:48:33.756918458 +0200
+@@ -47,6 +47,7 @@
+ dtb-y += s5_s928x_tencent_aurora_5x.dtb
+ dtb-y += s5_s928x_ugoos_am8_4g.dtb
+ dtb-y += s5_s928x_ugoos_am8_8g.dtb
++dtb-y += s5_s928x_dune_hd_pro_8k_plus.dtb
+ dtb-y += s5_s928x_ugoos_sk1_8g.dtb
+ dtb-y += s5_s928x_x96_x10_4g.dtb
+ dtb-y += s5_s928x_x96_x10_8g.dtb
+--- a/common_drivers/arch/arm64/boot/dts/amlogic/s5_s928x_dune_hd_pro_8k_plus.dts	1970-01-01 01:00:00.000000000 +0100
++++ b/common_drivers/arch/arm64/boot/dts/amlogic/s5_s928x_dune_hd_pro_8k_plus.dts	2026-09-28 17:48:33.760725276 +0200
+@@ -0,0 +1,36 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
++/*
++ * Dune HD Pro 8K Plus (Amlogic S928X, AX201-v2 based)
++ *
++ * The Ugoos SK1 tree runs the board; on top of it, from the vendor device
++ * tree, the power of the internal HDD bay. The board has no TCA6507 LED
++ * controller; the RTC and LED driver of the vendor tree are reference design
++ * leftovers that do not answer on the I2C buses.
++ */
++
++#include "s5_s928x_ugoos_sk1_8g.dts"
++
++/ {
++	model = "Dune HD Pro 8K Plus";
++	coreelec-dt-id = "s5_s928x_dune_hd_pro_8k_plus";
++};
++
++&gpio {
++	hdd_pwr_en {
++		gpio-hog;
++		gpios = <GPIOT_13 GPIO_ACTIVE_HIGH>;
++		output-high;
++		line-name = "hdd_pwr_en";
++	};
++};
++
++&tca6507 {
++	status = "disabled";
++};
++
++&amhdmitx {
++	vend_data {
++		vendor_name = "Dune HD";
++		product_desc = "Pro 8K Plus";
++	};
++};
