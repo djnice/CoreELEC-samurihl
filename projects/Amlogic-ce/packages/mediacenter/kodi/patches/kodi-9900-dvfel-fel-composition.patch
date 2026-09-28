@@ -1221,10 +1221,10 @@ index 0000000..91c6636
 +#endif
 diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.c b/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.c
 new file mode 100644
-index 0000000..b0b9fac
+index 0000000..bc78b3b
 --- /dev/null
 +++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.c
-@@ -0,0 +1,569 @@
+@@ -0,0 +1,608 @@
 +#ifndef _GNU_SOURCE
 +#define _GNU_SOURCE
 +#endif
@@ -1284,12 +1284,19 @@ index 0000000..b0b9fac
 +/* shaders                                                            */
 +/* ------------------------------------------------------------------ */
 +
-+/* program() prepends "#version 320 es" and "#define TAPS n" */
++
++/*
++ * program() prepends "#version 320 es" and "#define TAPS n". Mali loads
++ * uniform array elements with a per fragment index from memory: filter
++ * weights and bases are picked per phase with constant indices instead.
++ */
 +#define GLSL_HEAD \
 +    "precision highp float;\n" \
 +    "precision highp int;\n" \
 +    "precision highp usampler2D;\n" \
-+    "precision highp sampler2D;\n"
++    "precision highp sampler2D;\n" \
++    "#define WSEL(a, ph, k) ((ph) == 0 ? a[k] : a[TAPS + (k)])\n" \
++    "#define BSEL(a, ph) ((ph) == 0 ? a[0] : a[1])\n"
 +
 +/* the dma-buf is sampled as RGBA8 = one 32-bit pixel word Cr|Cb<<10|Y<<20 */
 +#define GLSL_WORD \
@@ -1310,10 +1317,21 @@ index 0000000..b0b9fac
 +    "vec2 el_h(sampler2D t, ivec2 p) {\n" \
 +    "  int ph = p.x & 1;\n" \
 +    "  int w = textureSize(t, 0).x;\n" \
-+    "  int b = (p.x >> 1) + hbase[ph];\n" \
++    "  int b = (p.x >> 1) + BSEL(hbase, ph);\n" \
 +    "  vec2 acc = vec2(0.0);\n" \
 +    "  for (int k = 0; k < TAPS; k++)\n" \
-+    "    acc += hwt[ph * TAPS + k] * texelFetch(t, ivec2(clamp(b + k, 0, w - 1), p.y), 0).xy;\n" \
++    "    acc += WSEL(hwt, ph, k) * texelFetch(t, ivec2(clamp(b + k, 0, w - 1), p.y), 0).xy;\n" \
++    "  return clamp(floor(acc + 0.5), 0.0, el_max);\n" \
++    "}\n" \
++    /* one component, 4 taps: two gathers (the textures clamp to edge) */ \
++    "float el_h4(sampler2D t, ivec2 p) {\n" \
++    "  int ph = p.x & 1, b = (p.x >> 1) + BSEL(hbase, ph);\n" \
++    "  vec2 sz = vec2(textureSize(t, 0));\n" \
++    /* footprint lower-left (b, y): .w (b, y), .z (b + 1, y) */ \
++    "  vec4 g0 = textureGather(t, (vec2(b, p.y) + 1.0) / sz, 0);\n" \
++    "  vec4 g1 = textureGather(t, (vec2(b + 2, p.y) + 1.0) / sz, 0);\n" \
++    "  float acc = WSEL(hwt, ph, 0) * g0.w + WSEL(hwt, ph, 1) * g0.z +\n" \
++    "              WSEL(hwt, ph, 2) * g1.w + WSEL(hwt, ph, 3) * g1.z;\n" \
 +    "  return clamp(floor(acc + 0.5), 0.0, el_max);\n" \
 +    "}\n"
 +
@@ -1336,11 +1354,11 @@ index 0000000..b0b9fac
 +    "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
 +    "  int ph = p.y & 1;\n"
 +    "  int h = textureSize(src0, 0).y;\n"
-+    "  int b = (p.y >> 1) + base[ph];\n"
++    "  int b = (p.y >> 1) + BSEL(base, ph);\n"
 +    "  vec2 acc = vec2(0.0);\n"
 +    "  for (int t = 0; t < TAPS; t++) {\n"
 +    "    ivec2 q = ivec2(p.x, clamp(b + t, 0, h - 1));\n"
-+    "    acc += wt[ph * TAPS + t] * vec2(float(texelFetch(src0, q, 0).x), float(texelFetch(src1, q, 0).x));\n"
++    "    acc += WSEL(wt, ph, t) * vec2(float(texelFetch(src0, q, 0).x), float(texelFetch(src1, q, 0).x));\n"
 +    "  }\n"
 +    "  o = acc;\n"
 +    "}\n";
@@ -1355,12 +1373,21 @@ index 0000000..b0b9fac
 +    "void main() {\n"
 +    "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
 +    "  int ph = p.y & 1;\n"
++    "  int b = (p.y >> 1) + BSEL(base, ph);\n"
++    "#if TAPS == 4\n"
++    "  vec2 sz = vec2(textureSize(src0, 0));\n"
++    /* footprint lower-left (x, b): .w (x, b), .x (x, b + 1) */
++    "  uvec4 g0 = textureGather(src0, (vec2(p.x, b) + 1.0) / sz, 0);\n"
++    "  uvec4 g1 = textureGather(src0, (vec2(p.x, b + 2) + 1.0) / sz, 0);\n"
++    "  o = WSEL(wt, ph, 0) * float(g0.w) + WSEL(wt, ph, 1) * float(g0.x) +\n"
++    "      WSEL(wt, ph, 2) * float(g1.w) + WSEL(wt, ph, 3) * float(g1.x);\n"
++    "#else\n"
 +    "  int h = textureSize(src0, 0).y;\n"
-+    "  int b = (p.y >> 1) + base[ph];\n"
 +    "  float acc = 0.0;\n"
 +    "  for (int t = 0; t < TAPS; t++)\n"
-+    "    acc += wt[ph * TAPS + t] * float(texelFetch(src0, ivec2(p.x, clamp(b + t, 0, h - 1)), 0).x);\n"
++    "    acc += WSEL(wt, ph, t) * float(texelFetch(src0, ivec2(p.x, clamp(b + t, 0, h - 1)), 0).x);\n"
 +    "  o = acc;\n"
++    "#endif\n"
 +    "}\n";
 +
 +/*
@@ -1381,18 +1408,23 @@ index 0000000..b0b9fac
 +    "uniform bool use_el;\n"
 +    "uniform float inv_bl;\n"
 +    "out uvec2 o;\n"
-+    "float predict_mmr(int cc, float s, vec3 sig) {\n"
-+    "  int c = cc + 1, n = npiv[c], k = 0;\n"
-+    "  s = clamp(s, piv[c * 9], piv[c * 9 + n - 1]);\n"
-+    "  for (int i = 1; i < 8; i++)\n"
-+    "    k += (i < n - 1 && s >= piv[c * 9 + i]) ? 1 : 0;\n"
-+    "  int b = (cc * 8 + k) * 6;\n"
++    "float mmr_eval(int b, float c0, vec3 sig) {\n"
 +    "  vec4 xx = vec4(sig.x * sig.y, sig.x * sig.z, sig.y * sig.z, sig.x * sig.y * sig.z);\n"
 +    "  vec3 x2 = sig * sig; vec4 xx2 = xx * xx;\n"
-+    "  return mmrc[cc * 8 + k]\n"
++    "  return c0\n"
 +    "       + dot(mmr[b].xyz, sig) + dot(mmr[b + 1], xx)\n"
 +    "       + dot(mmr[b + 2].xyz, x2) + dot(mmr[b + 3], xx2)\n"
 +    "       + dot(mmr[b + 4].xyz, x2 * sig) + dot(mmr[b + 5], xx2 * xx);\n"
++    "}\n"
++    "float predict_mmr(int cc, float s, vec3 sig) {\n"
++    "  int c = cc + 1, n = npiv[c], k = 0;\n"
++    /* a single piece (the common case) with constant indices */
++    "  if (n == 2)\n"
++    "    return mmr_eval(cc * 48, mmrc[cc * 8], sig);\n"
++    "  s = clamp(s, piv[c * 9], piv[c * 9 + n - 1]);\n"
++    "  for (int i = 1; i < 8; i++)\n"
++    "    k += (i < n - 1 && s >= piv[c * 9 + i]) ? 1 : 0;\n"
++    "  return mmr_eval((cc * 8 + k) * 6, mmrc[cc * 8 + k], sig);\n"
 +    "}\n"
 +    "void main() {\n"
 +    "  ivec2 c = ivec2(gl_FragCoord.xy);\n"
@@ -1436,8 +1468,13 @@ index 0000000..b0b9fac
 +    "  uint w = word_at(bl, p);\n"
 +    "  uvec2 c = texelFetch(chroma, p >> 1, 0).xy;\n"
 +    "  float v = lut_at(0, y_of(w));\n"
-+    "  if (use_el)\n"
++    "  if (use_el) {\n"
++    "#if TAPS == 4\n"
++    "    v += lut_at(1, uint(el_h4(ely, p)));\n"
++    "#else\n"
 +    "    v += lut_at(1, uint(el_h(ely, p).x));\n"
++    "#endif\n"
++    "  }\n"
 +    "  o = pack_px(out10(v), c.x, c.y);\n"
 +    "}\n";
 +
@@ -1495,6 +1532,8 @@ index 0000000..b0b9fac
 +    glTexStorage2D(GL_TEXTURE_2D, 1, ifmt, w, h);
 +    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 +    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 +    return tex;
 +}
 +
