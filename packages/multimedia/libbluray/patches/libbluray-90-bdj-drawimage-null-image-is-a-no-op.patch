@@ -1,0 +1,32 @@
+From: djnice <djnice77@gmail.com>
+Subject: bdj: drawing a null image is a no-op, not a NullPointerException
+
+java.awt.Graphics.drawImage() with a null image draws nothing: the JDK's
+SunGraphics2D returns true straight away, and BD-J menu frameworks rely on
+it. Every drawImage() overload of BDGraphicsBase funnels into drawImageN(),
+where a null image fails all the instanceof tests and reaches the
+"unsupported image type" branch, whose img.getClass() throws a
+NullPointerException back into the Xlet.
+
+Paramount's "radius" menu framework (e.g. Planes, Trains and Automobiles
+UHD) builds its sprites from composite PNGs under BDMV/JAR/00001 and keeps
+a sprite whose image did not load with a null image, drawing it anyway.
+The NPE thrown from inside the paint pass of onMediaPresented() aborts the
+menu's setup: the language selector is on screen, but no button is
+focused/highlighted and the remote cannot select anything, so the disc
+never gets past it.
+
+Return true for a null image before anything else, as the JDK does.
+--- a/src/libbluray/bdj/java/java/awt/BDGraphicsBase.java
++++ b/src/libbluray/bdj/java/java/awt/BDGraphicsBase.java
+@@ -1297,6 +1297,10 @@
+         boolean flipX, boolean flipY,
+         Color bg, ImageObserver observer) {
+ 
++        /* java.awt.Graphics: a null image draws nothing (the JDK returns true) */
++        if (img == null)
++            return true;
++
+         if ((sw == 0) || (sh == 0) || (dw == 0) || (dh == 0))
+             return false;
+ 
