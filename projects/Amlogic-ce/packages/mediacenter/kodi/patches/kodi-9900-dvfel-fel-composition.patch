@@ -40,7 +40,7 @@ index 912ce7ce41..3c4ac8f7b4 100644
  #: xbmc/video/VideoDatabase.cpp
  msgctxt "#15011"
 diff --git a/system/settings/settings.xml b/system/settings/settings.xml
-index 8c0702785a..25b17c5587 100755
+index c0cc211e26..1c1c926b27 100755
 --- a/system/settings/settings.xml
 +++ b/system/settings/settings.xml
 @@ -4122,6 +4122,30 @@
@@ -48,13 +48,13 @@ index 8c0702785a..25b17c5587 100755
            <control type="toggle" />
          </setting>
 +        <setting id="coreelec.amlogic.dvfelenable" type="boolean" label="14436" help="14437">
-+          <requirement>HAVE_AMCODEC</requirement>
++          <requirement>AML_DV_NO_HW_EL</requirement>
 +          <level>3</level>
 +          <default>true</default>
 +          <control type="toggle" />
 +        </setting>
 +        <setting id="coreelec.amlogic.dvfeldither" type="boolean" label="14428" help="14429">
-+          <requirement>HAVE_AMCODEC</requirement>
++          <requirement>AML_DV_NO_HW_EL</requirement>
 +          <level>3</level>
 +          <default>true</default>
 +          <control type="toggle" />
@@ -63,7 +63,7 @@ index 8c0702785a..25b17c5587 100755
 +          </dependencies>
 +        </setting>
 +        <setting id="coreelec.amlogic.dvfeldemo" type="boolean" label="14434" help="14435">
-+          <requirement>HAVE_AMCODEC</requirement>
++          <requirement>AML_DV_NO_HW_EL</requirement>
 +          <level>3</level>
 +          <default>false</default>
 +          <control type="toggle" />
@@ -2154,6 +2154,21 @@ index 0000000000..4dfa143ba7
 +#endif
 +
 +#endif
+diff --git a/xbmc/settings/SettingConditions.cpp b/xbmc/settings/SettingConditions.cpp
+index a9b33a0807..16340f10af 100644
+--- a/xbmc/settings/SettingConditions.cpp
++++ b/xbmc/settings/SettingConditions.cpp
+@@ -417,6 +417,10 @@ void CSettingConditions::Initialize()
+ #endif
+ #ifdef HAS_LIBAMCODEC
+   m_simpleConditions.insert("have_amcodec");
++  // S5 has no hardware Dolby Vision enhancement layer path (P7 is converted
++  // to P8.1), a FEL can only be composed on the GPU there
++  if (aml_get_cpufamily_id() == AML_S5)
++    m_simpleConditions.insert("aml_dv_no_hw_el");
+ #endif
+ #if defined(TARGET_WINDOWS)
+   m_simpleConditions.emplace("has_dx");
 diff --git a/xbmc/settings/Settings.h b/xbmc/settings/Settings.h
 index c466975d9f..ff7ffc684e 100644
 --- a/xbmc/settings/Settings.h
