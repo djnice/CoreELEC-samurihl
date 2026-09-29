@@ -208,7 +208,7 @@ struct dvfel_dev {
 	struct vicp_ctx ctx_a, ctx_b;
 
 	/* stats */
-	u64 frames_in, frames_proc, frames_pass, vicp_err, slot_waits;
+	u64 frames_in, frames_proc, frames_pass, vicp_err, slot_waits, held_breaks;
 	u64 gpu_jobs, gpu_composed, gpu_fallback, gpu_timeouts;
 	s64 us_a_sum, us_b_sum, us_a_max, us_b_max, us_gpu_sum, us_gpu_max;
 	u64 us_cnt, us_b_cnt, us_gpu_cnt;
@@ -269,6 +269,25 @@ static bool slot_released_locked(struct dvfel_dev *d, struct dvfel_slot *s)
 		s->orig = NULL;
 	}
 	return s->state == SLOT_FREE;
+}
+
+/*
+ * After a reset every slot may still be held by the display: it had taken
+ * them all (e.g. waiting on a clock that jumped at a chapter skip). Held
+ * slots are released once a frame of the new stream went out, which itself
+ * needs a slot. When nothing of the new stream is on its way, stage A
+ * passes the next frame through instead (d->lock held).
+ */
+static bool held_deadlock_locked(struct dvfel_dev *d)
+{
+	int i;
+
+	if (d->shown_new || d->pend_cnt || d->outq_cnt)
+		return false;
+	for (i = 0; i < d->nslots; i++)
+		if (d->slots[i].state == SLOT_FREE || d->slots[i].state == SLOT_BUSY)
+			return false;
+	return true;
 }
 
 /* some slot may still be on screen (d->lock held) */
@@ -870,20 +889,29 @@ static int dvfel_thread_a(void *data)
 				break;
 			}
 			if (mode) {
-				/* backpressure: never fall back to passthrough */
+				/*
+				 * backpressure: never fall back to passthrough, except
+				 * to break the held slot deadlock (held_deadlock_locked)
+				 */
 				s = slot_free(d);
 				if (mode == 2 && d->client_ready) {
 					j = job_free(d);
 					gpu = true;
 				}
-				if (!s || (gpu && j < 0)) {
+				if (!s && held_deadlock_locked(d)) {
+					j = -1;
+					gpu = false;
+					d->held_breaks++;
+					dvfel_dbg("all slots held after a reset: pass a frame through\n");
+				} else if (!s || (gpu && j < 0)) {
 					d->slot_waits++;
 					spin_unlock_irqrestore(&d->lock, flags);
 					break;
+				} else {
+					s->state = SLOT_BUSY;
+					if (gpu)
+						d->jobs[j].state = JOB_RESERVED;
 				}
-				s->state = SLOT_BUSY;
-				if (gpu)
-					d->jobs[j].state = JOB_RESERVED;
 			}
 			gen = d->gen;
 			spin_unlock_irqrestore(&d->lock, flags);
@@ -1206,8 +1234,11 @@ static void dvfel_put(struct vframe_s *vf, void *op_arg)
 	if (s) {
 		if (s->state == SLOT_OUT && s->gen == d->gen)
 			upstream = s->orig;
-		/* a held slot waits for the keeper, see slot_released_locked() */
-		if (s->state == SLOT_OUT)
+		/*
+		 * a held slot waits for the keeper (slot_released_locked()),
+		 * unless the display returned it and the keeper does not hold it
+		 */
+		if (s->state == SLOT_OUT || (s->state == SLOT_HELD && !slot_kept(s)))
 			s->state = SLOT_FREE;
 		s->orig = NULL;
 	} else {
@@ -1639,9 +1670,9 @@ static int stats_show(struct seq_file *m, void *v)
 		   mode, d->nslots, d->prov_reg ? "registered" : "idle",
 		   d->bufs_ok ? "allocated" : "free", d->buf_w, d->buf_h,
 		   d->client_ready ? "connected" : "none");
-	seq_printf(m, "frames in %llu, processed %llu, passthrough %llu, vicp errors %llu, slot waits %llu\n",
+	seq_printf(m, "frames in %llu, processed %llu, passthrough %llu, vicp errors %llu, slot waits %llu, held breaks %llu\n",
 		   d->frames_in, d->frames_proc, d->frames_pass, d->vicp_err,
-		   d->slot_waits);
+		   d->slot_waits, d->held_breaks);
 	seq_printf(m, "gpu jobs %llu, composed %llu, fallback %llu, timeouts %llu\n",
 		   d->gpu_jobs, d->gpu_composed, d->gpu_fallback, d->gpu_timeouts);
 	seq_printf(m, "VICP A (decompress)  avg %lld us max %lld us\n",
@@ -1661,7 +1692,7 @@ static ssize_t stats_reset_write(struct file *f, const char __user *buf,
 	struct dvfel_dev *d = f->private_data;
 
 	d->frames_in = d->frames_proc = d->frames_pass = d->vicp_err = 0;
-	d->slot_waits = 0;
+	d->slot_waits = d->held_breaks = 0;
 	d->gpu_jobs = d->gpu_composed = d->gpu_fallback = d->gpu_timeouts = 0;
 	d->us_a_sum = d->us_b_sum = d->us_a_max = d->us_b_max = 0;
 	d->us_gpu_sum = d->us_gpu_max = 0;
