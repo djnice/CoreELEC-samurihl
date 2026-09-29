@@ -1,0 +1,564 @@
+diff --git a/addons/resource.language.en_gb/resources/strings.po b/addons/resource.language.en_gb/resources/strings.po
+index 86f39b424f..9bb4229238 100644
+--- a/addons/resource.language.en_gb/resources/strings.po
++++ b/addons/resource.language.en_gb/resources/strings.po
+@@ -9156,7 +9156,7 @@ msgstr ""
+ 
+ #: system/settings/settings.xml
+ msgctxt "#14435"
+-msgid "Split screen comparison for profile 7 FEL titles: the left half is shown with the full FEL composition (RPU mapping and enhancement layer), the right half as without it (the base layer, as shown after the usual conversion to profile 8.1). S928X only."
++msgid "Split screen comparison for profile 7 FEL titles: the left half is shown with the full FEL composition (RPU mapping and enhancement layer), the right half as without it (the base layer, as shown after the usual conversion to profile 8.1). The top of each half shows the brightness measured on the whole picture with and without the enhancement layer (level 1: maximum and average of max(R, G, B), in nits), the difference, and the level 1 the RPU carries. S928X only."
+ msgstr ""
+ 
+ #: system/settings/settings.xml
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp
+index 52cc57ead3..7d2dd0338b 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp
+@@ -13,8 +13,10 @@
+ #include "ServiceBroker.h"
+ #include "settings/Settings.h"
+ #include "settings/SettingsComponent.h"
++#include "utils/StringUtils.h"
+ #include "utils/log.h"
+ 
++#include <algorithm>
+ #include <cmath>
+ #include <climits>
+ #include <cstring>
+@@ -147,6 +149,25 @@ std::shared_ptr<felgpu_meta> ParseRpu(const uint8_t* nal, size_t size,
+     }
+   }
+ 
++  // level 1 for the demo mode overlay; it changes per frame, also when the
++  // mapping is reused from the previous RPU
++  if (meta)
++  {
++    int l1Max = -1, l1Avg = -1;
++    const DoviVdrDmData* dm = dovi_rpu_get_vdr_dm_data(rpu);
++    if (dm && dm->dm_data.level1)
++    {
++      l1Max = dm->dm_data.level1->max_pq;
++      l1Avg = dm->dm_data.level1->avg_pq;
++    }
++    if (dm)
++      dovi_rpu_free_vdr_dm_data(dm);
++    if (meta == prev && (meta->l1_max_pq != l1Max || meta->l1_avg_pq != l1Avg))
++      meta = std::make_shared<felgpu_meta>(*prev);
++    meta->l1_max_pq = l1Max;
++    meta->l1_avg_pq = l1Avg;
++  }
++
+   if (map)
+     dovi_rpu_free_data_mapping(map);
+   if (hdr)
+@@ -155,6 +176,37 @@ std::shared_ptr<felgpu_meta> ParseRpu(const uint8_t* nal, size_t size,
+   return meta;
+ }
+ 
++// SMPTE ST 2084, 12-bit PQ code -> cd/m^2
++float PqNits(int code)
++{
++  const double m1 = 0.1593017578125, m2 = 78.84375;
++  const double c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;
++  const double e = std::pow(std::max(code, 0) / 4095.0, 1.0 / m2);
++  return static_cast<float>(10000.0 * std::pow(std::max(e - c1, 0.0) / (c2 - c3 * e), 1.0 / m1));
++}
++
++std::string Nits(float v, bool sign = false)
++{
++  const std::string s = std::fabs(v) < 10.0f ? StringUtils::Format("{:.1f}", std::fabs(v))
++                                            : StringUtils::Format("{}", std::lround(std::fabs(v)));
++  return (sign ? (v < 0.0f ? "-" : "+") : (v < 0.0f ? "-" : "")) + s;
++}
++
++// demo mode: the measured L1 of both pictures and the RPU's own at the top of
++// each half, see felgpu_get_stats
++void SetDemoOverlay(felgpu* fel, const float n[4], const felgpu_meta& m)
++{
++  felgpu_set_overlay(fel, 0, ("FEL  MAX " + Nits(n[0]) + "  AVG " + Nits(n[1]) + " NIT").c_str());
++  felgpu_set_overlay(fel, 1, m.l1_max_pq < 0 ? "RPU L1  -"
++                                             : ("RPU L1  MAX " + Nits(PqNits(m.l1_max_pq)) + "  AVG " +
++                                                Nits(PqNits(m.l1_avg_pq)) + " NIT")
++                                                   .c_str());
++  felgpu_set_overlay(fel, 2, ("BL   MAX " + Nits(n[2]) + "  AVG " + Nits(n[3]) + " NIT").c_str());
++  felgpu_set_overlay(fel, 3, ("FEL-BL  MAX " + Nits(n[0] - n[2], true) + "  AVG " +
++                              Nits(n[1] - n[3], true) + " NIT")
++                                 .c_str());
++}
++
+ // debug: /storage/dvfel_dump_pts holds a pts; the EL frame and metadata used
+ // for that frame are written to /storage/dvfel_el.yuv and dvfel_meta.txt
+ int64_t DumpPts()
+@@ -761,6 +813,7 @@ void CAMLDvFel::GpuThread(std::promise<bool> ready)
+     const int64_t dumpPts = DumpPts();
+     int dither = -1, pattern = -1, demo = -1;
+     auto nextDitherCheck = std::chrono::steady_clock::now();
++    auto nextOverlay = nextDitherCheck;
+     while (!m_stop)
+     {
+       if (std::chrono::steady_clock::now() >= nextDitherCheck)
+@@ -789,6 +842,8 @@ void CAMLDvFel::GpuThread(std::promise<bool> ready)
+         {
+           demo = dem;
+           felgpu_set_demo(fel, dem);
++          for (int line = 0; line < 4; line++)
++            felgpu_set_overlay(fel, line, "");
+           CLog::Log(LOGINFO, "CAMLDvFel: demo mode {}", dem);
+         }
+       }
+@@ -828,6 +883,14 @@ void CAMLDvFel::GpuThread(std::promise<bool> ready)
+         felgpu_run(fel, tin[job.buf], fout[job.buf]);
+         glFinish();
+         m_gpuMsSum += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++        // the overlay text is drawn from the next frame, updated at 4 Hz to stay readable
++        float nits[4];
++        if (demo == 1 && felgpu_get_stats(fel, nits) &&
++            std::chrono::steady_clock::now() >= nextOverlay)
++        {
++          nextOverlay = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
++          SetDemoOverlay(fel, nits, *meta);
++        }
+         done.status = DVFEL_DONE_COMPOSED;
+         m_composed++;
+       }
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.c b/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.c
+index f8ed5e76d9..a193559c5b 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.c
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.c
+@@ -39,6 +39,17 @@ struct felgpu {
+     int dither_mode;                /* 0 off, 1 on, 2 left half only */
+     int demo;                       /* EL on the left half only */
+     int pattern;                    /* 1: grey ramp test pattern instead of the video */
++
++    /* demo mode L1 measurement and text overlay */
++    GLuint p_stats, p_reduce;
++    GLuint stats, fbo_stats;        /* per sample max(R',G',B') PQ codes, RG16UI sw x sh */
++    GLuint red, fbo_red;            /* max / sum per REDUCE_W samples, RGBA32UI rw x sh */
++    int sw, sh, rw;
++    int stats_valid;
++    float stat_nits[4];
++    GLuint *red_buf;
++    int txt[4 * FELGPU_OVERLAY_LEN], txt_len[4];
++    GLuint font[2 * 32];
+     float vwt_y[12], vwt_c[12], hwt_y[12], hwt_c[12];
+     int vbase_y[2], vbase_c[2], hbase_y[2], hbase_c[2];
+ 
+@@ -133,6 +144,54 @@ struct felgpu {
+     "  return clamp(floor(acc + 0.5), 0.0, el_max);\n" \
+     "}\n"
+ 
++#define STR_(x) #x
++#define STR(x) STR_(x)
++
++/* demo mode: the L1 measurement samples every STATS_STEP-th pixel */
++#define STATS_STEP 8
++/* samples per fragment of the first reduction, the CPU sums the rest */
++#define REDUCE_W 16
++/* overlay text luma, 10-bit limited range (about 200 cd/m^2) */
++#define TEXT_Y 560
++
++/*
++ * demo mode text: 5x7 glyphs in 6x10 cells of ovl_s pixels, from 16 cells
++ * right of each half's left edge; the box behind the lines is darkened.
++ * Glyph rows 0-3 are in .x (row 0 in bits 19-15), rows 4-6 in .y.
++ */
++#define GLSL_OVERLAY \
++    "uniform bool ovl_on;\n" \
++    "uniform int ovl_s;\n" \
++    /* the darkened box of each half (x0, y0, x1, y1), empty if the half has no text */ \
++    "uniform ivec4 ovl_box0;\n" \
++    "uniform ivec4 ovl_box1;\n" \
++    "uniform int ovl_len[4];\n" \
++    "uniform int txt[4 * " STR(FELGPU_OVERLAY_LEN) "];\n" \
++    "uniform uvec2 font[32];\n" \
++    "void overlay(ivec2 p, int W, inout uint y, inout uvec2 c) {\n" \
++    "  bool right = p.x >= W / 2;\n" \
++    "  ivec4 b = right ? ovl_box1 : ovl_box0;\n" \
++    "  if (p.x < b.x || p.x >= b.z || p.y < b.y || p.y >= b.w)\n" \
++    "    return;\n" \
++    "  int side = right ? 1 : 0, s = ovl_s;\n" \
++    "  ivec2 q = p - ivec2(side * (W / 2) + 16 * s, 8 * s);\n" \
++    "  int yi = 64 + (int(y) - 64) * 3 / 10;\n" \
++    "  int cb = 512 + (int(c.x) - 512) * 3 / 10, cr = 512 + (int(c.y) - 512) * 3 / 10;\n" \
++    "  if (q.x >= 0 && q.y >= 0) {\n" \
++    "    int line = q.y / (10 * s), col = q.x / (6 * s);\n" \
++    "    int gx = (q.x - col * 6 * s) / s, gy = (q.y - line * 10 * s) / s;\n" \
++    "    if (col < ovl_len[side * 2 + line] && gx < 5 && gy < 7) {\n" \
++    "      uvec2 g = font[txt[(side * 2 + line) * " STR(FELGPU_OVERLAY_LEN) " + col]];\n" \
++    "      uint bits = gy < 4 ? g.x >> uint(5 * (3 - gy)) : g.y >> uint(5 * (6 - gy));\n" \
++    "      if (((bits >> uint(4 - gx)) & 1u) != 0u) {\n" \
++    "        yi = " STR(TEXT_Y) "; cb = 512; cr = 512;\n" \
++    "      }\n" \
++    "    }\n" \
++    "  }\n" \
++    "  y = uint(yi);\n" \
++    "  c = uvec2(uint(cb), uint(cr));\n" \
++    "}\n"
++
+ static const char *vs_src =
+     "#version 320 es\n"
+     "void main() {\n"
+@@ -198,7 +257,6 @@ static const char *fs_chroma =
+     "uniform float mmrc[16];\n"
+     "uniform bool cpoly[2];\n"
+     "uniform bool use_el;\n"
+-    "uniform int el_split;\n"   /* demo: the composition only left of this column */
+     "uniform float inv_bl;\n"
+     "out uvec2 o;\n"
+     "float mmr_eval(int b, float c0, vec3 sig) {\n"
+@@ -240,10 +298,8 @@ static const char *fs_chroma =
+     "    vcb = cpoly[0] ? lut_at(4, cb) : predict_mmr(0, sig.y, sig);\n"
+     "    vcr = cpoly[1] ? lut_at(5, cr) : predict_mmr(1, sig.z, sig);\n"
+     "  }\n"
+-    "  if (c.x >= el_split) {\n"   /* demo: the untouched base layer, as a no-op P8.1 RPU shows it */
+-    "    vcb = float(cb) / 1024.0;\n"
+-    "    vcr = float(cr) / 1024.0;\n"
+-    "  } else if (use_el) {\n"
++    /* composed on the whole picture also in demo mode: the luma pass picks the BL chroma */
++    "  if (use_el) {\n"
+     "    vec2 el = el_h(elc, c);\n"
+     "    vcb += lut_at(2, uint(el.x));\n"
+     "    vcr += lut_at(3, uint(el.y));\n"
+@@ -255,27 +311,113 @@ static const char *fs_chroma =
+ 
+ /* luma + packing: one fragment per output pixel word */
+ static const char *fs_luma =
+-    GLSL_HEAD GLSL_WORD GLSL_EL_H
++    GLSL_HEAD GLSL_WORD GLSL_EL_H GLSL_OVERLAY
+     "uniform sampler2D bl;\n"
+     "uniform sampler2D ely;\n"
+     "uniform usampler2D chroma;\n"
+     "uniform bool use_el;\n"
+-    "uniform int el_split;\n"
++    "uniform int el_split;\n"   /* demo: the composition only left of this column */
+     "out vec4 o;\n"
+     "void main() {\n"
+     "  ivec2 p = ivec2(gl_FragCoord.xy);\n"
+     "  uint w = word_at(bl, p);\n"
+     "  uvec2 c = texelFetch(chroma, p >> 1, 0).xy;\n"
+     "  float v = lut_at(0, y_of(w));\n"
+-    "  if (p.x >= el_split)\n"
++    "  if (p.x >= el_split) {\n"   /* demo: the untouched base layer, as a no-op P8.1 RPU shows it */
+     "    v = float(y_of(w)) / 1024.0;\n"
+-    "  else if (use_el)\n"
++    "    uint wc = word_at(bl, (p >> 1) << 1);\n"
++    "    c = pattern != 0 ? uvec2(512u) : uvec2(cb_of(wc), cr_of(wc));\n"
++    "  } else if (use_el)\n"
+     "    v += lut_at(1, uint(el_hg(ely, p)));\n"
+     "  if (pattern != 0)\n"
+     "    v = pattern_v(p, textureSize(bl, 0));\n"
+-    "  o = pack_px(out10d(v, dth(p, ivec2(0))), c.x, c.y);\n"
++    "  uint y = out10d(v, dth(p, ivec2(0)));\n"
++    "  if (ovl_on)\n"
++    "    overlay(p, textureSize(bl, 0).x, y, c);\n"
++    "  o = pack_px(y, c.x, c.y);\n"
++    "}\n";
++
++/*
++ * demo mode L1 measurement, one fragment per STATS_STEP x STATS_STEP block:
++ * max(R', G', B') as a 12-bit PQ code of the composed picture (.x) and of
++ * the base layer (.y) at the block's centre (an even, 4:2:0 sited pixel)
++ */
++static const char *fs_stats =
++    GLSL_HEAD GLSL_WORD GLSL_EL_H
++    "#define STATS_STEP " STR(STATS_STEP) "\n"
++    "uniform sampler2D bl;\n"
++    "uniform sampler2D ely;\n"
++    "uniform usampler2D chroma;\n"
++    "uniform bool use_el;\n"
++    "out uvec2 o;\n"
++    /* limited range BT.2020 non-constant luminance Y'CbCr, 10-bit codes */
++    "uint pq_max(float y, float cb, float cr) {\n"
++    "  float Y = (y - 64.0) / 876.0, u = (cb - 512.0) / 896.0, v = (cr - 512.0) / 896.0;\n"
++    "  float m = max(Y + 1.4746 * v, max(Y - 0.16455 * u - 0.57135 * v, Y + 1.8814 * u));\n"
++    "  return uint(clamp(m, 0.0, 1.0) * 4095.0 + 0.5);\n"
++    "}\n"
++    "void main() {\n"
++    "  ivec2 p = ivec2(gl_FragCoord.xy) * STATS_STEP + STATS_STEP / 2;\n"
++    "  uint w = word_at(bl, p);\n"
++    "  float v = lut_at(0, y_of(w));\n"
++    "  if (use_el)\n"
++    "    v += lut_at(1, uint(el_hg(ely, p)));\n"
++    "  uvec2 c = texelFetch(chroma, p >> 1, 0).xy;\n"
++    "  o = uvec2(pq_max(clamp(floor(v * 1024.0 + 0.5), 0.0, 1023.0), float(c.x), float(c.y)),\n"
++    "            pq_max(float(y_of(w)), float(cb_of(w)), float(cr_of(w))));\n"
++    "}\n";
++
++/* one fragment per REDUCE_W samples of a row: max and sum of both values */
++static const char *fs_reduce =
++    GLSL_HEAD
++    "uniform usampler2D s;\n"
++    "out uvec4 o;\n"
++    "void main() {\n"
++    "  ivec2 q = ivec2(gl_FragCoord.xy);\n"
++    "  int x0 = q.x * " STR(REDUCE_W) ", x1 = min(x0 + " STR(REDUCE_W) ", textureSize(s, 0).x);\n"
++    "  uvec4 a = uvec4(0u);\n"
++    "  for (int x = x0; x < x1; x++) {\n"
++    "    uvec2 v = texelFetch(s, ivec2(x, q.y), 0).xy;\n"
++    "    a = uvec4(max(a.xy, v), a.zw + v);\n"
++    "  }\n"
++    "  o = a;\n"
+     "}\n";
+ 
++/* overlay glyphs: 5x7, '#' set */
++static const char font_chars[] = " 0123456789ABEFGILMNPRTUVX.+-%";
++static const char *const font_rows[][7] = {
++    { ".....", ".....", ".....", ".....", ".....", ".....", "....." },
++    { ".###.", "#...#", "#..##", "#.#.#", "##..#", "#...#", ".###." },
++    { "..#..", ".##..", "..#..", "..#..", "..#..", "..#..", ".###." },
++    { ".###.", "#...#", "....#", "...#.", "..#..", ".#...", "#####" },
++    { "#####", "...#.", "..#..", "...#.", "....#", "#...#", ".###." },
++    { "...#.", "..##.", ".#.#.", "#..#.", "#####", "...#.", "...#." },
++    { "#####", "#....", "####.", "....#", "....#", "#...#", ".###." },
++    { "..##.", ".#...", "#....", "####.", "#...#", "#...#", ".###." },
++    { "#####", "....#", "...#.", "..#..", ".#...", ".#...", ".#..." },
++    { ".###.", "#...#", "#...#", ".###.", "#...#", "#...#", ".###." },
++    { ".###.", "#...#", "#...#", ".####", "....#", "...#.", ".##.." },
++    { ".###.", "#...#", "#...#", "#####", "#...#", "#...#", "#...#" }, /* A */
++    { "####.", "#...#", "#...#", "####.", "#...#", "#...#", "####." }, /* B */
++    { "#####", "#....", "#....", "####.", "#....", "#....", "#####" }, /* E */
++    { "#####", "#....", "#....", "####.", "#....", "#....", "#...." }, /* F */
++    { ".###.", "#...#", "#....", "#.###", "#...#", "#...#", ".####" }, /* G */
++    { ".###.", "..#..", "..#..", "..#..", "..#..", "..#..", ".###." }, /* I */
++    { "#....", "#....", "#....", "#....", "#....", "#....", "#####" }, /* L */
++    { "#...#", "##.##", "#.#.#", "#.#.#", "#...#", "#...#", "#...#" }, /* M */
++    { "#...#", "#...#", "##..#", "#.#.#", "#..##", "#...#", "#...#" }, /* N */
++    { "####.", "#...#", "#...#", "####.", "#....", "#....", "#...." }, /* P */
++    { "####.", "#...#", "#...#", "####.", "#.#..", "#..#.", "#...#" }, /* R */
++    { "#####", "..#..", "..#..", "..#..", "..#..", "..#..", "..#.." }, /* T */
++    { "#...#", "#...#", "#...#", "#...#", "#...#", "#...#", ".###." }, /* U */
++    { "#...#", "#...#", "#...#", "#...#", "#...#", ".#.#.", "..#.." }, /* V */
++    { "#...#", "#...#", ".#.#.", "..#..", ".#.#.", "#...#", "#...#" }, /* X */
++    { ".....", ".....", ".....", ".....", ".....", ".##..", ".##.." }, /* . */
++    { ".....", "..#..", "..#..", "#####", "..#..", "..#..", "....." }, /* + */
++    { ".....", ".....", ".....", "#####", ".....", ".....", "....." }, /* - */
++    { "##...", "##..#", "...#.", "..#..", ".#...", "#..##", "...##" }, /* % */
++};
++
+ /* ------------------------------------------------------------------ */
+ /* GL helpers                                                         */
+ /* ------------------------------------------------------------------ */
+@@ -504,7 +646,9 @@ struct felgpu *felgpu_create(int w, int h, int taps)
+     f->p_vert2 = program(fs_el_vert2, taps);
+     f->p_chroma = program(fs_chroma, taps);
+     f->p_luma = program(fs_luma, taps);
+-    if (!f->p_vert1 || !f->p_vert2 || !f->p_chroma || !f->p_luma) {
++    f->p_stats = program(fs_stats, taps);
++    f->p_reduce = program(fs_reduce, taps);
++    if (!f->p_vert1 || !f->p_vert2 || !f->p_chroma || !f->p_luma || !f->p_stats || !f->p_reduce) {
+         free(f);
+         return NULL;
+     }
+@@ -526,6 +670,28 @@ struct felgpu *felgpu_create(int w, int h, int taps)
+     f->fbo_cv = make_fbo(f->el_cv);
+     f->fbo_chroma = make_fbo(f->chroma);
+ 
++    f->sw = w / STATS_STEP;
++    f->sh = h / STATS_STEP;
++    f->rw = (f->sw + REDUCE_W - 1) / REDUCE_W;
++    f->stats = make_tex(GL_RG16UI, f->sw, f->sh);
++    f->red = make_tex(GL_RGBA32UI, f->rw, f->sh);
++    f->fbo_stats = make_fbo(f->stats);
++    f->fbo_red = make_fbo(f->red);
++    f->red_buf = calloc((size_t)f->rw * f->sh * 4, sizeof(GLuint));
++    for (size_t g = 0; g < sizeof(font_rows) / sizeof(font_rows[0]) && g < 32; g++) {
++        GLuint rows = 0, rows2 = 0;
++        for (int r = 0; r < 7; r++)
++            for (int x = 0; x < 5; x++)
++                if (font_rows[g][r][x] == '#') {
++                    if (r < 4)
++                        rows |= 1u << (5 * (3 - r) + 4 - x);
++                    else
++                        rows2 |= 1u << (5 * (6 - r) + 4 - x);
++                }
++        f->font[2 * g] = rows;
++        f->font[2 * g + 1] = rows2;
++    }
++
+     /* EL sample phase: centered 2x (see fel_compose.c); chroma top-left sited */
+     const double ce = 0.5;
+     kernel(-ce / 2, taps, f->vwt_y, f->vbase_y);
+@@ -539,14 +705,18 @@ void felgpu_destroy(struct felgpu *f)
+ {
+     if (!f)
+         return;
+-    GLuint tex[] = { f->el_y, f->el_cb, f->el_cr, f->el_yv, f->el_cv, f->chroma, f->lut, f->dither };
+-    GLuint fbo[] = { f->fbo_yv, f->fbo_cv, f->fbo_chroma };
+-    glDeleteTextures(8, tex);
+-    glDeleteFramebuffers(3, fbo);
++    GLuint tex[] = { f->el_y, f->el_cb, f->el_cr, f->el_yv, f->el_cv, f->chroma, f->lut, f->dither,
++                     f->stats, f->red };
++    GLuint fbo[] = { f->fbo_yv, f->fbo_cv, f->fbo_chroma, f->fbo_stats, f->fbo_red };
++    glDeleteTextures(10, tex);
++    glDeleteFramebuffers(5, fbo);
+     glDeleteProgram(f->p_vert1);
+     glDeleteProgram(f->p_vert2);
+     glDeleteProgram(f->p_chroma);
+     glDeleteProgram(f->p_luma);
++    glDeleteProgram(f->p_stats);
++    glDeleteProgram(f->p_reduce);
++    free(f->red_buf);
+     free(f);
+ }
+ 
+@@ -661,6 +831,52 @@ static int dither_split(const struct felgpu *f, int width)
+     return f->dither_mode == 1 ? width : f->dither_mode == 2 ? width / 2 : 0;
+ }
+ 
++/* SMPTE ST 2084: normalized PQ -> cd/m^2 */
++static float pq_nits(double n)
++{
++    const double m1 = 0.1593017578125, m2 = 78.84375;
++    const double c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;
++    double e = pow(n < 0.0 ? 0.0 : n, 1.0 / m2);
++    return (float)(10000.0 * pow(fmax(e - c1, 0.0) / (c2 - c3 * e), 1.0 / m1));
++}
++
++/* demo mode: L1 of the composed picture and of the base layer (see felgpu_get_stats) */
++static void measure(struct felgpu *f, GLuint bl_tex)
++{
++    GLuint p = f->p_stats;
++    glUseProgram(p);
++    glUniform1i(glGetUniformLocation(p, "use_el"), f->use_el);
++    glUniform1f(glGetUniformLocation(p, "el_max"), f->el_max);
++    glUniform1fv(glGetUniformLocation(p, "hwt"), 12, f->hwt_y);
++    glUniform1iv(glGetUniformLocation(p, "hbase"), 2, f->hbase_y);
++    bind_tex(p, "bl", 0, bl_tex);
++    bind_tex(p, "ely", 1, f->el_yv);
++    bind_tex(p, "chroma", 2, f->chroma);
++    bind_tex(p, "lut", 3, f->lut);
++    draw(f->fbo_stats, f->sw, f->sh);
++
++    p = f->p_reduce;
++    glUseProgram(p);
++    bind_tex(p, "s", 0, f->stats);
++    draw(f->fbo_red, f->rw, f->sh);
++    glReadPixels(0, 0, f->rw, f->sh, GL_RGBA_INTEGER, GL_UNSIGNED_INT, f->red_buf);
++
++    GLuint mx[2] = { 0, 0 };
++    uint64_t sum[2] = { 0, 0 };
++    for (int k = 0; k < f->rw * f->sh; k++)
++        for (int i = 0; i < 2; i++) {
++            if (f->red_buf[k * 4 + i] > mx[i])
++                mx[i] = f->red_buf[k * 4 + i];
++            sum[i] += f->red_buf[k * 4 + 2 + i];
++        }
++    const double n = (double)f->sw * f->sh * 4095.0;
++    for (int i = 0; i < 2; i++) {
++        f->stat_nits[2 * i] = pq_nits(mx[i] / 4095.0);
++        f->stat_nits[2 * i + 1] = pq_nits(sum[i] / n);
++    }
++    f->stats_valid = 1;
++}
++
+ void felgpu_run(struct felgpu *f, GLuint bl_tex, GLuint out_fbo)
+ {
+     GLuint p;
+@@ -701,12 +917,15 @@ void felgpu_run(struct felgpu *f, GLuint bl_tex, GLuint out_fbo)
+     bind_tex(p, "lut", 2, f->lut);
+     bind_tex(p, "dither", 3, f->dither);
+     glUniform1i(glGetUniformLocation(p, "dither_split"), dither_split(f, f->w / 2));
+-    glUniform1i(glGetUniformLocation(p, "el_split"), f->demo ? f->w / 4 : f->w);
+     glUniform1i(glGetUniformLocation(p, "pattern"), f->pattern);
+     glUniform1i(glGetUniformLocation(p, "pass_h"), f->h / 2);
+     draw(f->fbo_chroma, f->w / 2, f->h / 2);
+     prof_mark(f, 2);
+ 
++    f->stats_valid = 0;
++    if (f->demo && !f->pattern)
++        measure(f, bl_tex);
++
+     p = f->p_luma;
+     glUseProgram(p);
+     glUniform1i(glGetUniformLocation(p, "use_el"), f->use_el);
+@@ -722,6 +941,27 @@ void felgpu_run(struct felgpu *f, GLuint bl_tex, GLuint out_fbo)
+     glUniform1i(glGetUniformLocation(p, "el_split"), f->demo ? f->w / 2 : f->w);
+     glUniform1i(glGetUniformLocation(p, "pattern"), f->pattern);
+     glUniform1i(glGetUniformLocation(p, "pass_h"), f->h);
++    /* overlay boxes, see GLSL_OVERLAY: text from 16 cells right, 8 down of each half's corner */
++    const int s = f->h >= 1080 ? f->h / 540 : 1;
++    int ovl = 0, box[2][4];
++    for (int side = 0; side < 2; side++) {
++        int n0 = f->txt_len[side * 2], n1 = f->txt_len[side * 2 + 1];
++        int nl = n1 > 0 ? 2 : n0 > 0 ? 1 : 0;
++        int x = side * (f->w / 2) + 16 * s, y = 8 * s;
++        int cols = n0 > n1 ? n0 : n1;
++        box[side][0] = x - 3 * s;
++        box[side][1] = y - 3 * s;
++        box[side][2] = nl ? x + cols * 6 * s + 2 * s : box[side][0];
++        box[side][3] = y + nl * 10 * s;
++        ovl |= nl;
++    }
++    glUniform1i(glGetUniformLocation(p, "ovl_on"), f->demo && ovl);
++    glUniform1i(glGetUniformLocation(p, "ovl_s"), s);
++    glUniform4iv(glGetUniformLocation(p, "ovl_box0"), 1, box[0]);
++    glUniform4iv(glGetUniformLocation(p, "ovl_box1"), 1, box[1]);
++    glUniform1iv(glGetUniformLocation(p, "ovl_len"), 4, f->txt_len);
++    glUniform1iv(glGetUniformLocation(p, "txt"), 4 * FELGPU_OVERLAY_LEN, f->txt);
++    glUniform2uiv(glGetUniformLocation(p, "font"), 32, f->font);
+     draw(out_fbo, f->w, f->h);
+     prof_mark(f, 3);
+     f->prof_n++;
+@@ -742,6 +982,26 @@ void felgpu_set_demo(struct felgpu *f, int on)
+     f->demo = on;
+ }
+ 
++int felgpu_get_stats(struct felgpu *f, float nits[4])
++{
++    if (!f->stats_valid)
++        return 0;
++    memcpy(nits, f->stat_nits, sizeof(f->stat_nits));
++    return 1;
++}
++
++void felgpu_set_overlay(struct felgpu *f, int line, const char *text)
++{
++    if (line < 0 || line > 3)
++        return;
++    int n = 0;
++    for (; text && text[n] && n < FELGPU_OVERLAY_LEN; n++) {
++        const char *g = strchr(font_chars, text[n]);
++        f->txt[line * FELGPU_OVERLAY_LEN + n] = g ? (int)(g - font_chars) : 0;
++    }
++    f->txt_len[line] = n;
++}
++
+ void felgpu_set_pattern(struct felgpu *f, int pattern)
+ {
+     f->pattern = pattern;
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.h
+index 4dfa143ba7..8b8166a770 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.h
+@@ -39,6 +39,7 @@ struct felgpu_meta {
+     double mmr[3][FELGPU_MAX_PIECES][3][7];            /* [order][term] */
+     int nlq_offset[3];                 /* EL codewords */
+     double nlq_slope[3], nlq_thresh[3], nlq_max[3];    /* normalized */
++    int l1_max_pq, l1_avg_pq;          /* RPU level 1, 12-bit PQ; -1 if absent (not used by felgpu) */
+ };
+ 
+ struct felgpu;
+@@ -69,6 +70,22 @@ void felgpu_set_dither(struct felgpu *f, int mode);
+  */
+ void felgpu_set_demo(struct felgpu *f, int on);
+ 
++/*
++ * demo mode measurement: the L1 of the whole composed picture and of the whole
++ * base layer, from every 8th pixel - max and average of max(R', G', B') in PQ,
++ * as cd/m^2: nits[0] composed max, [1] composed avg, [2] BL max, [3] BL avg.
++ * Returns 0 if the last felgpu_run did not measure (demo off).
++ */
++int felgpu_get_stats(struct felgpu *f, float nits[4]);
++
++/*
++ * demo mode text at the top of the picture: line 0/1 on the left half,
++ * 2/3 on the right one; upper case letters, digits, space and . + - %
++ * (at most FELGPU_OVERLAY_LEN characters, "" hides the line)
++ */
++#define FELGPU_OVERLAY_LEN 40
++void felgpu_set_overlay(struct felgpu *f, int line, const char *text);
++
+ /*
+  * test pattern instead of the composition (1): 12-bit grey ramps in 4 bands,
+  * dark (10-bit codes 160-240) and mid (330-410); with dither on, the upper
