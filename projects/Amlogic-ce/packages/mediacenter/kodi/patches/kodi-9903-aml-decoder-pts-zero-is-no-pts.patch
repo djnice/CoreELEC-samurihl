@@ -1,0 +1,49 @@
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLCodec.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLCodec.cpp
+index 7da50e206e..b47a452809 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLCodec.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLCodec.cpp
+@@ -3453,6 +3453,20 @@ CDVDVideoCodec::VCReturn CAMLCodec::GetPicture(VideoPicture *pVideoPicture)
+                 elapsed_since_last_frame.count(), static_cast<int>(starve_probe_delay.count()));
+     }
+ 
++    // The first picture after a reset without a pts (see below) is dropped: the
++    // player syncs its clock to the first picture of a new position, and an
++    // interpolated pts keeps it on the old timeline while the next pictures
++    // carry the new one - a Blu-ray chapter skip into another clip then stalls.
++    // One picture per reset at most (m_cur_pts stays 0, so the next one is not
++    // the first any more), and never for a stream without timestamps.
++    if (m_cur_pts == 0 && m_last_pts == DVD_NOPTS_VALUE && !m_hints.ptsinvalid)
++    {
++      CLog::Log(LOGDEBUG, LOGVIDEO,
++                "CAMLCodec::GetPicture: dropping the first picture after a reset, it has no pts");
++      ReleaseFrame(m_bufferIndex, true, m_sessionGen.load());
++      return CDVDVideoCodec::VC_BUFFER;
++    }
++
+     pVideoPicture->iFlags = 0;
+ 
+     m_minimum_buffer_level = (streambuffer ? m_minimum_buffer_level : 0.0f);
+@@ -3460,7 +3474,13 @@ CDVDVideoCodec::VCReturn CAMLCodec::GetPicture(VideoPicture *pVideoPicture)
+     m_tp_last_frame = std::chrono::steady_clock::now();
+     BDSTAGE::PictureEmitted();
+ 
+-    if (m_last_pts == DVD_NOPTS_VALUE)
++    // A frame whose packet had no pts comes back with 0: AddData writes avpts 0
++    // for DVD_NOPTS_VALUE. It is not a timestamp of zero. Taken as one it
++    // restarts the clock at 0 while the next frames carry the real timeline
++    // (after a Blu-ray chapter skip into another clip: playback stalls), and the
++    // frame after it gets the whole jump as its duration.
++    const bool noPts = m_cur_pts == 0;
++    if (m_last_pts == DVD_NOPTS_VALUE || m_last_pts == 0 || noPts)
+       pVideoPicture->iDuration = static_cast<double>(am_private->video_rate) * DVD_TIME_BASE / UNIT_FREQ;
+     else
+     {
+@@ -3471,7 +3491,7 @@ CDVDVideoCodec::VCReturn CAMLCodec::GetPicture(VideoPicture *pVideoPicture)
+     }
+ 
+     pVideoPicture->dts = DVD_NOPTS_VALUE;
+-    pVideoPicture->pts = static_cast<double>(m_cur_pts);
++    pVideoPicture->pts = noPts ? DVD_NOPTS_VALUE : static_cast<double>(m_cur_pts);
+ 
+     CLog::Log(LOGDEBUG, LOGVIDEO, "CAMLCodec::GetPicture: index: {:d}, pts: {:.3f}, dur:{:.3f}ms elf:{:d}ms",
+       m_bufferIndex, pVideoPicture->pts / DVD_TIME_BASE, pVideoPicture->iDuration / 1000, elapsed_since_last_frame.count());
