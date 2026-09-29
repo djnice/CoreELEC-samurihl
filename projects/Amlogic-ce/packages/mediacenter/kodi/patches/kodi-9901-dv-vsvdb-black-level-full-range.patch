@@ -1,0 +1,93 @@
+diff --git a/addons/resource.language.en_gb/resources/strings.po b/addons/resource.language.en_gb/resources/strings.po
+index 3c4ac8f7b4..86f39b424f 100644
+--- a/addons/resource.language.en_gb/resources/strings.po
++++ b/addons/resource.language.en_gb/resources/strings.po
+@@ -26499,7 +26499,7 @@ msgstr ""
+ #. Description of setting with label #60380
+ #: system/settings/settings.xml
+ msgctxt "#60381"
+-msgid "Override the minimum luminance advertised in the injected Dolby Vision VSVDB. With player-led (low-latency) Dolby Vision the Dolby engine in this box maps black to exactly this level, so it sets where near-black detail stops: a display advertising 0.0006 nit shows everything below 10-bit code 68 as black. 'Display' keeps the panel's own figure. Lower values reveal more shadow detail if the panel can reproduce it; higher values lift black for panels that crush. No effect on TV-led Dolby Vision (the television maps it) or on HDR10/SDR output. Requires a v2 VSVDB display."
++msgid "Override the minimum luminance advertised in the injected Dolby Vision VSVDB. With player-led (low-latency) Dolby Vision the Dolby engine in this box maps black to exactly this level, so it sets where near-black detail stops: a display advertising 0.0006 nit shows everything below 10-bit code 68 as black. 'Display' keeps the panel's own figure. Lower values reveal more shadow detail if the panel can reproduce it; higher values lift black for panels that crush. The list covers the whole range the VSVDB can carry, from PQ 0 up to PQ 620 (about 1 cd/m²): projectors and other displays that cannot reach a true black should be set to their measured black level. No effect on TV-led Dolby Vision (the television maps it) or on HDR10/SDR output. Requires a v2 VSVDB display."
+ msgstr ""
+ 
+ #: system/settings/settings.xml
+diff --git a/system/settings/settings.xml b/system/settings/settings.xml
+index 1c1c926b27..753cde1f40 100755
+--- a/system/settings/settings.xml
++++ b/system/settings/settings.xml
+@@ -4453,7 +4453,8 @@
+           <control type="spinner" format="string" />
+         </setting>
+         <!-- Black level advertised in the injected VSVDB (v2 min-luminance index): the
+-             player-led DV engine maps black to it. 0 = keep the panel's; N = index N-1. -->
++             player-led DV engine maps black to it. 0 = keep the panel's; N = index N-1,
++             the full PQ 0-620 range (VSVDBMinLumFiller). -->
+         <setting id="coreelec.amlogic.dolbyvision.vsvdb.minlum" type="integer" label="60380" help="60381" parent="coreelec.amlogic.dolbyvision.vsvdb.maxlum.override">
+           <requirement>HAVE_AMCODEC</requirement>
+           <level>2</level>
+@@ -4463,14 +4464,7 @@
+             <dependency type="visible" setting="coreelec.amlogic.dolbyvision.vsvdb.maxlum.override" operator="is">true</dependency>
+           </dependencies>
+           <constraints>
+-            <options>
+-              <option label="60344">0</option>
+-              <option label="60382">1</option>
+-              <option label="60383">2</option>
+-              <option label="60384">3</option>
+-              <option label="60385">4</option>
+-              <option label="60386">5</option>
+-            </options>
++            <options>DolbyVisionVSVDBMinLum</options>
+           </constraints>
+           <control type="spinner" format="string" />
+         </setting>
+diff --git a/xbmc/windowing/amlogic/WinSystemAmlogic.cpp b/xbmc/windowing/amlogic/WinSystemAmlogic.cpp
+index 108f76cf59..49755cee01 100644
+--- a/xbmc/windowing/amlogic/WinSystemAmlogic.cpp
++++ b/xbmc/windowing/amlogic/WinSystemAmlogic.cpp
+@@ -32,6 +32,7 @@
+ #include "settings/lib/SettingsManager.h"
+ #include "guilib/DispResource.h"
+ #include "utils/AMLUtils.h"
++#include "utils/StringUtils.h"
+ #include "utils/log.h"
+ #include "threads/SingleLock.h"
+ 
+@@ -336,6 +337,29 @@ void VS10DvFiller(const SettingConstPtr& setting, std::vector<IntegerSettingOpti
+   if (aml_display_support_hdr_pq()) list.emplace_back(vs10_label(60065), DOLBY_VISION_OUTPUT_MODE_HDR10); // HDR10
+   if (aml_display_support_dv()) list.emplace_back(vs10_label(60063), DOLBY_VISION_OUTPUT_MODE_IPT); // Off = native DV
+ }
++
++// VSVDB v2 black level: 0 keeps the display's own figure, N selects the 5-bit
++// min-luminance index N-1 (PQ12 = 20 x index), see aml_dv_apply_vsvdb. The whole
++// range is offered - up to about 1 cd/m^2 - since projectors and panels that
++// cannot reach a true black need far more than an OLED.
++void VSVDBMinLumFiller(const SettingConstPtr& setting,
++                       std::vector<IntegerSettingOption>& list,
++                       int& current)
++{
++  // PQ12 = 20 x index in cd/m^2, held as 1e-8 cd/m^2
++  static const long nits_1e8[32] = {
++      0,        64354,    223738,   478965,   837904,   1310152,  1906315,  2637791,
++      3516709,  4555910,  5768953,  7170139,  8774531,  10597988, 12657199, 14969718,
++      17554001, 20429448, 23616447, 27136414, 31011844, 35266356, 39924746, 45013035,
++      50558532, 56589883, 63137136, 70231800, 77906912, 86197104, 95138673, 104769654};
++
++  list.clear();
++  list.emplace_back(vs10_label(60344), 0); // Display
++  for (int i = 0; i < 32; i++)
++    list.emplace_back(StringUtils::Format("PQ {} ({:.8f} cd/m²)", i * 20,
++                                          static_cast<double>(nits_1e8[i]) / 1e8),
++                      i + 1);
++}
+ } // namespace
+ 
+ bool CWinSystemAmlogic::InitWindowSystem()
+@@ -398,6 +422,7 @@ bool CWinSystemAmlogic::InitWindowSystem()
+     dvMgr->RegisterSettingOptionsFiller("DolbyVisionVS10HDR10", VS10Hdr10Filler);
+     dvMgr->RegisterSettingOptionsFiller("DolbyVisionVS10HDRHLG", VS10HdrHlgFiller);
+     dvMgr->RegisterSettingOptionsFiller("DolbyVisionVS10DV", VS10DvFiller);
++    dvMgr->RegisterSettingOptionsFiller("DolbyVisionVSVDBMinLum", VSVDBMinLumFiller);
+ 
+     // Live-apply the VSVDB max-luminance override when the shared display-peak
+     // value or the force toggle changes during DV playback, and the CMv4.0
