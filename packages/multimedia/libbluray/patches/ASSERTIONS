@@ -113,3 +113,5 @@ src/libbluray/bdnav/clpi_parse.c:if (jj > 0) {:1
 # the two below also occur once in pristine 1.5.0: the count (2) is what catches a dropped hunk
 src/libbluray/bdnav/clpi_parse.c:if (cpi->num_stream_pid < 1 || !cpi->entry) {:2
 src/libbluray/bdnav/navigation.c:if (angle > 8) {:2
+# 90 drawing a null image is a no-op
+src/libbluray/bdj/java/java/awt/BDGraphicsBase.java:/* java.awt.Graphics: a null image draws nothing (the JDK returns true) */:1
