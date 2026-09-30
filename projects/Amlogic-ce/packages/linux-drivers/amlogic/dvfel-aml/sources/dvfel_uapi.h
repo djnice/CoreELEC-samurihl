@@ -17,6 +17,11 @@
  * In in[buf], chroma at even x and even y is the original 4:2:0 sample; odd
  * positions are interpolated. dvfel converts out[buf] back to 4:2:0 by
  * keeping the chroma at even x/y.
+ *
+ * Hardware decoded enhancement layer (Dolby Vision dual layer decoding, the
+ * EL decoder feeding the "dvfelel" receiver): with el_width set, dvfel
+ * decompresses the EL picture of each frame into el[buf] in the same layout
+ * (el_width x el_height) and flags the job with DVFEL_JOB_EL.
  */
 #ifndef _UAPI_DVFEL_H
 #define _UAPI_DVFEL_H
@@ -34,9 +39,13 @@ struct dvfel_reg_bufs {
 	__u32 count;			/* 1..DVFEL_MAX_BUFS */
 	__s32 in_fd[DVFEL_MAX_BUFS];	/* dma-buf fds */
 	__s32 out_fd[DVFEL_MAX_BUFS];
+	__u32 el_width;			/* 0: no hardware decoded EL */
+	__u32 el_height;
+	__s32 el_fd[DVFEL_MAX_BUFS];
 };
 
 #define DVFEL_JOB_NEW_STREAM	(1 << 0)	/* first job after start/seek */
+#define DVFEL_JOB_EL		(1 << 1)	/* el[buf] holds the EL picture */
 
 struct dvfel_job {
 	__u32 timeout_ms;		/* in: max wait */
@@ -46,6 +55,14 @@ struct dvfel_job {
 	__u32 height;			/* out */
 	__u32 flags;			/* out: DVFEL_JOB_* */
 	__u64 pts_us;			/* out: vframe pts_us64 (Kodi packet pts) */
+	/*
+	 * out: the access units (decode order, 16 bits, wrapping) of the BL
+	 * frame and of its EL picture. They differ when the EL is coded in
+	 * another picture order than the BL (paired by display order): the
+	 * RPU is then the one of the EL picture's access unit.
+	 */
+	__u32 bl_au;
+	__u32 el_au;
 };
 
 #define DVFEL_DONE_COMPOSED	0	/* out[buf] holds the frame */

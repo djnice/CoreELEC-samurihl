@@ -52,6 +52,10 @@
 #include "dvfel_uapi.h"
 
 #define DRV_NAME	"dvfel"
+/* receiver of the hardware decoded EL (vfm: "dveldec dvfelel") */
+#define EL_RECV_NAME	"dvfelel"
+#define EL_HOLD		8	/* EL pictures waiting for their BL frame */
+#define EL_STALE	16	/* access units */
 #define MAX_SLOTS	12
 #define QUEUE_LEN	16
 #define MAX_W		3840
@@ -92,6 +96,10 @@ module_param(debug, int, 0644);
 static int test422;
 module_param(test422, int, 0644);
 MODULE_PARM_DESC(test422, "debug: static 12-bit 4:2:2 linear test frame in mode 1 (1: Y high, 2: Y low)");
+
+static int el_wait_ms = 20;
+module_param(el_wait_ms, int, 0644);
+MODULE_PARM_DESC(el_wait_ms, "max wait for the hardware decoded EL picture of a frame");
 
 #define dvfel_dbg(fmt, ...) \
 	do { if (debug) pr_info(DRV_NAME ": " fmt, ##__VA_ARGS__); } while (0)
@@ -139,6 +147,7 @@ struct dvfel_kjob {
 	u32 flags;
 	int status;
 	u64 pts_us;
+	u32 bl_au, el_au;	/* access units of the pair (PAIR_AU) */
 	ktime_t posted;
 	struct dvfel_slot *slot;
 	struct vframe_s *orig;
@@ -194,6 +203,14 @@ struct dvfel_dev {
 	u32 client_w, client_h;
 	int client_nbufs;
 	struct dvfel_cbuf cin[DVFEL_MAX_BUFS], cout[DVFEL_MAX_BUFS];
+	/* hardware decoded EL: receiver of the EL decoder, client EL buffers */
+	struct vframe_receiver_s el_recv;
+	bool el_prov;
+	spinlock_t el_lock;
+	struct vframe_s *el_hold[EL_HOLD];
+	int el_nhold;
+	u32 client_el_w, client_el_h;
+	struct dvfel_cbuf cel[DVFEL_MAX_BUFS];
 	struct dvfel_kjob jobs[DVFEL_MAX_BUFS];
 	u32 job_seq;
 	wait_queue_head_t wq_client;
@@ -210,8 +227,10 @@ struct dvfel_dev {
 	/* stats */
 	u64 frames_in, frames_proc, frames_pass, vicp_err, slot_waits, held_breaks;
 	u64 gpu_jobs, gpu_composed, gpu_fallback, gpu_timeouts;
+	u64 el_in, el_used, el_dropped, el_missing;
 	s64 us_a_sum, us_b_sum, us_a_max, us_b_max, us_gpu_sum, us_gpu_max;
-	u64 us_cnt, us_b_cnt, us_gpu_cnt;
+	s64 us_el_sum, us_el_max, us_el_wait_max;
+	u64 us_cnt, us_b_cnt, us_gpu_cnt, us_el_cnt;
 
 	/* debug capture of the next frame (A output and A of our B output) */
 	struct dentry *dbg;
@@ -576,6 +595,17 @@ static int vicp_decompress(struct vicp_ctx *c, struct vframe_s *vf,
 	 * source format neutralized.
 	 */
 	c->vin = *vf;
+	/*
+	 * A picture coded taller or wider than shown (1920x1088 cropped to
+	 * 1080 by the SPS conformance window, common for an EL): read only
+	 * the top left w x h of it. The AFBC headers are laid out block row
+	 * by block row, so fewer rows is just a shorter read; the output
+	 * axis equal to the source size keeps the scaler out.
+	 */
+	if (w < c->vin.compWidth)
+		c->vin.compWidth = w;
+	if (h < c->vin.compHeight)
+		c->vin.compHeight = h;
 	c->vin.src_fmt.sei_magic_code = 0;
 	c->vin.src_fmt.fmt = VFRAME_SIGNAL_FMT_INVALID;
 	c->vin.fgs_valid = false;
@@ -866,6 +896,180 @@ static bool process_direct(struct dvfel_dev *d, struct dvfel_slot *s,
 	return ok;
 }
 
+/* ------------------------------------------------------------------ */
+/* hardware decoded EL (Dolby Vision dual layer decoding)             */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The EL picture matches the client's EL buffers by its shown size; the
+ * coded (compressed) size may be larger (conformance window crop).
+ */
+static bool el_fits(struct vframe_s *el, u32 w, u32 h)
+{
+	u32 ew = el->width ? el->width : el->compWidth;
+	u32 eh = el->height ? el->height : el->compHeight;
+
+	return ew == w && eh == h && el->compWidth >= w && el->compHeight >= h;
+}
+
+static void el_put(struct dvfel_dev *d, struct vframe_s *el)
+{
+	vf_put(el, EL_RECV_NAME);
+	vf_notify_provider(EL_RECV_NAME, VFRAME_EVENT_RECEIVER_PUT, NULL);
+}
+
+/* the BL decoder marks each picture that has an EL picture (dual layer) */
+static bool bl_has_el(struct vframe_s *vf)
+{
+	struct provider_aux_req_s req;
+
+	memset(&req, 0, sizeof(req));
+	req.vf = vf;
+	vf_notify_provider(DRV_NAME, VFRAME_EVENT_RECEIVER_GET_AUX_DATA, &req);
+	return req.dv_enhance_exist;
+}
+
+/*
+ * EL pictures taken from the EL decoder, waiting for their BL frame. The
+ * decoders of the dual layer pair label their pictures (vf->frame_index,
+ * media_modules patches 9003/9006): bits 0-15 pair a BL and an EL picture,
+ * bits 16-31 are the access unit the picture was coded in. The pair label
+ * is the access unit, or, for an EL coded in another picture order than
+ * the BL, the display order (n-th picture of each layer); the compositor
+ * then takes the RPU of the EL picture's access unit. Older ones (their BL
+ * frame is gone) go back; the pair stalls when the EL is not consumed.
+ */
+#define PAIR(fi)	((u16)(fi))
+#define PAIR_AU(fi)	((fi) >> 16)
+
+/* (d->el_lock held) remove hold[i], keeping the order */
+static struct vframe_s *el_hold_remove(struct dvfel_dev *d, int i)
+{
+	struct vframe_s *el = d->el_hold[i];
+
+	memmove(&d->el_hold[i], &d->el_hold[i + 1], (d->el_nhold - i - 1) * sizeof(el));
+	d->el_nhold--;
+	return el;
+}
+
+static struct vframe_s *el_take(struct dvfel_dev *d, struct vframe_s *bl)
+{
+	struct vframe_s *drop[EL_HOLD + 1], *el = NULL;
+	ktime_t t0 = ktime_get();
+	u32 id = bl->frame_index;
+	unsigned long flags;
+	int i, ndrop;
+	bool want;
+
+	if (!d->el_prov)
+		return NULL;
+	want = bl_has_el(bl);
+	for (;;) {
+		ndrop = 0;
+		spin_lock_irqsave(&d->el_lock, flags);
+		while (d->el_nhold < EL_HOLD && vf_peek(EL_RECV_NAME)) {
+			struct vframe_s *v = vf_get(EL_RECV_NAME);
+
+			if (!v)
+				break;
+			d->el_in++;
+			if (debug > 2)
+				pr_info(DRV_NAME ": EL in id %u (BL id %u)\n", v->frame_index, id);
+			d->el_hold[d->el_nhold++] = v;
+		}
+		for (i = 0; i < d->el_nhold && !el; i++) {
+			/* without ids (unpatched decoder) the oldest one */
+			if ((id && PAIR(d->el_hold[i]->frame_index) == PAIR(id)) || (!id && want))
+				el = el_hold_remove(d, i);
+		}
+		/* stale ones, and the oldest when the hold is full */
+		for (i = 0; i < d->el_nhold;) {
+			if (id && (s16)(PAIR(d->el_hold[i]->frame_index) - PAIR(id)) < -EL_STALE)
+				drop[ndrop++] = el_hold_remove(d, i);
+			else
+				i++;
+		}
+		if (!el && d->el_nhold == EL_HOLD)
+			drop[ndrop++] = el_hold_remove(d, 0);
+		spin_unlock_irqrestore(&d->el_lock, flags);
+		for (i = 0; i < ndrop; i++) {
+			d->el_dropped++;
+			el_put(d, drop[i]);
+		}
+		if (el || !want || !d->el_prov || kthread_should_stop() ||
+		    ktime_ms_delta(ktime_get(), t0) >= el_wait_ms)
+			break;
+		usleep_range(1000, 2000);
+	}
+	if (!want) {
+		/* not flagged, but here: use it anyway, it is this frame's */
+		if (!el)
+			return NULL;
+	}
+	d->us_el_wait_max = max(d->us_el_wait_max, ktime_us_delta(ktime_get(), t0));
+	if (!el && debug > 1) {
+		spin_lock_irqsave(&d->el_lock, flags);
+		pr_info(DRV_NAME ": no EL for BL id %u (want %d), held %d: %u %u %u %u\n",
+			id, want, d->el_nhold,
+			d->el_nhold > 0 ? d->el_hold[0]->frame_index : 0,
+			d->el_nhold > 1 ? d->el_hold[1]->frame_index : 0,
+			d->el_nhold > 2 ? d->el_hold[2]->frame_index : 0,
+			d->el_nhold > 3 ? d->el_hold[3]->frame_index : 0);
+		spin_unlock_irqrestore(&d->el_lock, flags);
+	}
+	if (!el)
+		d->el_missing++;
+	else if (debug > 1)
+		pr_info(DRV_NAME ": EL id %u for BL id %u pts %llu, held %d\n",
+			el->frame_index, id, bl->pts_us64, d->el_nhold);
+	return el;
+}
+
+/* the EL decoder goes away: give back what is held */
+static void el_hold_release(struct dvfel_dev *d)
+{
+	struct vframe_s *held[EL_HOLD];
+	unsigned long flags;
+	int i, n;
+
+	spin_lock_irqsave(&d->el_lock, flags);
+	n = d->el_nhold;
+	memcpy(held, d->el_hold, n * sizeof(held[0]));
+	d->el_nhold = 0;
+	spin_unlock_irqrestore(&d->el_lock, flags);
+	for (i = 0; i < n; i++)
+		el_put(d, held[i]);
+}
+
+static int dvfel_el_event(int type, void *data, void *op_arg)
+{
+	struct dvfel_dev *d = op_arg;
+
+	switch (type) {
+	case VFRAME_EVENT_PROVIDER_REG:
+		dvfel_dbg("EL provider REG %s\n", data ? (char *)data : "");
+		d->el_prov = true;
+		break;
+	case VFRAME_EVENT_PROVIDER_UNREG:
+		dvfel_dbg("EL provider UNREG\n");
+		d->el_prov = false;
+		el_hold_release(d);
+		break;
+	case VFRAME_EVENT_PROVIDER_RESET:
+		el_hold_release(d);
+		break;
+	case VFRAME_EVENT_PROVIDER_QUREY_STATE:
+		return RECEIVER_ACTIVE;
+	default:
+		break;
+	}
+	return 0;
+}
+
+static const struct vframe_receiver_op_s dvfel_el_recv_ops = {
+	.event_cb = dvfel_el_event,
+};
+
 static int dvfel_thread_a(void *data)
 {
 	struct dvfel_dev *d = data;
@@ -877,9 +1081,10 @@ static int dvfel_thread_a(void *data)
 		for (;;) {
 			struct dvfel_slot *s = NULL;
 			struct dvfel_pass *p;
-			struct vframe_s *vf;
+			struct vframe_s *vf, *el;
 			unsigned long flags;
-			bool gpu = false, ok = false, capture = false;
+			bool gpu = false, ok = false, capture = false, el_ok = false, took_el;
+			u32 el_fi = 0;
 			int j = -1;
 			u32 gen, w, h;
 
@@ -929,6 +1134,8 @@ static int dvfel_thread_a(void *data)
 			d->frames_in++;
 			w = vf->compWidth;
 			h = vf->compHeight;
+			el = NULL;
+			took_el = false;
 
 			if (s && frame_supported(vf) && ensure_bufs(d, w, h)) {
 				capture = atomic_xchg(&d->capture_req, 0) ||
@@ -945,6 +1152,28 @@ static int dvfel_thread_a(void *data)
 						d->us_a_sum += ua;
 						d->us_a_max = max(d->us_a_max, ua);
 						d->us_cnt++;
+					}
+					/* after the BL: by now its EL picture is usually there */
+					if (ok) {
+						el = el_take(d, vf);
+						took_el = true;
+					}
+					if (ok && el && d->client_el_w && frame_supported(el) &&
+					    el_fits(el, d->client_el_w, d->client_el_h)) {
+						t0 = ktime_get();
+						el_ok = vicp_ok(d, vicp_decompress(&d->ctx_a, el,
+										   d->cel[j].phys,
+										   d->client_el_w,
+										   d->client_el_h),
+								ktime_us_delta(ktime_get(), t0), "A EL");
+						ua = ktime_us_delta(ktime_get(), t0);
+						if (el_ok) {
+							el_fi = el->frame_index;
+							d->el_used++;
+							d->us_el_sum += ua;
+							d->us_el_max = max(d->us_el_max, ua);
+							d->us_el_cnt++;
+						}
 					}
 				} else {
 					if (j >= 0) {
@@ -963,6 +1192,13 @@ static int dvfel_thread_a(void *data)
 				j = -1;
 				gpu = false;
 			}
+			if (!took_el)
+				el = el_take(d, vf);
+			if (el) {
+				if (!el_ok)
+					d->el_dropped++;
+				el_put(d, el);
+			}
 
 			spin_lock_irqsave(&d->lock, flags);
 			if (gen != d->gen) {
@@ -980,7 +1216,10 @@ static int dvfel_thread_a(void *data)
 				jb->id = ++d->job_seq;
 				jb->gen = gen;
 				jb->pts_us = vf->pts_us64;
-				jb->flags = d->new_stream ? DVFEL_JOB_NEW_STREAM : 0;
+				jb->bl_au = PAIR_AU(vf->frame_index);
+				jb->el_au = el_ok ? PAIR_AU(el_fi) : jb->bl_au;
+				jb->flags = (d->new_stream ? DVFEL_JOB_NEW_STREAM : 0) |
+					    (el_ok ? DVFEL_JOB_EL : 0);
 				jb->slot = s;
 				jb->orig = vf;
 				jb->capture = capture;
@@ -1475,9 +1714,11 @@ static void client_unreg(struct dvfel_dev *d)
 	for (i = 0; i < d->client_nbufs; i++) {
 		cbuf_put(&d->cin[i]);
 		cbuf_put(&d->cout[i]);
+		cbuf_put(&d->cel[i]);
 		d->jobs[i].state = JOB_FREE;
 	}
 	d->client_nbufs = 0;
+	d->client_el_w = d->client_el_h = 0;
 }
 
 static long ioc_reg_bufs(struct dvfel_dev *d, struct file *f, void __user *arg)
@@ -1490,6 +1731,9 @@ static long ioc_reg_bufs(struct dvfel_dev *d, struct file *f, void __user *arg)
 		return -EFAULT;
 	if (!r.count || r.count > DVFEL_MAX_BUFS || !r.width || !r.height ||
 	    r.width > MAX_W || r.height > MAX_H || !wmif_bg_width(r.width))
+		return -EINVAL;
+	if (r.el_width && (!r.el_height || r.el_width > r.width || r.el_height > r.height ||
+			   (r.el_width | r.el_height) & 1 || !wmif_bg_width(r.el_width)))
 		return -EINVAL;
 	size = LIN_SIZE(r.width, r.height);
 
@@ -1504,6 +1748,8 @@ static long ioc_reg_bufs(struct dvfel_dev *d, struct file *f, void __user *arg)
 		ret = cbuf_get(d, &d->cin[i], r.in_fd[i], size);
 		if (!ret)
 			ret = cbuf_get(d, &d->cout[i], r.out_fd[i], size);
+		if (!ret && r.el_width)
+			ret = cbuf_get(d, &d->cel[i], r.el_fd[i], LIN_SIZE(r.el_width, r.el_height));
 		if (ret) {
 			d->client_nbufs = i + 1;
 			client_unreg(d);
@@ -1517,12 +1763,14 @@ static long ioc_reg_bufs(struct dvfel_dev *d, struct file *f, void __user *arg)
 	d->client_w = r.width;
 	d->client_h = r.height;
 	d->client_nbufs = r.count;
+	d->client_el_w = r.el_width;
+	d->client_el_h = r.el_width ? r.el_height : 0;
 	memset(d->jobs, 0, sizeof(d->jobs));
 	d->client_ready = true;
 	d->new_stream = true;
 	mutex_unlock(&d->client_lock);
-	pr_info(DRV_NAME ": compositor registered %u buffer pairs %ux%u\n",
-		r.count, r.width, r.height);
+	pr_info(DRV_NAME ": compositor registered %u buffer pairs %ux%u, EL %ux%u\n",
+		r.count, r.width, r.height, r.el_width, r.el_height);
 	return 0;
 }
 
@@ -1573,6 +1821,8 @@ static long ioc_wait_job(struct dvfel_dev *d, struct file *f, void __user *arg)
 	u.height = d->client_h;
 	u.flags = d->jobs[i].flags;
 	u.pts_us = d->jobs[i].pts_us;
+	u.bl_au = d->jobs[i].bl_au;
+	u.el_au = d->jobs[i].el_au;
 	spin_unlock_irqrestore(&d->lock, flags);
 	return copy_to_user(arg, &u, sizeof(u)) ? -EFAULT : 0;
 }
@@ -1681,7 +1931,27 @@ static int stats_show(struct seq_file *m, void *v)
 		   d->us_b_sum / nb, d->us_b_max);
 	seq_printf(m, "GPU job (post->done) avg %lld us max %lld us\n",
 		   d->us_gpu_sum / ng, d->us_gpu_max);
+	seq_printf(m, "EL (hardware) provider %s, client %ux%u: in %llu, used %llu, dropped %llu, missing %llu, held %d\n",
+		   d->el_prov ? "registered" : "idle", d->client_el_w, d->client_el_h,
+		   d->el_in, d->el_used, d->el_dropped, d->el_missing, d->el_nhold);
+	seq_printf(m, "VICP A EL            avg %lld us max %lld us, EL wait max %lld us\n",
+		   d->us_el_sum / (d->us_el_cnt ? d->us_el_cnt : 1), d->us_el_max,
+		   d->us_el_wait_max);
 	seq_printf(m, "queued %d, pending %d\n", d->outq_cnt, d->pend_cnt);
+	{
+		static const char * const recv[] = { DRV_NAME, EL_RECV_NAME };
+		int i;
+
+		for (i = 0; i < 2; i++) {
+			struct vframe_provider_s *p = vf_get_provider(recv[i]);
+			struct vframe_states st;
+
+			if (p && !vf_get_states(p, &st))
+				seq_printf(m, "%s provider %s: pool %d, avail %d, free %d, recycle %d\n",
+					   recv[i], p->name, st.vf_pool_size, st.buf_avail_num,
+					   st.buf_free_num, st.buf_recycle_num);
+		}
+	}
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(stats);
@@ -1696,6 +1966,8 @@ static ssize_t stats_reset_write(struct file *f, const char __user *buf,
 	d->gpu_jobs = d->gpu_composed = d->gpu_fallback = d->gpu_timeouts = 0;
 	d->us_a_sum = d->us_b_sum = d->us_a_max = d->us_b_max = 0;
 	d->us_gpu_sum = d->us_gpu_max = 0;
+	d->el_in = d->el_used = d->el_dropped = d->el_missing = 0;
+	d->us_el_sum = d->us_el_max = d->us_el_wait_max = d->us_el_cnt = 0;
 	d->us_cnt = d->us_b_cnt = d->us_gpu_cnt = 0;
 	return len;
 }
@@ -1765,6 +2037,7 @@ static int __init dvfel_init(void)
 		return -ENOMEM;
 	d->nslots = clamp(slots, 2, MAX_SLOTS);
 	spin_lock_init(&d->lock);
+	spin_lock_init(&d->el_lock);
 	mutex_init(&d->buf_lock);
 	mutex_init(&d->client_lock);
 	init_waitqueue_head(&d->wq_a);
@@ -1798,6 +2071,8 @@ static int __init dvfel_init(void)
 		goto err_misc;
 	}
 	vf_reg_receiver(&d->recv);
+	vf_receiver_init(&d->el_recv, EL_RECV_NAME, &dvfel_el_recv_ops, d);
+	vf_reg_receiver(&d->el_recv);
 
 	d->dbg = debugfs_create_dir(DRV_NAME, NULL);
 	debugfs_create_file("stats", 0444, d->dbg, d, &stats_fops);
@@ -1821,6 +2096,7 @@ static void __exit dvfel_exit(void)
 
 	debugfs_remove_recursive(d->dbg);
 	vf_unreg_receiver(&d->recv);
+	vf_unreg_receiver(&d->el_recv);
 	if (d->prov_reg)
 		vf_unreg_provider(&d->prov);
 	misc_deregister(&d->misc);
