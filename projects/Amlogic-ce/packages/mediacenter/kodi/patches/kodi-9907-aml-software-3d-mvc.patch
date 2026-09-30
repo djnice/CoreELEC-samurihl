@@ -1,0 +1,1370 @@
+From: djnice <djnice77@gmail.com>
+Subject: [PATCH] AMLCodec: software 3D MVC decoding (edge264 + mvcout)
+
+The S5 hardware MVC decoder corrupts the dependent view on some discs. With the
+mvcout kernel module loaded and Kodi built with edge264-mvc, 3D MVC is decoded
+on the CPU and both views are composed into one picture (frame packing at full
+resolution, mono, or half resolution side-by-side / top-bottom) that goes to
+the video layer through the amlvideo queue like a hardware decoder's frames.
+Always used on S5, a setting on the other Amlogic SoCs.
+
+With it:
+- StereoscopicsManager: no notification loop when playing in mono.
+- AMLDisplay: frame packing only on frame packed modes, a modeset when frame
+  packing is entered or left (the mode name stays), 3D mode labels.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/addons/resource.language.en_gb/resources/strings.po b/addons/resource.language.en_gb/resources/strings.po
+index be0ee4934e..9d7d2fd423 100644
+--- a/addons/resource.language.en_gb/resources/strings.po
++++ b/addons/resource.language.en_gb/resources/strings.po
+@@ -9169,6 +9169,18 @@ msgctxt "#14437"
+ msgid "Compose the full enhancement layer of Dolby Vision profile 7 FEL titles on the GPU. When disabled, FEL titles play like MEL ones: converted to profile 8.1 without the enhancement layer. Takes effect when playback starts. S928X only."
+ msgstr ""
+ 
++#. label of the setting to decode 3D MVC video in software
++#: system/settings/settings.xml
++msgctxt "#14438"
++msgid "Decode 3D MVC in software"
++msgstr ""
++
++#. help text of setting with label #14438
++#: system/settings/settings.xml
++msgctxt "#14439"
++msgid "Decode 3D Blu-ray (MVC) video on the CPU instead of the hardware decoder, which corrupts the second view of some titles. Both views keep their full resolution. Needs the mvcout kernel module. Takes effect when playback starts. S928X always decodes 3D MVC in software."
++msgstr ""
++
+ #: xbmc/music/MusicDatabase.cpp
+ #: xbmc/video/VideoDatabase.cpp
+ msgctxt "#15011"
+diff --git a/cmake/modules/FindAML.cmake b/cmake/modules/FindAML.cmake
+index 7a9a2f1012..bb0567ecab 100644
+--- a/cmake/modules/FindAML.cmake
++++ b/cmake/modules/FindAML.cmake
+@@ -22,16 +22,26 @@ find_package_handle_standard_args(AML
+ include(CheckCSourceCompiles)
+ set(CMAKE_REQUIRED_INCLUDES ${AML_INCLUDE_DIR})
+ 
++# edge264-mvc: software 3D MVC decoding (optional)
++find_path(EDGE264_INCLUDE_DIR edge264.h)
++find_library(EDGE264_LIBRARY NAMES libedge264.a edge264)
++
+ if(AML_FOUND)
+   set(AML_INCLUDE_DIRS ${AML_INCLUDE_DIR})
+   set(AML_DEFINITIONS -DHAS_LIBAMCODEC=1)
++  if(EDGE264_INCLUDE_DIR AND EDGE264_LIBRARY)
++    list(APPEND AML_INCLUDE_DIRS ${EDGE264_INCLUDE_DIR})
++    list(APPEND AML_DEFINITIONS -DHAS_EDGE264=1)
++    set(AML_LIBRARIES ${EDGE264_LIBRARY} pthread)
++  endif()
+ 
+   if(NOT TARGET ${APP_NAME_LC}::${CMAKE_FIND_PACKAGE_NAME})
+     add_library(${APP_NAME_LC}::${CMAKE_FIND_PACKAGE_NAME} INTERFACE IMPORTED)
+     set_target_properties(${APP_NAME_LC}::${CMAKE_FIND_PACKAGE_NAME} PROPERTIES
+-                                   INTERFACE_INCLUDE_DIRECTORIES "${AML_INCLUDE_DIR}"
+-                                   INTERFACE_COMPILE_DEFINITIONS "${AML_DEFINITIONS}")
++                                   INTERFACE_INCLUDE_DIRECTORIES "${AML_INCLUDE_DIRS}"
++                                   INTERFACE_COMPILE_DEFINITIONS "${AML_DEFINITIONS}"
++                                   INTERFACE_LINK_LIBRARIES "${AML_LIBRARIES}")
+   endif()
+ endif()
+ 
+-mark_as_advanced(AMLCODEC_INCLUDE_DIR)
++mark_as_advanced(AMLCODEC_INCLUDE_DIR EDGE264_INCLUDE_DIR EDGE264_LIBRARY)
+diff --git a/system/settings/settings.xml b/system/settings/settings.xml
+index 753cde1f40..2bc889bfc2 100755
+--- a/system/settings/settings.xml
++++ b/system/settings/settings.xml
+@@ -4146,6 +4146,12 @@
+             <dependency type="enable" setting="coreelec.amlogic.dvfelenable">true</dependency>
+           </dependencies>
+         </setting>
++        <setting id="coreelec.amlogic.mvcsoftware" type="boolean" label="14438" help="14439">
++          <requirement>AML_MVC_SW_SELECTABLE</requirement>
++          <level>3</level>
++          <default>false</default>
++          <control type="toggle" />
++        </setting>
+         <setting id="coreelec.amlogic.sdr2hdr" type="boolean" label="14404" help="14405">
+           <requirement>HAVE_AMCODEC</requirement>
+           <default>false</default>
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLCodec.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLCodec.cpp
+index b47a452809..f4143ed213 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLCodec.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLCodec.cpp
+@@ -8,6 +8,7 @@
+ 
+ 
+ #include "AMLCodec.h"
++#include "AMLMvc.h"
+ 
+ #include "cores/VideoPlayer/BDStageTrace.h"
+ #include "DynamicDll.h"
+@@ -2111,6 +2112,12 @@ bool CAMLCodec::OpenDecoder(CDVDStreamInfo &hints, bool doviIsFEL, bool isDualSt
+ 
+   ShowMainVideo(false);
+ 
++  // 3D MVC: the hardware decoder corrupts the dependent view on some discs
++  if (hints.codec == AV_CODEC_ID_H264 &&
++      (hints.codec_tag == CODEC_TAG_AMVC || hints.codec_tag == CODEC_TAG_MVC1) &&
++      CAMLMvc::IsEnabled() && OpenMvc(hints))
++    return true;
++
+   am_packet_init(&am_private->am_pkt);
+   // default stream type
+   am_private->stream_type      = AM_STREAM_ES;
+@@ -2701,6 +2708,12 @@ void CAMLCodec::CloseDecoder()
+   bool dv_enabled(AmlDisplay->aml_get_drmProperty("dv_enable", DRM_MODE_OBJECT_CRTC));
+   CLog::Log(LOGDEBUG, "CAMLCodec::CloseDecoder");
+ 
++  if (m_mvc)
++  {
++    CloseMvc();
++    return;
++  }
++
+   SetPollDevice(-1);
+ 
+   // never leave vcodec ff/rw or paused.
+@@ -2856,6 +2869,17 @@ void CAMLCodec::Reset()
+   if (!m_opened)
+     return;
+ 
++  if (m_mvc)
++  {
++    SetPollDevice(-1);
++    m_mvc->Reset();
++    m_cur_pts = DVD_NOPTS_VALUE;
++    m_last_pts = DVD_NOPTS_VALUE;
++    m_tp_last_frame = std::chrono::steady_clock::now();
++    SetPollDevice(m_mvcPollFd);
++    return;
++  }
++
+   m_park_last_data_len = -1;
+   SetPollDevice(-1);
+ 
+@@ -2915,6 +2939,9 @@ void CAMLCodec::Reset()
+ 
+ bool CAMLCodec::AddData(uint8_t *pData, size_t iSize, double dts, double pts)
+ {
++  if (m_mvc)
++    return m_opened && pData && m_mvc->AddData(pData, iSize, pts);
++
+   if (iSize > 0)
+   {
+     m_no_data_since_reset = false;
+@@ -3245,6 +3272,14 @@ int CAMLCodec::ReleaseFrame(const uint32_t index, bool drop, uint32_t sessionGen
+ 
+ float CAMLCodec::GetBufferLevel(int new_chunk, int &data_len, int &free_len, int &size)
+ {
++  // no stream buffer is open: the player's "video still has data" test at
++  // the end of a Blu-ray title would read 100% forever
++  if (m_mvc)
++  {
++    data_len = free_len = size = 0;
++    return m_mvc->GetLevel();
++  }
++
+   struct buf_status bs;
+   float level = 0.0f;
+   m_dll->codec_get_vbuf_state(&am_private->vcodec, &bs);
+@@ -3302,6 +3337,9 @@ int CAMLCodec::DequeueBuffer()
+ 
+ CDVDVideoCodec::VCReturn CAMLCodec::GetPicture(VideoPicture *pVideoPicture)
+ {
++  if (m_mvc)
++    return GetPictureMvc(pVideoPicture);
++
+   int ret = EAGAIN;
+   int data_len, free_len, size;
+   float buffer_level = GetBufferLevel(0, data_len, free_len, size);
+@@ -3621,7 +3659,7 @@ void CAMLCodec::SetSpeed(int speed)
+   // of if we are open or not.
+   m_speed = speed;
+ 
+-  if (!m_opened)
++  if (!m_opened || m_mvc)
+     return;
+ 
+   switch(speed)
+@@ -3837,6 +3875,29 @@ void CAMLCodec::SetVideoRect(const CRect &SrcRect, const CRect &DestRect)
+       case VFORMAT_H264MVC:
+         {
+           mvc_view_mode = m_processInfo.GetVideoStereoMode() == "block_lr" ? 3 : 2;
++          if (m_mvc)
++          {
++            // both views are composed in software: the video layer shows a 2D picture
++            switch (m_guiStereoMode)
++            {
++              case RenderStereoMode::HARDWAREBASED:
++                m_mvc->SetMode(CAMLMvc::Mode::FramePacked);
++                break;
++              case RenderStereoMode::SPLIT_VERTICAL:
++                m_mvc->SetMode(CAMLMvc::Mode::SideBySide);
++                break;
++              case RenderStereoMode::SPLIT_HORIZONTAL:
++                m_mvc->SetMode(CAMLMvc::Mode::TopBottom);
++                break;
++              default:
++                m_mvc->SetMode(m_guiStereoView == RenderStereoView::RIGHT ? CAMLMvc::Mode::Right
++                                                                          : CAMLMvc::Mode::Left);
++                break;
++            }
++            m_mvc->SetSwapViews(m_processInfo.GetVideoStereoMode() == "block_rl");
++            aml_set_3d_video_mode(MODE_3D_DISABLE, false, mvc_view_mode);
++            break;
++          }
+           switch (m_guiStereoMode)
+           {
+             case RenderStereoMode::HARDWAREBASED:
+@@ -3972,3 +4033,122 @@ std::string CAMLCodec::GetHDRStaticMetadata(bool dv_enable)
+     CLog::Log(LOGDEBUG, "CAMLCodec::GetHDRStaticMetadata - Created the following config: {}", config_data);
+   return config_data;
+ }
++
++/*
++ * Software 3D MVC decoding: the stream goes to CAMLMvc (edge264 on the CPU),
++ * the composed pictures come back through the same amlvideo v4l queue as a
++ * hardware decoder's, so GetPicture/ReleaseFrame and the renderer are shared.
++ */
++bool CAMLCodec::OpenMvc(CDVDStreamInfo &hints)
++{
++  auto mvc = std::make_unique<CAMLMvc>();
++
++  // the provider needs its receiver chain before it registers
++  SetVfmMap("mvcoutpath", "mvcout amlvideo amvideo");
++  if (!mvc->Open(hints))
++  {
++    CSysfsPath("/sys/class/vfm/map", "rm mvcoutpath");
++    CLog::Log(LOGWARNING, "CAMLCodec::OpenMvc - software MVC decoding not possible, using the hardware decoder");
++    return false;
++  }
++  m_mvc = std::move(mvc);
++
++  am_private->video_format = VFORMAT_H264MVC;
++  am_private->video_codec_id = hints.codec;
++  am_private->video_codec_tag = hints.codec_tag;
++  am_private->video_width = hints.width;
++  am_private->video_height = hints.height;
++  am_private->video_rate = static_cast<int>(m_mvc->GetFrameDuration() * UNIT_FREQ / DVD_TIME_BASE + 0.5);
++
++  // frames are paced through amlvideo, as for the hardware decoders
++  CSysfsPath("/sys/class/tsync/enable", 0);
++  CSysfsPath("/sys/class/video/freerun_mode", 1);
++
++  m_mvcPollFd = open("/dev/amvideo", O_RDWR | O_NONBLOCK | O_CLOEXEC);
++  SetPollDevice(m_mvcPollFd);
++  m_display_rect = CRect(0, 0, CDisplaySettings::GetInstance().GetCurrentResolutionInfo().iWidth,
++                         CDisplaySettings::GetInstance().GetCurrentResolutionInfo().iHeight);
++  m_opened = true;
++  CLog::Log(LOGINFO, "CAMLCodec::OpenMvc - 3D MVC decoded in software");
++  return true;
++}
++
++void CAMLCodec::CloseMvc()
++{
++  SetPollDevice(-1);
++  m_mvc->Close();
++  m_mvc.reset();
++  m_opened = false;
++  CSysfsPath("/sys/class/vfm/map", "rm mvcoutpath");
++  if (m_mvcPollFd >= 0)
++    close(m_mvcPollFd);
++  m_mvcPollFd = -1;
++  CSysfsPath("/sys/class/tsync/enable", 1);
++  ShowMainVideo(false);
++
++  PosixFilePtr closing;
++  {
++    std::lock_guard<std::mutex> lock(m_amlVideoFileMutex);
++    closing.swap(m_amlVideoFile);
++  }
++}
++
++CDVDVideoCodec::VCReturn CAMLCodec::GetPictureMvc(VideoPicture *pVideoPicture)
++{
++  if (!m_opened)
++    return CDVDVideoCodec::VC_ERROR;
++
++  if (m_drain)
++    m_mvc->Drain();
++
++  if (DequeueBuffer() == 0)
++  {
++    m_tp_last_frame = std::chrono::steady_clock::now();
++    pVideoPicture->iFlags = 0;
++    const int64_t delta = static_cast<int64_t>(m_cur_pts - m_last_pts);
++    pVideoPicture->iDuration = (m_last_pts != DVD_NOPTS_VALUE && delta > 0)
++                                   ? static_cast<double>(delta)
++                                   : m_mvc->GetFrameDuration();
++    pVideoPicture->dts = DVD_NOPTS_VALUE;
++    pVideoPicture->pts = static_cast<double>(m_cur_pts);
++    pVideoPicture->stereoMode = m_hints.stereo_mode;
++    if (pVideoPicture->stereoMode == "block_lr" && m_processInfo.GetVideoSettings().m_StereoInvert)
++      pVideoPicture->stereoMode = "block_rl";
++    else if (pVideoPicture->stereoMode == "block_rl" && m_processInfo.GetVideoSettings().m_StereoInvert)
++      pVideoPicture->stereoMode = "block_lr";
++    CLog::Log(LOGDEBUG, LOGVIDEO, "CAMLCodec::GetPictureMvc: index: {:d}, pts: {:.3f}",
++              m_bufferIndex, pVideoPicture->pts / DVD_TIME_BASE);
++    return CDVDVideoCodec::VC_PICTURE;
++  }
++
++  if (m_drain)
++  {
++    if (m_mvc->IsDrained())
++    {
++      int queued = 0;
++      PosixFilePtr amlVideoFile;
++      {
++        std::lock_guard<std::mutex> lock(m_amlVideoFileMutex);
++        amlVideoFile = m_amlVideoFile;
++      }
++      if (!amlVideoFile || amlVideoFile->IOControl(AMLVIDEO_IOC_GET_VFQ, &queued) != 0 ||
++          queued == 0)
++        return CDVDVideoCodec::VC_EOF;
++    }
++    // The decoder thread still decodes its input queue and squeezes out the
++    // pictures it holds, and they pass the amlvideo queue one by one at the
++    // display rate: VC_BUFFER would end the player's drain loop here and lose
++    // them all (the last second of every file), VC_NONE keeps it polling.
++    if (std::chrono::steady_clock::now() - m_tp_last_frame <
++        std::chrono::seconds(m_decoder_timeout))
++    {
++      std::this_thread::sleep_for(std::chrono::milliseconds(5));
++      return CDVDVideoCodec::VC_NONE;
++    }
++    CLog::Log(LOGWARNING, "CAMLCodec::GetPictureMvc - drain timed out");
++    return CDVDVideoCodec::VC_EOF;
++  }
++
++  // a full input queue: nothing to take, the decoder is busy
++  return m_mvc->IsFull() ? CDVDVideoCodec::VC_NONE : CDVDVideoCodec::VC_BUFFER;
++}
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLCodec.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLCodec.h
+index b1f3a41a06..90a98905e6 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLCodec.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLCodec.h
+@@ -19,6 +19,7 @@
+ #include <deque>
+ #include <mutex>
+ #include <atomic>
++#include <memory>
+ 
+ typedef struct am_private_t am_private_t;
+ 
+@@ -28,6 +29,7 @@ class PosixFile;
+ typedef std::shared_ptr<PosixFile> PosixFilePtr;
+ 
+ class CProcessInfo;
++class CAMLMvc;
+ 
+ struct vpp_pq_ctrl_s {
+ 	unsigned int length;
+@@ -105,6 +107,9 @@ public:
+   static int    PollFrame();
+   static void   SetPollDevice(int device);
+ 
++  //! software 3D MVC decoding (edge264 + mvcout) is used for this stream
++  bool          IsSoftwareMvc() const { return m_mvc != nullptr; }
++
+ private:
+   void          ShowMainVideo(const bool show);
+   void          SetVideoZoom(const float zoom);
+@@ -150,6 +155,12 @@ private:
+   std::mutex       m_amlVideoFileMutex;
+   std::atomic<uint32_t> m_sessionGen{0};
+   std::string      m_defaultVfmMap;
++  // software 3D MVC decoding: edge264 on the CPU, frames through mvcout
++  bool          OpenMvc(CDVDStreamInfo &hints);
++  void          CloseMvc();
++  CDVDVideoCodec::VCReturn GetPictureMvc(VideoPicture *pVideoPicture);
++  std::unique_ptr<CAMLMvc> m_mvc;
++  int              m_mvcPollFd = -1;
+ 
+   static std::atomic_flag  m_pollSync;
+   static int m_pollDevice;
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLMvc.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLMvc.cpp
+new file mode 100644
+index 0000000000..cfde0a7192
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLMvc.cpp
+@@ -0,0 +1,593 @@
++/*
++ *  Copyright (C) 2026 Team CoreELEC (https://coreelec.org)
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "AMLMvc.h"
++
++#include "ServiceBroker.h"
++#include "cores/VideoPlayer/DVDStreamInfo.h"
++#include "cores/VideoPlayer/Interface/TimingConstants.h"
++#include "mvcout_uapi.h"
++#include "settings/Settings.h"
++#include "settings/SettingsComponent.h"
++#include "utils/AMLUtils.h"
++#include "utils/log.h"
++
++#include <algorithm>
++#include <cerrno>
++#include <chrono>
++#include <cstring>
++
++#include <fcntl.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <unistd.h>
++
++#ifdef HAS_EDGE264
++#include <edge264.h>
++#endif
++
++namespace
++{
++constexpr int NUM_BUFFERS = 10;
++constexpr int VIEW_W = 1920;
++constexpr int VIEW_H = 1080;
++constexpr int FP_GAP = 45; // active space of 1080p frame packing
++// the decoder runs well ahead of realtime and 10 composed pictures wait in
++// mvcout: a short input queue, since everything queued at the end of a file
++// plays out in one player drain step, which gives up after 1.5 s of no progress
++constexpr size_t MAX_QUEUE_PACKETS = 8;
++constexpr size_t MAX_QUEUE_BYTES = 16 * 1024 * 1024;
++constexpr size_t MAX_PENDING_PTS = 32;
++
++// the S5 video layer reads packed 4:2:2 as U Y V Y
++enum
++{
++  B_U = 0,
++  B_Y0 = 1,
++  B_V = 2,
++  B_Y1 = 3
++};
++
++struct View
++{
++  const uint8_t* y;
++  const uint8_t* u;
++  const uint8_t* v;
++  int sy;
++  int sc;
++};
++
++inline uint8_t Avg2(int a, int b)
++{
++  return static_cast<uint8_t>((a + b + 1) >> 1);
++}
++
++/*
++ * One view at full size into packed 4:2:2 lines. 4:2:0 -> 4:2:2 chroma for
++ * luma row r (chroma between luma rows 2k and 2k+1): 3/4 of chroma row k and
++ * 1/4 of row k-1 (even r) or k+1 (odd r).
++ */
++void ComposeFull(uint8_t* dst, int stride, const View& vw)
++{
++  const int hc = VIEW_H / 2;
++  uint8_t line[VIEW_W * 2];
++
++  for (int r = 0; r < VIEW_H; r++)
++  {
++    const int k = r >> 1;
++    const int n = std::clamp((r & 1) ? k + 1 : k - 1, 0, hc - 1);
++    const uint8_t* y = vw.y + r * vw.sy;
++    const uint8_t* u0 = vw.u + k * vw.sc;
++    const uint8_t* u1 = vw.u + n * vw.sc;
++    const uint8_t* v0 = vw.v + k * vw.sc;
++    const uint8_t* v1 = vw.v + n * vw.sc;
++    uint8_t* d = line;
++
++    for (int x = 0; x < VIEW_W / 2; x++, d += 4)
++    {
++      d[B_Y0] = y[2 * x];
++      d[B_Y1] = y[2 * x + 1];
++      d[B_U] = static_cast<uint8_t>((3 * u0[x] + u1[x] + 2) >> 2);
++      d[B_V] = static_cast<uint8_t>((3 * v0[x] + v1[x] + 2) >> 2);
++    }
++    // one sequential write per line into the write-combined buffer
++    memcpy(dst + r * stride, line, sizeof(line));
++  }
++}
++
++//! One view at half width (x0 = 0 or VIEW_W / 2) of a side-by-side picture
++void ComposeHalfWidth(uint8_t* dst, int stride, int x0, const View& vw)
++{
++  const int hc = VIEW_H / 2;
++  uint8_t line[VIEW_W];
++
++  for (int r = 0; r < VIEW_H; r++)
++  {
++    const int k = r >> 1;
++    const int n = std::clamp((r & 1) ? k + 1 : k - 1, 0, hc - 1);
++    const uint8_t* y = vw.y + r * vw.sy;
++    const uint8_t* u0 = vw.u + k * vw.sc;
++    const uint8_t* u1 = vw.u + n * vw.sc;
++    const uint8_t* v0 = vw.v + k * vw.sc;
++    const uint8_t* v1 = vw.v + n * vw.sc;
++    uint8_t* d = line;
++
++    // output pixel pair i covers source luma 4i..4i+3 and chroma 2i, 2i+1
++    for (int i = 0; i < VIEW_W / 4; i++, d += 4)
++    {
++      const int c = 2 * i;
++      d[B_Y0] = Avg2(y[4 * i], y[4 * i + 1]);
++      d[B_Y1] = Avg2(y[4 * i + 2], y[4 * i + 3]);
++      d[B_U] = static_cast<uint8_t>((3 * (u0[c] + u0[c + 1]) + u1[c] + u1[c + 1] + 4) >> 3);
++      d[B_V] = static_cast<uint8_t>((3 * (v0[c] + v0[c + 1]) + v1[c] + v1[c + 1] + 4) >> 3);
++    }
++    memcpy(dst + r * stride + x0 * 2, line, sizeof(line));
++  }
++}
++
++//! One view at half height into VIEW_H / 2 lines of a top-bottom picture
++void ComposeHalfHeight(uint8_t* dst, int stride, const View& vw)
++{
++  uint8_t line[VIEW_W * 2];
++
++  // output row r covers luma rows 2r, 2r+1 and exactly chroma row r
++  for (int r = 0; r < VIEW_H / 2; r++)
++  {
++    const uint8_t* ya = vw.y + 2 * r * vw.sy;
++    const uint8_t* yb = ya + vw.sy;
++    const uint8_t* u = vw.u + r * vw.sc;
++    const uint8_t* v = vw.v + r * vw.sc;
++    uint8_t* d = line;
++
++    for (int x = 0; x < VIEW_W / 2; x++, d += 4)
++    {
++      d[B_Y0] = Avg2(ya[2 * x], yb[2 * x]);
++      d[B_Y1] = Avg2(ya[2 * x + 1], yb[2 * x + 1]);
++      d[B_U] = u[x];
++      d[B_V] = v[x];
++    }
++    memcpy(dst + r * stride, line, sizeof(line));
++  }
++}
++
++void Black(uint8_t* dst, int stride, int rows)
++{
++  uint8_t line[VIEW_W * 2];
++
++  for (int x = 0; x < VIEW_W / 2; x++)
++  {
++    line[4 * x + B_Y0] = line[4 * x + B_Y1] = 16;
++    line[4 * x + B_U] = line[4 * x + B_V] = 128;
++  }
++  for (int r = 0; r < rows; r++)
++    memcpy(dst + r * stride, line, sizeof(line));
++}
++
++//! Parameter sets out of the (Annex B) extradata, so a reset can resend them
++std::vector<uint8_t> AnnexBHeaders(const uint8_t* data, size_t size)
++{
++  if (size >= 4 && data[0] == 0 && data[1] == 0 &&
++      (data[2] == 1 || (data[2] == 0 && data[3] == 1)))
++    return std::vector<uint8_t>(data, data + size);
++  return {};
++}
++} // namespace
++
++CAMLMvc::~CAMLMvc()
++{
++  Close();
++}
++
++bool CAMLMvc::IsSupported()
++{
++#ifdef HAS_EDGE264
++  return access(MVCOUT_DEV, F_OK) == 0;
++#else
++  return false;
++#endif
++}
++
++bool CAMLMvc::IsEnabled()
++{
++  if (!IsSupported())
++    return false;
++  if (aml_get_cpufamily_id() == AML_S5)
++    return true;
++  return CServiceBroker::GetSettingsComponent()->GetSettings()->GetBool(
++      CSettings::SETTING_COREELEC_AMLOGIC_MVC_SOFTWARE);
++}
++
++bool CAMLMvc::Open(const CDVDStreamInfo& hints)
++{
++#ifdef HAS_EDGE264
++  if (hints.width != VIEW_W || (hints.height != VIEW_H && hints.height != 1088))
++  {
++    CLog::Log(LOGWARNING, "CAMLMvc::Open - unsupported size {}x{}", hints.width, hints.height);
++    return false;
++  }
++
++  m_fd = open(MVCOUT_DEV, O_RDWR | O_CLOEXEC);
++  if (m_fd < 0)
++  {
++    CLog::Log(LOGERROR, "CAMLMvc::Open - cannot open {}: {}", MVCOUT_DEV, strerror(errno));
++    return false;
++  }
++
++  // one allocation for every mode: frame packing is the largest picture
++  mvcout_alloc a{};
++  a.width = VIEW_W;
++  a.height = 2 * VIEW_H + FP_GAP;
++  a.format = MVCOUT_FMT_YUV422;
++  a.count = NUM_BUFFERS;
++  if (ioctl(m_fd, MVCOUT_IOC_ALLOC, &a) < 0)
++  {
++    CLog::Log(LOGERROR, "CAMLMvc::Open - buffer allocation failed: {}", strerror(errno));
++    Close();
++    return false;
++  }
++  m_width = a.width;
++  m_height = a.height;
++  m_stride = a.stride;
++  m_size = a.size;
++  for (int i = 0; i < NUM_BUFFERS; i++)
++  {
++    void* p = mmap(nullptr, a.size, PROT_READ | PROT_WRITE, MAP_SHARED, m_fd,
++                   static_cast<off_t>(i) * a.map_size);
++    if (p == MAP_FAILED)
++    {
++      CLog::Log(LOGERROR, "CAMLMvc::Open - mmap failed: {}", strerror(errno));
++      Close();
++      return false;
++    }
++    m_maps.push_back(static_cast<uint8_t*>(p));
++  }
++
++  if (hints.fpsrate > 0 && hints.fpsscale > 0)
++    m_frameDuration = static_cast<double>(DVD_TIME_BASE) * hints.fpsscale / hints.fpsrate;
++  else
++    m_frameDuration = DVD_TIME_BASE * 1001.0 / 24000.0;
++  m_duration96 = static_cast<uint32_t>(m_frameDuration * 96000.0 / DVD_TIME_BASE + 0.5);
++
++  m_headers = AnnexBHeaders(hints.extradata.GetData(), hints.extradata.GetSize());
++
++  m_decoder = edge264_alloc(-1, nullptr, nullptr, 0, nullptr, nullptr, nullptr);
++  if (!m_decoder)
++  {
++    CLog::Log(LOGERROR, "CAMLMvc::Open - edge264_alloc failed");
++    Close();
++    return false;
++  }
++
++  if (ioctl(m_fd, MVCOUT_IOC_START) < 0)
++  {
++    CLog::Log(LOGERROR, "CAMLMvc::Open - start failed: {}", strerror(errno));
++    Close();
++    return false;
++  }
++
++  m_stop = false;
++  m_drainReq = m_drained = false;
++  m_resetReq = m_resetDone = 0;
++  m_lastPts = DVD_NOPTS_VALUE;
++  m_pts.clear();
++  m_frames = m_badNals = 0;
++  m_thread = std::thread(&CAMLMvc::Process, this);
++
++  CLog::Log(LOGINFO,
++            "CAMLMvc::Open - software MVC decoding, {} buffers of {} KiB, frame {:.3f} ms, "
++            "{} bytes of parameter sets",
++            NUM_BUFFERS, a.map_size >> 10, m_frameDuration / 1000.0, m_headers.size());
++  return true;
++#else
++  return false;
++#endif
++}
++
++void CAMLMvc::Close()
++{
++  if (m_thread.joinable())
++  {
++    {
++      std::unique_lock<std::mutex> lock(m_mutex);
++      m_stop = true;
++    }
++    m_cv.notify_all();
++    m_thread.join();
++    CLog::Log(LOGINFO, "CAMLMvc::Close - {} frames, {} bad NAL units", m_frames, m_badNals);
++  }
++#ifdef HAS_EDGE264
++  if (m_decoder)
++    edge264_free(&m_decoder);
++#endif
++  m_decoder = nullptr;
++  if (m_fd >= 0)
++    ioctl(m_fd, MVCOUT_IOC_STOP);
++  for (uint8_t* p : m_maps)
++    munmap(p, m_size);
++  m_maps.clear();
++  if (m_fd >= 0)
++    close(m_fd);
++  m_fd = -1;
++  m_queue.clear();
++  m_queueBytes = 0;
++}
++
++bool CAMLMvc::AddData(const uint8_t* data, size_t size, double pts)
++{
++  std::unique_lock<std::mutex> lock(m_mutex);
++  if (m_queue.size() >= MAX_QUEUE_PACKETS || m_queueBytes + size > MAX_QUEUE_BYTES)
++    return false;
++  m_queue.push_back({std::vector<uint8_t>(data, data + size), pts});
++  m_queueBytes += size;
++  m_drainReq = m_drained = false;
++  lock.unlock();
++  m_cv.notify_all();
++  return true;
++}
++
++bool CAMLMvc::IsFull()
++{
++  std::unique_lock<std::mutex> lock(m_mutex);
++  return m_queue.size() >= MAX_QUEUE_PACKETS || m_queueBytes >= MAX_QUEUE_BYTES / 2;
++}
++
++float CAMLMvc::GetLevel()
++{
++  std::unique_lock<std::mutex> lock(m_mutex);
++  const float packets = static_cast<float>(m_queue.size()) / MAX_QUEUE_PACKETS;
++  const float bytes = static_cast<float>(m_queueBytes) / (MAX_QUEUE_BYTES / 2);
++  return std::min(100.0f, 100.0f * std::max(packets, bytes));
++}
++
++void CAMLMvc::Reset()
++{
++  std::unique_lock<std::mutex> lock(m_mutex);
++  m_queue.clear();
++  m_queueBytes = 0;
++  m_drainReq = m_drained = false;
++  const uint64_t req = ++m_resetReq;
++  m_cv.notify_all();
++  // the thread may sit in a decode call for a few ms, never much longer
++  if (!m_cvIdle.wait_for(lock, std::chrono::seconds(2), [&] { return m_resetDone >= req || !m_thread.joinable(); }))
++    CLog::Log(LOGWARNING, "CAMLMvc::Reset - decoder thread did not acknowledge");
++}
++
++void CAMLMvc::Drain()
++{
++  std::unique_lock<std::mutex> lock(m_mutex);
++  if (!m_drainReq)
++  {
++    m_drainReq = true;
++    m_cv.notify_all();
++  }
++}
++
++bool CAMLMvc::IsDrained()
++{
++  std::unique_lock<std::mutex> lock(m_mutex);
++  return m_drained;
++}
++
++bool CAMLMvc::ResetPending()
++{
++  std::unique_lock<std::mutex> lock(m_mutex);
++  return m_resetReq != m_resetDone || m_stop;
++}
++
++void CAMLMvc::DoReset()
++{
++#ifdef HAS_EDGE264
++  edge264_flush(m_decoder);
++#endif
++  m_pts.clear();
++  m_lastPts = DVD_NOPTS_VALUE;
++  ioctl(m_fd, MVCOUT_IOC_FLUSH);
++  // the parameter sets may only have come with the extradata
++  if (!m_headers.empty())
++    DecodeUnits(m_headers.data(), m_headers.size());
++}
++
++void CAMLMvc::Process()
++{
++  if (!m_headers.empty())
++    DecodeUnits(m_headers.data(), m_headers.size());
++
++  for (;;)
++  {
++    Packet pkt;
++    bool drain = false;
++    {
++      std::unique_lock<std::mutex> lock(m_mutex);
++      m_cv.wait(lock, [&] {
++        return m_stop || m_resetReq != m_resetDone || !m_queue.empty() ||
++               (m_drainReq && !m_drained);
++      });
++      if (m_stop)
++        break;
++      if (m_resetReq != m_resetDone)
++      {
++        const uint64_t req = m_resetReq;
++        lock.unlock();
++        DoReset();
++        lock.lock();
++        m_resetDone = req;
++        m_cvIdle.notify_all();
++        continue;
++      }
++      if (!m_queue.empty())
++      {
++        pkt = std::move(m_queue.front());
++        m_queue.pop_front();
++        m_queueBytes -= pkt.data.size();
++      }
++      else
++        drain = true;
++    }
++
++    if (drain)
++    {
++      OutputFrames(true);
++      std::unique_lock<std::mutex> lock(m_mutex);
++      if (m_resetReq == m_resetDone && m_queue.empty())
++        m_drained = true;
++      continue;
++    }
++
++    if (pkt.pts != DVD_NOPTS_VALUE)
++    {
++      m_pts.insert(pkt.pts);
++      // pictures the decoder never outputs (broken links after a seek)
++      while (m_pts.size() > MAX_PENDING_PTS)
++        m_pts.erase(m_pts.begin());
++    }
++    DecodeUnits(pkt.data.data(), pkt.data.size());
++  }
++  std::unique_lock<std::mutex> lock(m_mutex);
++  m_cvIdle.notify_all();
++}
++
++void CAMLMvc::DecodeUnits(const uint8_t* data, size_t size)
++{
++#ifdef HAS_EDGE264
++  const uint8_t* end = data + size;
++  const uint8_t* nal = edge264_find_start_code(data, end, 0);
++
++  while (nal < end && !ResetPending())
++  {
++    nal += 3;
++    const uint8_t* next = edge264_find_start_code(nal, end, 0);
++    // a 4-byte start code leaves its leading zero on the previous unit
++    const uint8_t* stop = next;
++    while (stop > nal && stop[-1] == 0)
++      stop--;
++    int res;
++    while ((res = edge264_decode_NAL(m_decoder, nal, stop, nullptr, nullptr)) == ENOBUFS)
++    {
++      OutputFrames(false);
++      if (ResetPending())
++        return;
++    }
++    if (res == EBADMSG)
++      m_badNals++;
++    OutputFrames(false);
++    nal = next;
++  }
++#endif
++}
++
++void CAMLMvc::OutputFrames(bool drain)
++{
++#ifdef HAS_EDGE264
++  // an empty buffer (buf >= end) makes every held picture ready for output
++  static const uint8_t none = 0;
++  Edge264Frame frame;
++
++  for (int pass = 0; pass < 64; pass++)
++  {
++    const int res = drain ? edge264_decode_NAL(m_decoder, &none, &none, nullptr, nullptr) : 0;
++    while (!ResetPending() && edge264_get_frame(m_decoder, &frame, 0) == 0)
++    {
++      if (!OutputFrame(frame))
++        return;
++    }
++    // ENOBUFS: the pictures just taken made room for more
++    if (!drain || (res != 0 && res != ENOBUFS) || ResetPending())
++      break;
++  }
++#endif
++}
++
++bool CAMLMvc::OutputFrame(const Edge264Frame& frame)
++{
++#ifdef HAS_EDGE264
++  if (frame.width_Y != VIEW_W || frame.height_Y != VIEW_H)
++  {
++    CLog::Log(LOGWARNING, "CAMLMvc - unsupported picture {}x{}", frame.width_Y, frame.height_Y);
++    return true;
++  }
++
++  // pts in display order: the smallest one queued (like a decoder's reorder)
++  double pts;
++  if (!m_pts.empty())
++  {
++    pts = *m_pts.begin();
++    m_pts.erase(m_pts.begin());
++  }
++  else if (m_lastPts != DVD_NOPTS_VALUE)
++    pts = m_lastPts + m_frameDuration;
++  else
++    pts = 0.0;
++  m_lastPts = pts;
++
++  mvcout_frame f{};
++  f.timeout_ms = 100;
++  while (ioctl(m_fd, MVCOUT_IOC_DEQUEUE, &f) < 0)
++  {
++    if ((errno != EAGAIN && errno != EINTR) || ResetPending())
++      return false;
++  }
++
++  View left{frame.samples[0], frame.samples[1], frame.samples[2], frame.stride_Y,
++            frame.stride_C};
++  View right = left;
++  if (frame.samples_mvc[0])
++    right = View{frame.samples_mvc[0], frame.samples_mvc[1], frame.samples_mvc[2],
++                 frame.stride_Y, frame.stride_C};
++  if (m_swap)
++    std::swap(left, right);
++
++  uint8_t* dst = m_maps[f.index];
++  const Mode mode = m_mode;
++  uint32_t height = VIEW_H;
++  switch (mode)
++  {
++    case Mode::FramePacked:
++    {
++      // the second view in a helper thread, the first one here
++      std::thread t(ComposeFull, dst + (VIEW_H + FP_GAP) * m_stride, m_stride, right);
++      ComposeFull(dst, m_stride, left);
++      Black(dst + VIEW_H * m_stride, m_stride, FP_GAP);
++      t.join();
++      height = m_height;
++      break;
++    }
++    case Mode::SideBySide:
++    {
++      std::thread t(ComposeHalfWidth, dst, m_stride, VIEW_W / 2, right);
++      ComposeHalfWidth(dst, m_stride, 0, left);
++      t.join();
++      break;
++    }
++    case Mode::TopBottom:
++    {
++      std::thread t(ComposeHalfHeight, dst + (VIEW_H / 2) * m_stride, m_stride, right);
++      ComposeHalfHeight(dst, m_stride, left);
++      t.join();
++      break;
++    }
++    case Mode::Left:
++    case Mode::Right:
++      ComposeFull(dst, m_stride, mode == Mode::Left ? left : right);
++      break;
++  }
++
++  f.pts_us = pts > 0 ? static_cast<uint64_t>(pts) : 0;
++  f.duration = m_duration96;
++  f.width = VIEW_W;
++  f.height = height;
++  if (ioctl(m_fd, MVCOUT_IOC_QUEUE, &f) < 0)
++  {
++    CLog::Log(LOGERROR, "CAMLMvc - queue failed: {}", strerror(errno));
++    return false;
++  }
++  m_frames++;
++  return true;
++#else
++  return false;
++#endif
++}
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLMvc.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLMvc.h
+new file mode 100644
+index 0000000000..06277dac6d
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLMvc.h
+@@ -0,0 +1,119 @@
++/*
++ *  Copyright (C) 2026 Team CoreELEC (https://coreelec.org)
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include <atomic>
++#include <condition_variable>
++#include <cstdint>
++#include <deque>
++#include <mutex>
++#include <set>
++#include <thread>
++#include <vector>
++
++class CDVDStreamInfo;
++struct Edge264Decoder;
++struct Edge264Frame;
++
++/*!
++ * \brief Software 3D MVC decoding for Amlogic SoCs.
++ *
++ * The hardware MVC decoder corrupts the dependent view on some discs, so the
++ * stream is decoded with edge264-mvc on the CPU instead. Both views are
++ * composed into one picture (frame packing at full resolution, or a mono /
++ * half resolution side-by-side / top-bottom picture) in buffers of the
++ * mvcout kernel module, which hands them to the video layer through the
++ * usual "... amlvideo amvideo" vfm chain. CAMLCodec keeps pacing the frames
++ * through the amlvideo v4l device as for the hardware decoders.
++ */
++class CAMLMvc
++{
++public:
++  enum class Mode
++  {
++    FramePacked, // left, 45 lines of active space, right (1920x2205 for 1080p)
++    Left,
++    Right,
++    SideBySide, // half width each
++    TopBottom, // half height each
++  };
++
++  CAMLMvc() = default;
++  ~CAMLMvc();
++
++  //! The mvcout module is loaded and Kodi was built with edge264
++  static bool IsSupported();
++  //! Decode 3D MVC in software: always on S5, a setting on the other SoCs
++  static bool IsEnabled();
++
++  bool Open(const CDVDStreamInfo& hints);
++  void Close();
++
++  //! Queue one access unit (Annex B, both views); false: queue full, retry
++  bool AddData(const uint8_t* data, size_t size, double pts);
++  //! Seek: drop everything queued or decoded, returns once the thread is idle
++  void Reset();
++  //! End of stream: output the pictures the decoder still holds
++  void Drain();
++  bool IsDrained();
++  bool IsFull();
++  //! input queue fill in percent, the stream buffer level of the hardware decoders
++  float GetLevel();
++
++  void SetMode(Mode mode) { m_mode = mode; }
++  //! the base view is the right eye ("block_rl")
++  void SetSwapViews(bool swap) { m_swap = swap; }
++  Mode GetMode() const { return m_mode; }
++  double GetFrameDuration() const { return m_frameDuration; }
++
++private:
++  struct Packet
++  {
++    std::vector<uint8_t> data;
++    double pts;
++  };
++
++  void Process();
++  void DecodeUnits(const uint8_t* data, size_t size);
++  void OutputFrames(bool drain);
++  bool OutputFrame(const Edge264Frame& frame);
++  bool ResetPending();
++  void DoReset();
++
++  int m_fd{-1};
++  std::vector<uint8_t*> m_maps;
++  uint32_t m_width{0};
++  uint32_t m_height{0};
++  uint32_t m_stride{0};
++  uint32_t m_size{0};
++
++  Edge264Decoder* m_decoder{nullptr};
++  std::vector<uint8_t> m_headers; // parameter sets from the extradata
++
++  std::thread m_thread;
++  std::mutex m_mutex;
++  std::condition_variable m_cv;
++  std::condition_variable m_cvIdle;
++  std::deque<Packet> m_queue;
++  size_t m_queueBytes{0};
++  bool m_stop{false};
++  bool m_drainReq{false};
++  bool m_drained{false};
++  uint64_t m_resetReq{0};
++  uint64_t m_resetDone{0};
++
++  std::atomic<Mode> m_mode{Mode::FramePacked};
++  std::atomic<bool> m_swap{false};
++  std::multiset<double> m_pts; // decode thread only
++  double m_lastPts;
++  double m_frameDuration{41708.0};
++  uint32_t m_duration96{4004};
++  uint64_t m_frames{0};
++  uint64_t m_badNals{0};
++};
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/CMakeLists.txt b/xbmc/cores/VideoPlayer/DVDCodecs/Video/CMakeLists.txt
+index 4bdb0781d0..5814ee3d1d 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/CMakeLists.txt
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/CMakeLists.txt
+@@ -15,10 +15,13 @@ endif()
+ if(TARGET ${APP_NAME_LC}::AML)
+   list(APPEND SOURCES AMLCodec.cpp
+                       AMLDvFel.cpp
++                      AMLMvc.cpp
+                       DVDVideoCodecAmlogic.cpp
+                       felgpu.c)
+   list(APPEND HEADERS AMLCodec.h
+                       AMLDvFel.h
++                      AMLMvc.h
++                      mvcout_uapi.h
+                       DVDVideoCodecAmlogic.h
+                       dvfel_uapi.h
+                       felgpu.h)
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.cpp
+index 704e56ca70..5aa2d897f8 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.cpp
+@@ -1201,6 +1201,13 @@ bool CDVDVideoCodecAmlogic::AddData(const DemuxPacket &packet)
+       CLog::Log(LOGINFO, "CDVDVideoCodecAmlogic::{}: Open decoder: fps:{:d}/{:d}", __FUNCTION__, m_hints.fpsrate, m_hints.fpsscale);
+       if (m_Codec && !m_Codec->OpenDecoder(m_hints, doviIsFEL, packet.isDualStream))
+         CLog::Log(LOGERROR, "CDVDVideoCodecAmlogic::{}: Failed to open Amlogic Codec", __FUNCTION__);
++      else if (m_Codec && m_Codec->IsSoftwareMvc())
++      {
++        // still a hardware decoder to the player: the pictures come through
++        // the video layer and the data level is the decoder's input queue
++        m_pFormatName = "edge264-mvc";
++        m_processInfo.SetVideoDecoderName(m_pFormatName, true);
++      }
+ 
+       m_videoBufferPool = std::shared_ptr<CAMLVideoBufferPool>(new CAMLVideoBufferPool());
+ 
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/mvcout_uapi.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/mvcout_uapi.h
+new file mode 100644
+index 0000000000..5c828e0ade
+--- /dev/null
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/mvcout_uapi.h
+@@ -0,0 +1,62 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later WITH Linux-syscall-note */
++/*
++ * mvcout - show frames written by user space on the video layer
++ *
++ * Usage: MVCOUT_IOC_ALLOC, mmap each buffer (offset = index * map_size),
++ * MVCOUT_IOC_START (registers the "mvcout" vframe provider; the vfm map
++ * that connects it to a receiver is set up by user space), then per frame
++ * MVCOUT_IOC_DEQUEUE -> write -> MVCOUT_IOC_QUEUE. The receiver shows a
++ * queued frame as soon as it takes it (freerun), so user space paces.
++ */
++#ifndef MVCOUT_UAPI_H
++#define MVCOUT_UAPI_H
++
++#include <linux/ioctl.h>
++#include <linux/types.h>
++
++#define MVCOUT_DEV		"/dev/mvcout"
++#define MVCOUT_PROVIDER		"mvcout"
++#define MVCOUT_MAX_BUFS		16
++
++#define MVCOUT_FMT_NV21		0	/* Y plane, then interleaved CrCb, 8 bit */
++#define MVCOUT_FMT_YUV422	1	/* packed 4:2:2, 2 bytes per pixel, 8 bit */
++
++struct mvcout_alloc {
++	__u32 width;		/* in */
++	__u32 height;		/* in */
++	__u32 format;		/* in: MVCOUT_FMT_* */
++	__u32 count;		/* in: 2..MVCOUT_MAX_BUFS */
++	__u32 stride;		/* out: bytes per line (Y plane for NV21) */
++	__u32 size;		/* out: bytes used per buffer */
++	__u32 map_size;		/* out: mmap offset step between buffers */
++	__u32 reserved;
++};
++
++struct mvcout_frame {
++	__s32 index;		/* DEQUEUE out, QUEUE in */
++	__u32 timeout_ms;	/* DEQUEUE in: 0 = do not wait */
++	__u64 pts_us;		/* QUEUE in */
++	__u32 duration;		/* QUEUE in: 1/96000 s units (4004 = 23.976 Hz) */
++	__u32 flags;		/* reserved, 0 */
++	__u32 width;		/* QUEUE in: picture size within the buffer, */
++	__u32 height;		/* 0 = the allocated size; same stride */
++};
++
++struct mvcout_stats {
++	__u64 queued;
++	__u64 taken;
++	__u64 returned;
++	__u32 held;		/* buffers kept by the display after a stop */
++	__u32 reserved;
++};
++
++#define MVCOUT_IOC_MAGIC	'M'
++#define MVCOUT_IOC_ALLOC	_IOWR(MVCOUT_IOC_MAGIC, 1, struct mvcout_alloc)
++#define MVCOUT_IOC_START	_IO(MVCOUT_IOC_MAGIC, 2)
++#define MVCOUT_IOC_STOP		_IO(MVCOUT_IOC_MAGIC, 3)
++#define MVCOUT_IOC_DEQUEUE	_IOWR(MVCOUT_IOC_MAGIC, 4, struct mvcout_frame)
++#define MVCOUT_IOC_QUEUE	_IOW(MVCOUT_IOC_MAGIC, 5, struct mvcout_frame)
++#define MVCOUT_IOC_FLUSH	_IO(MVCOUT_IOC_MAGIC, 6)
++#define MVCOUT_IOC_STATS	_IOR(MVCOUT_IOC_MAGIC, 7, struct mvcout_stats)
++
++#endif
+diff --git a/xbmc/guilib/StereoscopicsManager.cpp b/xbmc/guilib/StereoscopicsManager.cpp
+index 400b9b8eaa..67f2a45901 100644
+--- a/xbmc/guilib/StereoscopicsManager.cpp
++++ b/xbmc/guilib/StereoscopicsManager.cpp
+@@ -601,6 +601,11 @@ void CStereoscopicsManager::OnStreamChange()
+     // only change to new stereo mode if not yet in preferred stereo mode
+     if (mode == preferred || (preferred == RenderStereoMode::AUTO && mode == playing))
+       return;
++
++    // already playing in mono: notifying again re-runs the resolution update,
++    // whose VideoParamsChange comes back here as the next stream change
++    if (playbackMode == 2 && mode == RenderStereoMode::MONO)
++      return;
+   }
+ 
+   switch (playbackMode)
+diff --git a/xbmc/settings/SettingConditions.cpp b/xbmc/settings/SettingConditions.cpp
+index 16340f10af..4dca0118dc 100644
+--- a/xbmc/settings/SettingConditions.cpp
++++ b/xbmc/settings/SettingConditions.cpp
+@@ -421,6 +421,11 @@ void CSettingConditions::Initialize()
+   // to P8.1), a FEL can only be composed on the GPU there
+   if (aml_get_cpufamily_id() == AML_S5)
+     m_simpleConditions.insert("aml_dv_no_hw_el");
++#ifdef HAS_EDGE264
++  // 3D MVC: S5 always decodes it in software, elsewhere it is a choice
++  if (aml_get_cpufamily_id() != AML_S5)
++    m_simpleConditions.insert("aml_mvc_sw_selectable");
++#endif
+ #endif
+ #if defined(TARGET_WINDOWS)
+   m_simpleConditions.emplace("has_dx");
+diff --git a/xbmc/settings/Settings.h b/xbmc/settings/Settings.h
+index ff7ffc684e..7f126e503e 100644
+--- a/xbmc/settings/Settings.h
++++ b/xbmc/settings/Settings.h
+@@ -475,6 +475,7 @@ public:
+   static constexpr auto SETTING_MASTERLOCK_MAXRETRIES = "masterlock.maxretries";
+   static constexpr auto SETTING_COREELEC_AMLOGIC_NOISEREDUCTION = "coreelec.amlogic.noisereduction";
+   static constexpr auto SETTING_COREELEC_AMLOGIC_DVFEL_ENABLE = "coreelec.amlogic.dvfelenable";
++  static constexpr auto SETTING_COREELEC_AMLOGIC_MVC_SOFTWARE = "coreelec.amlogic.mvcsoftware";
+   static constexpr auto SETTING_COREELEC_AMLOGIC_DVFEL_DITHER = "coreelec.amlogic.dvfeldither";
+   static constexpr auto SETTING_COREELEC_AMLOGIC_DVFEL_DEMO = "coreelec.amlogic.dvfeldemo";
+   static constexpr auto SETTING_COREELEC_AMLOGIC_SDR2HDR = "coreelec.amlogic.sdr2hdr";
+diff --git a/xbmc/windowing/amlogic/AMLDisplay.cpp b/xbmc/windowing/amlogic/AMLDisplay.cpp
+index 4070a541d5..1f6b7d8154 100644
+--- a/xbmc/windowing/amlogic/AMLDisplay.cpp
++++ b/xbmc/windowing/amlogic/AMLDisplay.cpp
+@@ -980,8 +980,14 @@ bool CAMLDRMUtils::aml_set_drmDevice_active(std::string mode, int fractional_rat
+   // on the opening sequence. Mode-string-only matches the pre-rebase fork (smooth).
+   // Deliberately NOT gated on upstream's force_mode_switch either: forcing a modeset
+   // at an already-live mode string is the BD-J black regression this whole gate fixes.
++  // Entering or leaving 3D frame packing keeps the mode string but not the
++  // timing: without a modeset the CRTC stays on the frame packed timing after
++  // the 3D title (a 2205-line GUI, only its top part on screen), or never gets
++  // it when the GUI already ran at the title's rate.
++  const bool framePacked = stereo_mode == RenderStereoMode::HARDWAREBASED;
+   const bool mode_switch_required =
+-      !StringUtils::EqualsNoCase(aml_get_drmDevice_mode(), mode);
++      !StringUtils::EqualsNoCase(aml_get_drmDevice_mode(), mode) ||
++      (active && framePacked != m_modeFramePacked);
+ 
+   if (mode_switch_required)
+   {
+@@ -1038,7 +1044,10 @@ bool CAMLDRMUtils::aml_set_drmDevice_active(std::string mode, int fractional_rat
+       if (!ret)
+         CLog::Log(LOGDEBUG, "CAMLDRMUtils::{} - failed to set drmDevice mode: {}", __FUNCTION__, drmDevicemode->name);
+       else
++      {
+         m_crtc->mode = *drmDevicemode;
++        m_modeFramePacked = drmDevicemode == &syntheticMode;
++      }
+ 
+       drmModeAtomicFree(req);
+       drmModeDestroyPropertyBlob(m_fd, mode_blobid);
+@@ -1178,10 +1187,22 @@ void CAMLDisplay::aml_refresh_display_caps()
+ }
+ 
+ bool CAMLDisplay::set_native_resolution(const RESOLUTION_INFO &res, std::string framebuffer_name,
+-  const RenderStereoMode stereo_mode, bool force_mode_switch, bool hotplug_mode_switch)
++  RenderStereoMode stereo_mode, bool force_mode_switch, bool hotplug_mode_switch)
+ {
+   bool result = false;
+ 
++  // Frame packing only on a frame packed mode: playback stop returns to the
++  // desktop mode while the stereo mode is still hardware based (it is reset
++  // right after), and a sink without frame packing gets none from the
++  // whitelist. A frame packed timing there is a mode the sink never offered
++  // ("unsupported" / a re-sync, 1080p60 at 297 MHz).
++  if (stereo_mode == RenderStereoMode::HARDWAREBASED && !(res.dwFlags & D3DPRESENTFLAG_MODE3DFP))
++  {
++    CLog::Log(LOGINFO, "CAMLDisplay::{} - {} is no frame packed mode, 3D output off",
++              __FUNCTION__, res.strMode);
++    stereo_mode = RenderStereoMode::OFF;
++  }
++
+   if (aml_get_cpufamily_id() < AML_T7)
+   {
+     handle_display_stereo_mode(stereo_mode);
+@@ -1302,6 +1323,23 @@ std::string CAMLDisplay::aml_get_preferred_mode()
+   return mode;
+ }
+ 
++namespace
++{
++// the 3D modes carry the name of the 2D mode they are built from: tell them
++// apart in the resolution and whitelist lists
++std::string StereoModeSuffix(uint32_t flags)
++{
++  std::vector<std::string> modes;
++  if (flags & D3DPRESENTFLAG_MODE3DFP)
++    modes.emplace_back("FP");
++  if (flags & D3DPRESENTFLAG_MODE3DTB)
++    modes.emplace_back("TB");
++  if (flags & D3DPRESENTFLAG_MODE3DSBS)
++    modes.emplace_back("SBS");
++  return modes.empty() ? "" : " 3D " + StringUtils::Join(modes, "/");
++}
++} // namespace
++
+ bool CAMLDisplay::aml_mode_to_resolution(const char *mode, RESOLUTION_INFO *res)
+ {
+   int width = 0, height = 0, rrate = 60;
+@@ -1414,6 +1452,8 @@ bool CAMLDisplay::aml_mode_to_resolution(const char *mode, RESOLUTION_INFO *res)
+   if (fromMode.find("SidebySide") != std::string::npos)
+     res->dwFlags |= D3DPRESENTFLAG_MODE3DSBS;
+ 
++  res->strMode += StereoModeSuffix(res->dwFlags);
++
+   return res->iWidth > 0 && res->iHeight> 0;
+ }
+ 
+@@ -1486,7 +1526,7 @@ bool CAMLDisplay::aml_probe_resolutions(std::vector<RESOLUTION_INFO> &resolution
+           case 60:
+             res.fRefreshRate = FractionalRate(res.fRefreshRate);
+             res.strMode       = StringUtils::Format("{:d}x{:d} @ {:.2f}{} - Full Screen", res.iScreenWidth, res.iScreenHeight, res.fRefreshRate,
+-              res.dwFlags & D3DPRESENTFLAG_INTERLACED ? "i" : "");
++              res.dwFlags & D3DPRESENTFLAG_INTERLACED ? "i" : "") + StereoModeSuffix(res.dwFlags);
+             resolutions.push_back(res);
+             break;
+         }
+diff --git a/xbmc/windowing/amlogic/AMLDisplay.h b/xbmc/windowing/amlogic/AMLDisplay.h
+index 0576ef0992..b8d338ef17 100644
+--- a/xbmc/windowing/amlogic/AMLDisplay.h
++++ b/xbmc/windowing/amlogic/AMLDisplay.h
+@@ -135,6 +135,9 @@ private:
+   // 8-bit) or player-led/LLDV (YUV422 12-bit). Either one has to be handed back
+   // to the kernel on the way out - see leaving_dv_wire().
+   bool m_wireDvTunnel{false};
++  // the committed mode is the frame packed timing built from the mode of the
++  // same name (twice the active lines and pixel clock)
++  bool m_modeFramePacked{false};
+   int m_width;
+   int m_height;
+   int m_ScreenWidth;
