@@ -1,0 +1,691 @@
+From a56c21cbac8e4dcc6f3644d0aac47248b785275f Mon Sep 17 00:00:00 2001
+From: djnice <djnice77@gmail.com>
+Date: Wed, 30 Sep 2026 08:38:24 +0200
+Subject: [PATCH 9905/9906] dvfel: compose the hardware decoded EL
+
+With the dvfel module that takes a decoded EL (its el_wait_ms parameter),
+a FEL title keeps its EL in the stream and the decoder is opened for Dolby
+Vision dual layer: the S5 decodes both layers, dvfel hands the decoded EL
+picture of each frame to the compositor with the BL, and the EL no longer
+costs CPU (Kodi 5-9 % instead of all cores on heavy remuxes). The Dolby
+Vision core still gets the converted no-op RPU.
+
+- the EL is kept from the first access unit (its parameter sets)
+- felgpu takes the EL as a texture (unpack pass) instead of a CPU frame
+- the RPU is found by the frame's pts; an EL coded in another picture order
+  than the BL (dvfel reports different access units for the pair, paired by
+  display order) takes the RPU of its own access unit, like the software
+  EL decoder does
+- /storage/dvfel_sw_el keeps the software EL decoder, for comparisons
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp  | 162 ++++++++++++++++--
+ .../VideoPlayer/DVDCodecs/Video/AMLDvFel.h    |  27 ++-
+ .../DVDCodecs/Video/DVDVideoCodecAmlogic.cpp  |  20 ++-
+ .../VideoPlayer/DVDCodecs/Video/dvfel_uapi.h  |  17 ++
+ .../VideoPlayer/DVDCodecs/Video/felgpu.c      |  57 +++++-
+ .../VideoPlayer/DVDCodecs/Video/felgpu.h      |   5 +
+ xbmc/utils/BitstreamConverter.cpp             |   6 +-
+ xbmc/utils/BitstreamConverter.h               |   5 +
+ 8 files changed, 269 insertions(+), 30 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp
+index d376ce4ba3..3a30f93379 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp
+@@ -55,7 +55,12 @@ constexpr int EL_WAIT_MS = 80;         // wait for the EL frame of a job (the ke
+ constexpr int64_t EL_LEAD_US = 350000;
+ constexpr size_t MAX_EL_FRAMES = 24;   // decoded EL frames kept (6 MB each at 4K)
+ constexpr size_t MAX_EL_QUEUE = 400;   // compressed EL packets
++constexpr size_t MAX_META = 2048;      // hwEl: RPUs waiting for their frame (the stream
++                                       // mode decoder buffer holds seconds of video)
+ constexpr int64_t PTS_TOLERANCE_US = 1000;
++// hwEl: RPUs older than the frame shown are kept this long, for an EL of another
++// picture order than the BL (its RPU comes with an access unit shown earlier)
++constexpr int64_t META_KEEP_US = 3000000;
+ 
+ void WriteSysfs(const char* path, const std::string& value)
+ {
+@@ -343,6 +348,13 @@ bool CAMLDvFel::IsAvailable()
+   return access(DVFEL_DEV, R_OK | W_OK) == 0;
+ }
+ 
++bool CAMLDvFel::SupportsHwEl()
++{
++  // /storage/dvfel_sw_el keeps the software EL decoder, for comparisons
++  return access("/sys/module/dvfel/parameters/el_wait_ms", F_OK) == 0 &&
++         access("/storage/dvfel_sw_el", F_OK) != 0;
++}
++
+ void CAMLDvFel::RouteThroughDvfel(bool enable)
+ {
+   // non Dolby Vision decoding builds its map from vdec_vfm_path, Dolby Vision
+@@ -351,9 +363,15 @@ void CAMLDvFel::RouteThroughDvfel(bool enable)
+   WriteSysfs("/sys/class/vfm/map", "rm dvblpath");
+   WriteSysfs("/sys/class/vfm/map", enable ? "add dvblpath dvbldec dvfel amlvideo deinterlace amvideo"
+                                           : "add dvblpath dvbldec amlvideo deinterlace amvideo");
++  // the hardware decoded EL goes to dvfel instead of the Dolby Vision core
++  if (m_hwEl)
++  {
++    WriteSysfs("/sys/class/vfm/map", "rm dvelpath");
++    WriteSysfs("/sys/class/vfm/map", enable ? "add dvelpath dveldec dvfelel" : "add dvelpath dveldec dvel");
++  }
+ }
+ 
+-bool CAMLDvFel::Start(int width, int height)
++bool CAMLDvFel::Start(int width, int height, bool hwEl)
+ {
+   if (m_started)
+     return true;
+@@ -362,8 +380,10 @@ bool CAMLDvFel::Start(int width, int height)
+ 
+   m_width = width;
+   m_height = height;
++  m_hwEl = hwEl;
+   m_stop = false;
+   m_noPairLogged = 0;
++  m_noRpuLogged = 0;
+ 
+   std::promise<bool> ready;
+   std::future<bool> ok = ready.get_future();
+@@ -374,11 +394,13 @@ bool CAMLDvFel::Start(int width, int height)
+     CLog::Log(LOGERROR, "CAMLDvFel: GPU compositor failed to start, FEL composition disabled");
+     return false;
+   }
+-  m_elThread = std::thread(&CAMLDvFel::ElThread, this);
++  if (!m_hwEl)
++    m_elThread = std::thread(&CAMLDvFel::ElThread, this);
+ 
+   RouteThroughDvfel(true);
+   m_started = true;
+-  CLog::Log(LOGINFO, "CAMLDvFel: FEL composition started for {}x{}", width, height);
++  CLog::Log(LOGINFO, "CAMLDvFel: FEL composition started for {}x{}, EL decoded in {}", width,
++            height, m_hwEl ? "hardware" : "software");
+   return true;
+ }
+ 
+@@ -410,6 +432,8 @@ void CAMLDvFel::Stop()
+     av_frame_free(&f.second.frame);
+   m_elFrames.clear();
+   m_elQueue.clear();
++  m_metaByPts.clear();
++  m_ptsBySeq.clear();
+   m_started = false;
+ }
+ 
+@@ -418,8 +442,11 @@ void CAMLDvFel::Reset()
+   std::lock_guard<std::mutex> lock(m_lock);
+   m_elQueue.clear();
+   m_elQueue.push_back({0, {}, nullptr, true});
++  m_metaByPts.clear();
++  m_ptsBySeq.clear();
+   m_lastJobPts = INT64_MIN;
+   m_noPairLogged = 0;
++  m_noRpuLogged = 0;
+   m_pendingRpu.clear();
+   m_pendingEl.clear();
+   m_elCond.notify_all();
+@@ -437,19 +464,22 @@ void CAMLDvFel::OnDoviElNal(const uint8_t* nal, uint32_t size)
+   m_pendingEl.insert(m_pendingEl.end(), nal, nal + size);
+ }
+ 
+-void CAMLDvFel::DropPacket()
++void CAMLDvFel::DropPacket(bool decoded)
+ {
+   m_pendingRpu.clear();
+   m_pendingEl.clear();
++  if (decoded && m_started)
++    m_packetSeq++;
+ }
+ 
+ void CAMLDvFel::CommitPacket(double pts)
+ {
+   if (!m_started || pts < 0)
+   {
+-    DropPacket();
++    DropPacket(m_started);
+     return;
+   }
++  const uint32_t seq = m_packetSeq++;
+   // the decoder reports the packet pts truncated to microseconds
+   const int64_t key = static_cast<int64_t>(pts);
+ 
+@@ -460,7 +490,21 @@ void CAMLDvFel::CommitPacket(double pts)
+     m_lastMeta = meta;
+ 
+   std::lock_guard<std::mutex> lock(m_lock);
+-  if (!m_pendingEl.empty() && m_elQueue.size() < MAX_EL_QUEUE)
++  if (m_hwEl)
++  {
++    // the EL stays in the stream; the RPU is found by the pts of the frame, or
++    // (an EL of another picture order) by the packet number of its EL picture
++    if (meta)
++    {
++      m_metaByPts[key] = {meta, seq};
++      while (m_metaByPts.size() > MAX_META)
++        m_metaByPts.erase(m_metaByPts.begin());
++    }
++    m_ptsBySeq[seq] = key;
++    while (m_ptsBySeq.size() > MAX_META)
++      m_ptsBySeq.erase(m_ptsBySeq.begin());
++  }
++  else if (!m_pendingEl.empty() && m_elQueue.size() < MAX_EL_QUEUE)
+   {
+     m_elQueue.push_back({key, std::move(m_pendingEl), meta, false});
+     m_elCond.notify_all();
+@@ -694,6 +738,40 @@ bool CAMLDvFel::WaitForFrame(int64_t pts, AVFrame*& frame, std::shared_ptr<felgp
+   return frame != nullptr;
+ }
+ 
++std::shared_ptr<felgpu_meta> CAMLDvFel::TakeMeta(int64_t pts, int auDelta)
++{
++  std::lock_guard<std::mutex> lock(m_lock);
++  auto it = FindPts(m_metaByPts, pts);
++  if (it == m_metaByPts.end())
++    return nullptr;
++  std::shared_ptr<felgpu_meta> meta = it->second.meta;
++  if (auDelta != 0)
++  {
++    // an EL of another picture order: the kernel paired the frame with the EL
++    // picture shown at its time, coded auDelta access units away; its RPU is
++    // the one of that access unit (as for the software decoded EL)
++    meta = nullptr;
++    auto p = m_ptsBySeq.find(it->second.seq + auDelta);
++    if (p != m_ptsBySeq.end())
++    {
++      auto e = m_metaByPts.find(p->second);
++      if (e != m_metaByPts.end())
++        meta = e->second.meta;
++    }
++    if (!m_reorderLogged)
++    {
++      m_reorderLogged = true;
++      CLog::Log(LOGINFO,
++                "CAMLDvFel: the EL picture order differs from the base layer, pairing by "
++                "display order");
++    }
++  }
++  // frames are shown in display order: older RPUs are not needed any more,
++  // except by an EL of another picture order
++  m_metaByPts.erase(m_metaByPts.begin(), m_metaByPts.lower_bound(pts - META_KEEP_US));
++  return meta;
++}
++
+ void CAMLDvFel::GpuThread(std::promise<bool> ready)
+ {
+   bool announced = false;
+@@ -710,20 +788,22 @@ void CAMLDvFel::GpuThread(std::promise<bool> ready)
+   EGLContext ctx = EGL_NO_CONTEXT;
+   struct felgpu* fel = nullptr;
+   dvfel_reg_bufs reg{};
+-  GLuint tin[GPU_BUFFERS]{}, tout[GPU_BUFFERS]{}, fout[GPU_BUFFERS]{};
+-  EGLImageKHR images[GPU_BUFFERS * 2]{};
++  GLuint tin[GPU_BUFFERS]{}, tout[GPU_BUFFERS]{}, fout[GPU_BUFFERS]{}, tel[GPU_BUFFERS]{};
++  EGLImageKHR images[GPU_BUFFERS * 3]{};
++  // hardware decoded EL: half the size of the BL, same layout
++  const int elWidth = m_hwEl ? m_width / 2 : 0, elHeight = m_hwEl ? m_height / 2 : 0;
+   int nimg = 0;
+ 
+   auto createImage = PFNEGLCREATEIMAGEKHRPROC(eglGetProcAddress("eglCreateImageKHR"));
+   auto destroyImage = PFNEGLDESTROYIMAGEKHRPROC(eglGetProcAddress("eglDestroyImageKHR"));
+   auto targetTexture =
+       PFNGLEGLIMAGETARGETTEXTURE2DOESPROC(eglGetProcAddress("glEGLImageTargetTexture2DOES"));
+-  auto importTex = [&](int fd) -> GLuint {
+-    const EGLint attr[] = {EGL_WIDTH, m_width, EGL_HEIGHT, m_height,
++  auto importTex = [&](int fd, int width, int height) -> GLuint {
++    const EGLint attr[] = {EGL_WIDTH, width, EGL_HEIGHT, height,
+                            EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_ABGR8888,
+                            EGL_DMA_BUF_PLANE0_FD_EXT, fd,
+                            EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+-                           EGL_DMA_BUF_PLANE0_PITCH_EXT, m_width * 4,
++                           EGL_DMA_BUF_PLANE0_PITCH_EXT, width * 4,
+                            EGL_NONE};
+     EGLImageKHR img = createImage(dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attr);
+     if (img == EGL_NO_IMAGE_KHR)
+@@ -787,6 +867,8 @@ void CAMLDvFel::GpuThread(std::promise<bool> ready)
+     reg.width = m_width;
+     reg.height = m_height;
+     reg.count = GPU_BUFFERS;
++    reg.el_width = elWidth;
++    reg.el_height = elHeight;
+     bool ok = true;
+     for (int i = 0; i < GPU_BUFFERS && ok; i++)
+     {
+@@ -801,10 +883,23 @@ void CAMLDvFel::GpuThread(std::promise<bool> ready)
+       }
+       if (ok)
+       {
+-        tin[i] = importTex(reg.in_fd[i]);
+-        tout[i] = importTex(reg.out_fd[i]);
++        tin[i] = importTex(reg.in_fd[i], m_width, m_height);
++        tout[i] = importTex(reg.out_fd[i], m_width, m_height);
+         ok = tin[i] && tout[i];
+       }
++      if (ok && m_hwEl)
++      {
++        dma_heap_allocation_data a{};
++        a.len = DVFEL_BUF_SIZE(elWidth, elHeight);
++        a.fd_flags = O_RDWR | O_CLOEXEC;
++        ok = ioctl(heap, DMA_HEAP_IOCTL_ALLOC, &a) == 0;
++        if (ok)
++        {
++          reg.el_fd[i] = a.fd;
++          tel[i] = importTex(a.fd, elWidth, elHeight);
++          ok = tel[i] != 0;
++        }
++      }
+       if (ok)
+       {
+         glGenFramebuffers(1, &fout[i]);
+@@ -884,10 +979,35 @@ void CAMLDvFel::GpuThread(std::promise<bool> ready)
+ 
+       AVFrame* el = nullptr;
+       std::shared_ptr<felgpu_meta> meta;
+-      if (job.buf < GPU_BUFFERS && WaitForFrame(static_cast<int64_t>(job.pts_us), el, meta))
++      bool haveEl = false;
++      if (job.buf >= GPU_BUFFERS)
++        ;
++      else if (m_hwEl)
++      {
++        // the kernel decompressed the EL picture into tel[job.buf]
++        if (job.flags & DVFEL_JOB_EL)
++          meta = TakeMeta(static_cast<int64_t>(job.pts_us),
++                          static_cast<int16_t>(job.el_au - job.bl_au));
++        haveEl = meta != nullptr;
++        // an EL picture without its RPU is logged apart from a missing EL
++        int& logged = (job.flags & DVFEL_JOB_EL) ? m_noRpuLogged : m_noPairLogged;
++        if (!haveEl && logged < 10)
++        {
++          logged++;
++          std::lock_guard<std::mutex> lock(m_lock);
++          CLog::Log(LOGINFO, "CAMLDvFel: no {} for pts {} us (RPUs {} [{}..{}])",
++                    (job.flags & DVFEL_JOB_EL) ? "RPU" : "EL", job.pts_us, m_metaByPts.size(),
++                    m_metaByPts.empty() ? 0 : m_metaByPts.begin()->first,
++                    m_metaByPts.empty() ? 0 : m_metaByPts.rbegin()->first);
++        }
++      }
++      else
++        haveEl = WaitForFrame(static_cast<int64_t>(job.pts_us), el, meta);
++
++      if (haveEl)
+       {
+         const auto t0 = std::chrono::steady_clock::now();
+-        if (dumpPts >= 0 && static_cast<int64_t>(job.pts_us) == dumpPts)
++        if (el && dumpPts >= 0 && static_cast<int64_t>(job.pts_us) == dumpPts)
+         {
+           DumpFrame(el, *meta);
+           CLog::Log(LOGINFO, "CAMLDvFel: dumped EL frame pts {} (EL frame pts {})", dumpPts, el->pts);
+@@ -897,9 +1017,12 @@ void CAMLDvFel::GpuThread(std::promise<bool> ready)
+           felgpu_set_meta(fel, meta.get());
+           current = meta;
+         }
+-        felgpu_set_el(fel, reinterpret_cast<const uint16_t*>(el->data[0]), el->linesize[0] / 2,
+-                      reinterpret_cast<const uint16_t*>(el->data[1]),
+-                      reinterpret_cast<const uint16_t*>(el->data[2]), el->linesize[1] / 2);
++        if (m_hwEl)
++          felgpu_set_el_tex(fel, tel[job.buf]);
++        else
++          felgpu_set_el(fel, reinterpret_cast<const uint16_t*>(el->data[0]), el->linesize[0] / 2,
++                        reinterpret_cast<const uint16_t*>(el->data[1]),
++                        reinterpret_cast<const uint16_t*>(el->data[2]), el->linesize[1] / 2);
+         felgpu_set_active_area(fel, meta->l5[0] >= 0 ? meta->l5 : nullptr);
+         felgpu_run(fel, tin[job.buf], fout[job.buf]);
+         glFinish();
+@@ -936,6 +1059,7 @@ void CAMLDvFel::GpuThread(std::promise<bool> ready)
+     glDeleteFramebuffers(GPU_BUFFERS, fout);
+     glDeleteTextures(GPU_BUFFERS, tin);
+     glDeleteTextures(GPU_BUFFERS, tout);
++    glDeleteTextures(GPU_BUFFERS, tel);
+     for (int i = 0; i < nimg; i++)
+       destroyImage(dpy, images[i]);
+     eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+@@ -949,6 +1073,8 @@ void CAMLDvFel::GpuThread(std::promise<bool> ready)
+       close(reg.in_fd[i]);
+     if (reg.out_fd[i] > 0)
+       close(reg.out_fd[i]);
++    if (reg.el_fd[i] > 0)
++      close(reg.el_fd[i]);
+   }
+   if (heap >= 0)
+     close(heap);
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.h
+index eb6264f1f6..25b6582dfa 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.h
+@@ -52,10 +52,16 @@ public:
+ 
+   // the dvfel kernel node is loaded
+   static bool IsAvailable();
++  // the dvfel node takes the EL picture from the hardware EL decoder (Dolby
++  // Vision dual layer decoding) instead of it being decoded here
++  static bool SupportsHwEl();
+ 
+   // Starts EL decoding and the GPU compositor and routes the decoder output
+   // through dvfel. Must be called before the hardware decoder is opened.
+-  bool Start(int width, int height);
++  // hwEl: the stream keeps its EL for the hardware EL decoder, dvfel hands the
++  // decoded EL picture of each frame to the compositor (no EL decoding here)
++  bool Start(int width, int height, bool hwEl = false);
++  bool IsHwEl() const { return m_hwEl; }
+   void Stop();
+   bool IsStarted() const { return m_started; }
+ 
+@@ -64,8 +70,9 @@ public:
+ 
+   // the data collected by the sink belongs to the packet with this pts
+   void CommitPacket(double pts);
+-  // forget what the sink collected (packet not queued to the decoder)
+-  void DropPacket();
++  // forget what the sink collected; decoded: the packet went to the decoder
++  // anyway (without a pts), it still counts as an access unit
++  void DropPacket(bool decoded = false);
+ 
+   // IDoviElSink
+   void OnDoviRpu(const uint8_t* nal, uint32_t size) override;
+@@ -88,11 +95,15 @@ private:
+   void ElThread();
+   void GpuThread(std::promise<bool> ready);
+   bool WaitForFrame(int64_t pts, AVFrame*& frame, std::shared_ptr<felgpu_meta>& meta);
++  // the RPU for the frame at pts; auDelta: the EL picture is from the access
++  // unit that many packets away (an EL of another picture order)
++  std::shared_ptr<felgpu_meta> TakeMeta(int64_t pts, int auDelta);
+   void RouteThroughDvfel(bool enable);
+ 
+   int m_width{0};
+   int m_height{0};
+   bool m_started{false};
++  bool m_hwEl{false};
+   std::atomic<bool> m_stop{false};
+ 
+   // per packet, filled by the sink (decode thread)
+@@ -105,8 +116,18 @@ private:
+   std::condition_variable m_readyCond; // new EL frame
+   std::deque<ElPacket> m_elQueue;
+   std::map<int64_t, ElFrame> m_elFrames; // by display pts
++  struct PacketMeta
++  {
++    std::shared_ptr<felgpu_meta> meta;
++    uint32_t seq; // packet (access unit) number
++  };
++  std::map<int64_t, PacketMeta> m_metaByPts; // hwEl: RPU by packet pts
++  std::map<uint32_t, int64_t> m_ptsBySeq; // hwEl: packet pts by packet number
++  uint32_t m_packetSeq{0}; // hwEl: packets given to the decoder
++  bool m_reorderLogged{false};
+   int64_t m_lastJobPts{INT64_MIN}; // last frame the kernel asked for
+   int m_noPairLogged{0};           // since start or the last seek
++  int m_noRpuLogged{0};
+ 
+   std::thread m_elThread;
+   std::thread m_gpuThread;
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.cpp
+index 30480f79d9..e531409db9 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.cpp
+@@ -429,6 +429,10 @@ bool CDVDVideoCodecAmlogic::Open(CDVDStreamInfo &hints, CDVDCodecOptions &option
+             {
+               m_dvFel = std::make_unique<CAMLDvFel>();
+               m_bitstream->SetDoviElSink(m_dvFel.get());
++              // hardware EL decoding needs the EL from the very first access
++              // unit (its parameter sets); dropped again if the title is MEL
++              if (CAMLDvFel::SupportsHwEl())
++                m_bitstream->SetKeepDoviEl(true);
+             }
+           }
+ 
+@@ -1138,12 +1142,22 @@ bool CDVDVideoCodecAmlogic::AddData(const DemuxPacket &packet)
+         m_hdr10plusToDvCandidate = false;
+       }
+ 
+-      // the dvfel node has to be routed in before the decoder registers
+-      if (m_dvFel && !(doviIsFEL && m_dvFel->Start(m_hints.width, m_hints.height)))
++      // the dvfel node has to be routed in before the decoder registers.
++      // Hardware EL decoding: the stream keeps its EL and the decoder is opened
++      // for Dolby Vision dual layer, dvfel takes the decoded EL instead of the
++      // Dolby Vision core (which gets the converted, no-op RPU)
++      const bool hwEl = m_dvFel && doviIsFEL && CAMLDvFel::SupportsHwEl();
++      if (m_dvFel && !(doviIsFEL && m_dvFel->Start(m_hints.width, m_hints.height, hwEl)))
+       {
+         m_bitstream->SetDoviElSink(nullptr);
++        m_bitstream->SetKeepDoviEl(false);
+         m_dvFel.reset();
+       }
++      else if (m_dvFel && hwEl)
++      {
++        m_hints.dovi.dv_profile = 7;
++        m_hints.dovi.el_present_flag = true;
++      }
+       if (m_dvFel)
+         m_streamMeta.flags.push_back("fel-composed");
+ 
+@@ -1224,7 +1238,7 @@ bool CDVDVideoCodecAmlogic::AddData(const DemuxPacket &packet)
+     if (data_added && packet.pData && !m_hints.ptsinvalid && mergedPts != DVD_NOPTS_VALUE)
+       m_dvFel->CommitPacket(mergedPts);
+     else
+-      m_dvFel->DropPacket();
++      m_dvFel->DropPacket(data_added && packet.pData);
+   }
+ 
+   if (data_added && packet.pData)
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/dvfel_uapi.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/dvfel_uapi.h
+index 91c663650a..f9482a3799 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/dvfel_uapi.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/dvfel_uapi.h
+@@ -17,6 +17,11 @@
+  * In in[buf], chroma at even x and even y is the original 4:2:0 sample; odd
+  * positions are interpolated. dvfel converts out[buf] back to 4:2:0 by
+  * keeping the chroma at even x/y.
++ *
++ * Hardware decoded enhancement layer (Dolby Vision dual layer decoding, the
++ * EL decoder feeding the "dvfelel" receiver): with el_width set, dvfel
++ * decompresses the EL picture of each frame into el[buf] in the same layout
++ * (el_width x el_height) and flags the job with DVFEL_JOB_EL.
+  */
+ #ifndef _UAPI_DVFEL_H
+ #define _UAPI_DVFEL_H
+@@ -34,9 +39,13 @@ struct dvfel_reg_bufs {
+ 	__u32 count;			/* 1..DVFEL_MAX_BUFS */
+ 	__s32 in_fd[DVFEL_MAX_BUFS];	/* dma-buf fds */
+ 	__s32 out_fd[DVFEL_MAX_BUFS];
++	__u32 el_width;			/* 0: no hardware decoded EL */
++	__u32 el_height;
++	__s32 el_fd[DVFEL_MAX_BUFS];
+ };
+ 
+ #define DVFEL_JOB_NEW_STREAM	(1 << 0)	/* first job after start/seek */
++#define DVFEL_JOB_EL		(1 << 1)	/* el[buf] holds the EL picture */
+ 
+ struct dvfel_job {
+ 	__u32 timeout_ms;		/* in: max wait */
+@@ -46,6 +55,14 @@ struct dvfel_job {
+ 	__u32 height;			/* out */
+ 	__u32 flags;			/* out: DVFEL_JOB_* */
+ 	__u64 pts_us;			/* out: vframe pts_us64 (Kodi packet pts) */
++	/*
++	 * out: the access units (decode order, 16 bits, wrapping) of the BL
++	 * frame and of its EL picture. They differ when the EL is coded in
++	 * another picture order than the BL (paired by display order): the
++	 * RPU is then the one of the EL picture's access unit.
++	 */
++	__u32 bl_au;
++	__u32 el_au;
+ };
+ 
+ #define DVFEL_DONE_COMPOSED	0	/* out[buf] holds the frame */
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.c b/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.c
+index 01c4928e70..6cfd618bb2 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.c
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.c
+@@ -32,6 +32,8 @@ struct felgpu {
+     GLuint p_vert1, p_vert2, p_chroma, p_luma;
+     GLuint el_y, el_cb, el_cr;      /* uploaded EL planes, R16UI */
+     GLuint el_yv, el_cv;            /* vertically upsampled, R32F / RG32F */
++    GLuint p_unpack_y, p_unpack_c;  /* hardware decoded EL: packed words -> el_y, el_cb, el_cr */
++    GLuint fbo_el_y, fbo_el_c;
+     GLuint fbo_yv, fbo_cv;
+     GLuint chroma, fbo_chroma;      /* composed 4:2:0 chroma, RG16UI */
+     GLuint lut;                     /* R32F LUT_W x LUT_ROWS */
+@@ -195,6 +197,30 @@ struct felgpu {
+     "  c = uvec2(uint(cb), uint(cr));\n" \
+     "}\n"
+ 
++/*
++ * hardware decoded EL (felgpu_set_el_tex): the packed words of the EL picture,
++ * laid out like the BL, into the EL planes. Chroma at even x/y is the original
++ * 4:2:0 sample (see dvfel_uapi.h), so the planes match an uploaded EL exactly.
++ */
++static const char *fs_el_unpack_y =
++    GLSL_HEAD GLSL_WORD
++    "uniform sampler2D src;\n"
++    "layout(location = 0) out uint o;\n"
++    "void main() {\n"
++    "  o = y_of(word_at(src, ivec2(gl_FragCoord.xy)));\n"
++    "}\n";
++
++static const char *fs_el_unpack_c =
++    GLSL_HEAD GLSL_WORD
++    "uniform sampler2D src;\n"
++    "layout(location = 0) out uint cb;\n"
++    "layout(location = 1) out uint cr;\n"
++    "void main() {\n"
++    "  uint w = word_at(src, ivec2(gl_FragCoord.xy) * 2);\n"
++    "  cb = cb_of(w);\n"
++    "  cr = cr_of(w);\n"
++    "}\n";
++
+ static const char *vs_src =
+     "#version 320 es\n"
+     "void main() {\n"
+@@ -658,7 +684,10 @@ struct felgpu *felgpu_create(int w, int h, int taps)
+     f->p_luma = program(fs_luma, taps);
+     f->p_stats = program(fs_stats, taps);
+     f->p_reduce = program(fs_reduce, taps);
+-    if (!f->p_vert1 || !f->p_vert2 || !f->p_chroma || !f->p_luma || !f->p_stats || !f->p_reduce) {
++    f->p_unpack_y = program(fs_el_unpack_y, taps);
++    f->p_unpack_c = program(fs_el_unpack_c, taps);
++    if (!f->p_vert1 || !f->p_vert2 || !f->p_chroma || !f->p_luma || !f->p_stats || !f->p_reduce ||
++        !f->p_unpack_y || !f->p_unpack_c) {
+         free(f);
+         return NULL;
+     }
+@@ -679,6 +708,15 @@ struct felgpu *felgpu_create(int w, int h, int taps)
+     f->fbo_yv = make_fbo(f->el_yv);
+     f->fbo_cv = make_fbo(f->el_cv);
+     f->fbo_chroma = make_fbo(f->chroma);
++    f->fbo_el_y = make_fbo(f->el_y);
++    f->fbo_el_c = make_fbo(f->el_cb);
++    {
++        static const GLenum bufs[] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
++        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, f->el_cr, 0);
++        glDrawBuffers(2, bufs);
++        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
++            fprintf(stderr, "felgpu: EL chroma framebuffer incomplete\n");
++    }
+ 
+     f->sw = w / STATS_STEP;
+     f->sh = h / STATS_STEP;
+@@ -719,9 +757,12 @@ void felgpu_destroy(struct felgpu *f)
+         return;
+     GLuint tex[] = { f->el_y, f->el_cb, f->el_cr, f->el_yv, f->el_cv, f->chroma, f->lut, f->dither,
+                      f->stats, f->red };
+-    GLuint fbo[] = { f->fbo_yv, f->fbo_cv, f->fbo_chroma, f->fbo_stats, f->fbo_red };
++    GLuint fbo[] = { f->fbo_yv, f->fbo_cv, f->fbo_chroma, f->fbo_stats, f->fbo_red, f->fbo_el_y,
++                     f->fbo_el_c };
+     glDeleteTextures(10, tex);
+-    glDeleteFramebuffers(5, fbo);
++    glDeleteFramebuffers(7, fbo);
++    glDeleteProgram(f->p_unpack_y);
++    glDeleteProgram(f->p_unpack_c);
+     glDeleteProgram(f->p_vert1);
+     glDeleteProgram(f->p_vert2);
+     glDeleteProgram(f->p_chroma);
+@@ -748,6 +789,16 @@ void felgpu_set_el(struct felgpu *f, const uint16_t *y, int y_stride,
+     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+ }
+ 
++void felgpu_set_el_tex(struct felgpu *f, GLuint el)
++{
++    glUseProgram(f->p_unpack_y);
++    bind_tex(f->p_unpack_y, "src", 0, el);
++    draw(f->fbo_el_y, f->w / 2, f->h / 2);
++    glUseProgram(f->p_unpack_c);
++    bind_tex(f->p_unpack_c, "src", 0, el);
++    draw(f->fbo_el_c, f->w / 4, f->h / 4);
++}
++
+ static int piece_of(const struct felgpu_meta *m, int c, int code)
+ {
+     int n = m->npiv[c], k = 0;
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.h
+index 1314f915a4..5e977fe36a 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.h
+@@ -54,6 +54,11 @@ void felgpu_destroy(struct felgpu *f);
+ /* EL planes, yuv420p10 (16-bit samples), strides in samples */
+ void felgpu_set_el(struct felgpu *f, const uint16_t *y, int y_stride,
+                    const uint16_t *cb, const uint16_t *cr, int c_stride);
++/*
++ * hardware decoded EL: the EL picture as a (w/2 x h/2) texture of packed
++ * words laid out like the BL (see dvfel_uapi.h), instead of felgpu_set_el
++ */
++void felgpu_set_el_tex(struct felgpu *f, GLuint el);
+ void felgpu_set_meta(struct felgpu *f, const struct felgpu_meta *m);
+ 
+ /* compose bl_tex (dma-buf import, RGBA8) into out_fbo (dma-buf, RGBA8) */
+diff --git a/xbmc/utils/BitstreamConverter.cpp b/xbmc/utils/BitstreamConverter.cpp
+index 37c5fc2018..fed6d0a1b1 100644
+--- a/xbmc/utils/BitstreamConverter.cpp
++++ b/xbmc/utils/BitstreamConverter.cpp
+@@ -1044,7 +1044,7 @@ bool CBitstreamConverter::Convert(uint8_t* pData, int iSize)
+                 // Drop the enhancement layer only for the profile-7 -> 8.1
+                 // conversion; in RPU-processing-only mode (L5/CMv4.0 on an
+                 // annex-b stream) the in-band EL must survive for FEL/MEL.
+-                if (nal_type != HEVC_NAL_UNSPEC63 || !m_convert_dovi)
++                if (nal_type != HEVC_NAL_UNSPEC63 || !m_convert_dovi || m_keepDoviEl)
+                   BitstreamAllocAndCopy(&m_convertBuffer, &offset, buf, size, nal_type);
+                 else
+                   SinkElNal63(buf, size);
+@@ -1375,7 +1375,7 @@ bool CBitstreamConverter::Convert(uint8_t *pData_bl, int iSize_bl, uint8_t *pDat
+       }
+       else
+       {
+-        if (!m_convert_dovi)
++        if (!m_convert_dovi || m_keepDoviEl)
+           BitstreamAllocAndCopy(&m_convertBuffer, &offset, buf, size, HEVC_NAL_UNSPEC63);
+         else if (m_doviElSink)
+           m_doviElSink->OnDoviElNal(buf, size); // raw EL NAL of the EL track
+@@ -1972,7 +1972,7 @@ bool CBitstreamConverter::BitstreamConvert(uint8_t* pData,
+           }
+ #endif
+         }
+-        else if (m_convert_dovi && unit_type == HEVC_NAL_UNSPEC63)
++        else if (m_convert_dovi && !m_keepDoviEl && unit_type == HEVC_NAL_UNSPEC63)
+         {
+           // Ignore the enhancement layer, may or may not help
+           write_buf = false;
+diff --git a/xbmc/utils/BitstreamConverter.h b/xbmc/utils/BitstreamConverter.h
+index 288247be37..e83d01e3b6 100644
+--- a/xbmc/utils/BitstreamConverter.h
++++ b/xbmc/utils/BitstreamConverter.h
+@@ -191,6 +191,10 @@ public:
+   void ResetStartDecode();
+   bool CanStartDecode() const;
+   void SetConvertDovi(bool value) { m_convert_dovi = value; }
++  // With the conversion on, keep the EL NAL units in the stream anyway: S5 decodes
++  // the EL in hardware (Dolby Vision dual layer) for the dvfel FEL composition,
++  // while the Dolby Vision core gets the converted (no-op) RPU.
++  void SetKeepDoviEl(bool value) { m_keepDoviEl = value; }
+   // Real DV RPU stream (profile 5/7/8): run processDoviRpu on the already-
+   // annex-b single-stream path too (TS/M2TS input), so L5 active-area and
+   // CMv4.0 append apply there like they do on the hvcC and dual-layer paths.
+@@ -333,6 +337,7 @@ protected:
+   AVCodecID m_codec;
+   bool m_start_decode;
+   bool m_convert_dovi;
++  bool m_keepDoviEl{false};
+   bool m_process_dovi_rpu{false};
+   bool m_removeDovi;
+   bool m_removeHdr10Plus;
+-- 
+2.43.0
+
