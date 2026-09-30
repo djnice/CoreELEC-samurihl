@@ -1,0 +1,95 @@
+diff --git a/drivers/frame_provider/decoder/h265_fb/vh265_fb.c b/drivers/frame_provider/decoder/h265_fb/vh265_fb.c
+--- a/drivers/frame_provider/decoder/h265_fb/vh265_fb.c
++++ b/drivers/frame_provider/decoder/h265_fb/vh265_fb.c
+@@ -614,6 +614,8 @@
+ static u32 dv_toggle_prov_name;
+ 
+ static u32 dv_debug;
++/* dual layer: output EL pictures when the EL of an access unit is done */
++static u32 dv_el_early_out = 1;
+ 
+ static u32 force_bypass_dvenl;
+ #endif
+@@ -1872,6 +1874,7 @@
+ 	struct device *cma_dev;
+ 	unsigned char m_ins_flag;
+ 	unsigned char dolby_enhance_flag;
++	unsigned char dv_el_out_pending; /* EL: output at the end of the work */
+ 	u32 dv_pair_seq;	/* BL: last dv_pair_id given out */
+ 	unsigned long buf_start;
+ 	u32 buf_size;
+@@ -7827,6 +7830,41 @@
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION
++/*
++ * Dual layer EL: the EL of an access unit is done (the next NAL is the
++ * BL's). Do the output part of hevc_pre_pic() now instead of at the
++ * slice header of the next EL picture: the BL outputs a picture at its
++ * next slice header, which comes before that, and then waits for a free
++ * buffer (for the display), so the EL picture of every BL frame came a
++ * whole decode cycle after it. The output set is the same (the pictures
++ * of the access units done so far), so is the output order.
++ */
++static void hevc_el_output_decoded(struct hevc_state_s *hevc)
++{
++	struct PIC_s *pic = get_pic_by_POC(hevc, hevc->decoded_poc);
++
++	/* done here, not again at the next slice header */
++	hevc->decoded_poc = INVALID_POC;
++	if (pic && (pic->POC != INVALID_POC)) {
++		/* PB skip control, as hevc_pre_pic() */
++		if (pic->error_mark == 0 && hevc->PB_skip_mode == 1)
++			hevc->ignore_bufmgr_error |= 0x1;
++		if (hevc->ignore_bufmgr_error & 1) {
++			if (hevc->PB_skip_count_after_decoding > 0)
++				hevc->PB_skip_count_after_decoding--;
++			else
++				hevc->ignore_bufmgr_error |= 0x2;
++		}
++		if (!pic->ip_mode)
++			pic->output_mark = 1;
++		pic->recon_mark = 1;
++		pic->dis_mark = 1;
++	}
++	output_pic_display(hevc, 0, false);
++}
++#endif
++
+ static inline void hevc_pre_pic(struct hevc_state_s *hevc,
+ 			struct PIC_s *pic)
+ {
+@@ -13228,6 +13266,10 @@
+ 			hevc->decoding_pic = NULL;
+ 			hevc->over_decode = 0;
+ 			hevc->dec_result = DEC_RESULT_DV_DONE;
++			/* see hevc_el_output_decoded(), done by the work */
++			hevc->dv_el_out_pending = vdec->master && dv_el_early_out &&
++				dec_status == HEVC_FIND_NEXT_PIC_NAL &&
++				efficiency_mode == 0;
+ #ifdef NEW_FB_CODE
+ 			if (hevc->front_back_mode == 1)
+ 				amhevc_stop_f();
+@@ -16279,6 +16321,13 @@
+ 				hevc_print(hevc, 0,
+ 					"!!!Over decode\n");
+ 		}
++#ifdef CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION
++		if (hevc->dv_el_out_pending) {
++			hevc->dv_el_out_pending = 0;
++			if (hevc->dec_result == DEC_RESULT_DV_DONE)
++				hevc_el_output_decoded(hevc);
++		}
++#endif
+ 
+ 		if (is_log_enable(hevc))
+ 			add_log(hevc,
+@@ -19388,6 +19437,7 @@
+ MODULE_PARM_DESC(dv_toggle_prov_name, "\n dv_toggle_prov_name\n");
+ 
+ module_param(dv_debug, uint, 0664);
++module_param(dv_el_early_out, uint, 0664);
+ MODULE_PARM_DESC(dv_debug, "\n dv_debug\n");
+ 
+ module_param(force_bypass_dvenl, uint, 0664);
