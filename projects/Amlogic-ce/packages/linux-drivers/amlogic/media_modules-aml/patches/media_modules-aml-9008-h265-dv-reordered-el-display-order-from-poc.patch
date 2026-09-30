@@ -1,0 +1,149 @@
+diff --git a/drivers/frame_provider/decoder/h265_fb/vh265_fb.c b/drivers/frame_provider/decoder/h265_fb/vh265_fb.c
+--- a/drivers/frame_provider/decoder/h265_fb/vh265_fb.c
++++ b/drivers/frame_provider/decoder/h265_fb/vh265_fb.c
+@@ -1597,6 +1597,8 @@
+ 	 * receiver can pair them whatever their output order
+ 	 */
+ 	u32 dv_pair_id;
++	int dv_irap;	/* dual layer: its random access point, -1 none */
++	u8 dv_lead;	/* dual layer: a leading picture of it */
+ #endif
+ 	char *aux_data_buf;
+ 	int aux_data_size;
+@@ -1878,6 +1880,17 @@
+ 	int first_out_poc;	/* POC of the fast output first picture */
+ 	u32 dv_pair_seq;	/* BL: last dv_pair_id given out */
+ 	u32 dv_out_seq;		/* dual layer: pictures output */
++	/*
++	 * dual layer: the last random access points (IRAP) of this layer, for
++	 * the display order of a reordered EL; dv_irap_n counts them
++	 */
++	struct {
++		u32 au;		/* access unit */
++		int poc;
++		u32 lead;	/* leading pictures (shown before it) */
++		u32 lead_out;	/* of them output */
++	} dv_irap[8];
++	u32 dv_irap_n;
+ 	u8 dv_reordered;	/* BL: the EL has another picture order */
+ 	unsigned long buf_start;
+ 	u32 buf_size;
+@@ -5215,6 +5228,14 @@
+ 		pic_display = NULL;
+ 		hevc->first_pic_flag = 2;
+ 	}
++#ifdef CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION
++	/*
++	 * an EL picture output ahead (fast output) may still have leading
++	 * pictures to come: its place in the display order is not known
++	 */
++	if (pic_display && first_pic_flag && vdec->master)
++		pic_display->dv_irap = -1;
++#endif
+ 	return pic_display;
+ }
+ 
+@@ -7878,6 +7899,42 @@
+ }
+ #endif
+ 
++#ifdef CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION
++/*
++ * Dual layer: the random access point a new picture belongs to. A picture
++ * of POC p after the IRAP of access unit A, POC P and L leading pictures is
++ * shown at place A + L - P + p: the leading pictures (RASL/RADL) are shown
++ * before the IRAP (at A, A + 1, ... in their output order), and every access
++ * unit holds one picture of each layer.
++ * The place does not depend on how many pictures were decoded, shown or
++ * dropped, which after a seek differs between the layers.
++ */
++static void dv_note_picture(struct hevc_state_s *hevc, struct PIC_s *pic)
++{
++	int t = hevc->m_nalUnitType;
++
++	pic->dv_irap = -1;
++	pic->dv_lead = 0;
++	if (t >= NAL_UNIT_CODED_SLICE_BLA && t <= NAL_UNIT_CODED_SLICE_CRA) {
++		int i = hevc->dv_irap_n++ & 7;
++
++		hevc->dv_irap[i].au = pic->dv_pair_id;
++		hevc->dv_irap[i].poc = hevc->curr_POC;
++		hevc->dv_irap[i].lead = 0;
++		hevc->dv_irap[i].lead_out = 0;
++	}
++	/* before the first random access point: its place is not known */
++	if (!hevc->dv_irap_n)
++		return;
++	pic->dv_irap = (hevc->dv_irap_n - 1) & 7;
++	if (t >= NAL_UNIT_CODED_SLICE_RADL_N && t <= NAL_UNIT_CODED_SLICE_TFD &&
++		hevc->curr_POC < hevc->dv_irap[pic->dv_irap].poc) {
++		hevc->dv_irap[pic->dv_irap].lead++;
++		pic->dv_lead = 1;
++	}
++}
++#endif
++
+ static inline void hevc_pre_pic(struct hevc_state_s *hevc,
+ 			struct PIC_s *pic)
+ {
+@@ -8709,6 +8766,11 @@
+ 					hevc->curr_POC, hevc->m_pocRandomAccess);
+ 				hevc_print(hevc, 0,"RandomAccess point POC), skip it\n");
+ 			}
++#ifdef CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION
++			if ((vdec->master || vdec->slave) && hevc->dv_irap_n &&
++				rpm_param->p.slice_segment_address == 0)
++				hevc->dv_irap[(hevc->dv_irap_n - 1) & 7].lead++;
++#endif
+ 			return 1;
+ 		}
+ 
+@@ -8821,6 +8883,8 @@
+ 				if (hevc_ba->cur_pic)
+ 					hevc->cur_pic->dv_pair_id = hevc_ba->cur_pic->dv_pair_id;
+ 			}
++			if (vdec->master || vdec->slave)
++				dv_note_picture(hevc, hevc->cur_pic);
+ 			if (vdec->master == NULL &&
+ 				vdec->slave == NULL)
+ 				set_aux_data(hevc, hevc->cur_pic, 0, 0); /*prefix*/
+@@ -11314,18 +11378,33 @@
+ 		 * dual layer label: bits 0-15 pair a BL and an EL picture, bits
+ 		 * 16-31 are the access unit the picture was coded in. The pair
+ 		 * is the access unit, unless the EL has another picture order
+-		 * than the BL (dv_reordered): then it is the display order, the
+-		 * n-th picture output by each layer, and the receiver takes the
+-		 * RPU of the EL picture's access unit.
++		 * than the BL (dv_reordered): then it is the place in the display
++		 * order (dv_note_picture; 0 not known, never paired), and the
++		 * receiver takes the RPU of the EL picture's access unit.
+ 		 */
+ 		if (vdec->master || vdec->slave) {
+ 			struct hevc_state_s *bl = vdec->slave ? hevc :
+ 				(struct hevc_state_s *)vdec->master->private;
+ 
++			u32 pair = pic->dv_pair_id;
++
++			if (bl->dv_reordered) {
++				pair = 0;
++				/*
++				 * leading pictures are output (in display order)
++				 * while more of them may still come: they take the
++				 * places before the IRAP one by one
++				 */
++				if (pic->dv_irap >= 0 && pic->dv_lead)
++					pair = hevc->dv_irap[pic->dv_irap].au +
++						hevc->dv_irap[pic->dv_irap].lead_out++;
++				else if (pic->dv_irap >= 0)
++					pair = hevc->dv_irap[pic->dv_irap].au +
++						hevc->dv_irap[pic->dv_irap].lead -
++						hevc->dv_irap[pic->dv_irap].poc + pic->POC;
++			}
+ 			hevc->dv_out_seq++;
+-			vf->frame_index = (pic->dv_pair_id << 16) |
+-				((bl->dv_reordered ? hevc->dv_out_seq :
+-				pic->dv_pair_id) & 0xffff);
++			vf->frame_index = (pic->dv_pair_id << 16) | (pair & 0xffff);
+ 		}
+ #endif
+ 
