@@ -1,7 +1,6 @@
-From a56c21cbac8e4dcc6f3644d0aac47248b785275f Mon Sep 17 00:00:00 2001
 From: djnice <djnice77@gmail.com>
 Date: Wed, 30 Sep 2026 08:38:24 +0200
-Subject: [PATCH 9905/9906] dvfel: compose the hardware decoded EL
+Subject: [PATCH] dvfel: compose the hardware decoded EL
 
 With the dvfel module that takes a decoded EL (its el_wait_ms parameter),
 a FEL title keeps its EL in the stream and the decoder is opened for Dolby
@@ -18,18 +17,12 @@ Vision core still gets the converted no-op RPU.
   EL decoder does
 - /storage/dvfel_sw_el keeps the software EL decoder, for comparisons
 
+- a MEL title (or one without the composition) gets its first access unit
+  without the EL NAL units kept for the hardware decoder, else the decoder
+  switched to dual layer and Dolby Vision never engaged (HDR10)
+
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- .../VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp  | 162 ++++++++++++++++--
- .../VideoPlayer/DVDCodecs/Video/AMLDvFel.h    |  27 ++-
- .../DVDCodecs/Video/DVDVideoCodecAmlogic.cpp  |  20 ++-
- .../VideoPlayer/DVDCodecs/Video/dvfel_uapi.h  |  17 ++
- .../VideoPlayer/DVDCodecs/Video/felgpu.c      |  57 +++++-
- .../VideoPlayer/DVDCodecs/Video/felgpu.h      |   5 +
- xbmc/utils/BitstreamConverter.cpp             |   6 +-
- xbmc/utils/BitstreamConverter.h               |   5 +
- 8 files changed, 269 insertions(+), 30 deletions(-)
-
 diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp
 index d376ce4ba3..3a30f93379 100644
 --- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp
@@ -419,10 +412,48 @@ index eb6264f1f6..25b6582dfa 100644
    std::thread m_elThread;
    std::thread m_gpuThread;
 diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.cpp
-index 30480f79d9..e531409db9 100644
+index 30480f79d9..704e56ca70 100644
 --- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.cpp
 +++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecAmlogic.cpp
-@@ -429,6 +429,10 @@ bool CDVDVideoCodecAmlogic::Open(CDVDStreamInfo &hints, CDVDCodecOptions &option
+@@ -42,6 +42,37 @@ extern "C"
+ 
+ namespace
+ {
++// Remove the Dolby Vision EL NAL units (HEVC type 63) from an annex-b access
++// unit in place; returns the new size. Units are delimited by their start
++// codes (00 00 01 cannot occur inside a NAL unit: emulation prevention); a
++// zero byte before a start code (4-byte form) stays with the unit it starts.
++int StripDoviElNals(uint8_t* data, int size)
++{
++  std::vector<int> begin, header;
++  for (int i = 0; i + 3 < size; i++)
++  {
++    if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1)
++    {
++      begin.push_back(i > 0 && data[i - 1] == 0 ? i - 1 : i);
++      header.push_back(i + 3);
++      i += 2;
++    }
++  }
++  if (begin.empty())
++    return size;
++  int out = begin[0];
++  for (size_t k = 0; k < begin.size(); k++)
++  {
++    const int end = k + 1 < begin.size() ? begin[k + 1] : size;
++    if (((data[header[k]] >> 1) & 0x3f) == 63)
++      continue;
++    if (out != begin[k])
++      memmove(data + out, data + begin[k], end - begin[k]);
++    out += end - begin[k];
++  }
++  return out;
++}
++
+ // BL/EL pairing slack on the demuxer dts, in DVD_TIME units. One frame at
+ // 23.976fps is ~41708, so this is a quarter frame - wide enough to absorb the
+ // sub-millisecond rounding between the two layers' timestamps, far too narrow
+@@ -429,6 +460,10 @@ bool CDVDVideoCodecAmlogic::Open(CDVDStreamInfo &hints, CDVDCodecOptions &option
              {
                m_dvFel = std::make_unique<CAMLDvFel>();
                m_bitstream->SetDoviElSink(m_dvFel.get());
@@ -433,7 +464,7 @@ index 30480f79d9..e531409db9 100644
              }
            }
  
-@@ -1138,12 +1142,22 @@ bool CDVDVideoCodecAmlogic::AddData(const DemuxPacket &packet)
+@@ -1138,11 +1173,27 @@ bool CDVDVideoCodecAmlogic::AddData(const DemuxPacket &packet)
          m_hdr10plusToDvCandidate = false;
        }
  
@@ -449,16 +480,21 @@ index 30480f79d9..e531409db9 100644
          m_bitstream->SetDoviElSink(nullptr);
 +        m_bitstream->SetKeepDoviEl(false);
          m_dvFel.reset();
-       }
++        // this first access unit was converted keeping the EL for the hardware
++        // decoder; single layer (MEL, or no composition) it must not see any:
++        // an EL NAL switches the decoder to dual layer, and the Dolby Vision
++        // core never engages (the title plays as HDR10)
++        if (CAMLDvFel::SupportsHwEl())
++          iSize = StripDoviElNals(pData, iSize);
++      }
 +      else if (m_dvFel && hwEl)
 +      {
 +        m_hints.dovi.dv_profile = 7;
 +        m_hints.dovi.el_present_flag = true;
-+      }
+       }
        if (m_dvFel)
          m_streamMeta.flags.push_back("fel-composed");
- 
-@@ -1224,7 +1238,7 @@ bool CDVDVideoCodecAmlogic::AddData(const DemuxPacket &packet)
+@@ -1224,7 +1275,7 @@ bool CDVDVideoCodecAmlogic::AddData(const DemuxPacket &packet)
      if (data_added && packet.pData && !m_hints.ptsinvalid && mergedPts != DVD_NOPTS_VALUE)
        m_dvFel->CommitPacket(mergedPts);
      else
@@ -686,6 +722,3 @@ index 288247be37..e83d01e3b6 100644
    bool m_process_dovi_rpu{false};
    bool m_removeDovi;
    bool m_removeHdr10Plus;
--- 
-2.43.0
-
