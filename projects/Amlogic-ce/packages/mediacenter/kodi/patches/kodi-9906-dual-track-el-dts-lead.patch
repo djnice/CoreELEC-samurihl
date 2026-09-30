@@ -1,0 +1,138 @@
+From b1b640006cad5be2a66859843300eee9cc3b6bad Mon Sep 17 00:00:00 2001
+From: djnice <djnice77@gmail.com>
+Date: Wed, 30 Sep 2026 08:38:45 +0200
+Subject: [PATCH 9906/9906] DVDDemuxFFmpeg: a dual-track EL decode timeline
+ ahead of the BL
+
+The layers of a dual-track Dolby Vision file pair by dts. An EL coded
+with a decode delay the BL does not have (P7_FEL_DTDL2.mp4: BL without
+reordering, EL P-B-B) starts its dts one frame before the BL's, negative;
+ConvertTimestamp() clamps that to 0, onto the dts of the next EL packet,
+and the pairing drops that one: the EL cannot be decoded up to its next
+IDR (0.75 s without EL at every start and seek). Shift such an EL onto the
+BL's decode timeline, by the difference of the first decode times in the
+sample tables. m2ts layers share the timeline: unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../DVDDemuxers/DVDDemuxFFmpeg.cpp            | 67 ++++++++++++++++++-
+ .../VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h  |  4 ++
+ 2 files changed, 69 insertions(+), 2 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+index b65b3b2eae..d31876544e 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
+@@ -1102,6 +1102,62 @@ AVDictionary* CDVDDemuxFFmpeg::GetFFMpegOptionsFromInput()
+   return options;
+ }
+ 
++int64_t CDVDDemuxFFmpeg::GetElDtsLead(int streamIndex)
++{
++  auto known = m_elDtsLead.find(streamIndex);
++  if (known != m_elDtsLead.end())
++    return known->second;
++
++  // Only a dual-track EL in an ISO BMFF file: its sample table holds the first
++  // decode time of both tracks. The layers of a frame pair by decode order, so
++  // the EL's first sample goes with the BL's first one (m2ts layers share the
++  // timeline and have no index here: lead 0).
++  int64_t lead = 0;
++  CDemuxStream* el = GetStream(streamIndex);
++  if (el && el->type == StreamType::VIDEO && m_pFormatContext && m_pFormatContext->iformat &&
++      strstr(m_pFormatContext->iformat->name, "mov"))
++  {
++    auto* vel = static_cast<CDemuxStreamVideo*>(el);
++    if (!vel->isDualStream)
++      return 0; // not (yet) known to be a layer of a pair: decide later
++    if (!vel->isELStream)
++    {
++      m_elDtsLead[streamIndex] = 0; // the base layer
++      return 0;
++    }
++    AVStream* elSt = m_pFormatContext->streams[streamIndex];
++    for (unsigned int i = 0; i < m_pFormatContext->nb_streams; i++)
++    {
++      CDemuxStream* s = GetStream(i);
++      if (!s || s->type != StreamType::VIDEO)
++        continue;
++      auto* vs = static_cast<CDemuxStreamVideo*>(s);
++      if (!vs->isDualStream || vs->isELStream)
++        continue;
++      AVStream* blSt = m_pFormatContext->streams[i];
++      const AVIndexEntry* be = avformat_index_get_entry(blSt, 0);
++      const AVIndexEntry* ee = avformat_index_get_entry(elSt, 0);
++      if (be && ee)
++      {
++        const int64_t blFirst =
++            av_rescale_q(be->timestamp, blSt->time_base, elSt->time_base);
++        const int64_t d = blFirst - ee->timestamp;
++        // a decode delay of a few frames, not a different timeline
++        if (d > 0 && d < av_rescale_q(1, AVRational{1, 1}, elSt->time_base))
++          lead = d;
++        CLog::Log(LOGINFO,
++                  "CDVDDemuxFFmpeg - dual-track EL starts its decode timeline {:.3f}s "
++                  "before the BL{}",
++                  static_cast<double>(d) * elSt->time_base.num / elSt->time_base.den,
++                  lead ? ", shifted onto the BL's" : "");
++      }
++      break;
++    }
++  }
++  m_elDtsLead[streamIndex] = lead;
++  return lead;
++}
++
+ double CDVDDemuxFFmpeg::ConvertTimestamp(int64_t pts, int den, int num)
+ {
+   if (pts == (int64_t)AV_NOPTS_VALUE)
+@@ -1286,8 +1342,14 @@ DemuxPacket* CDVDDemuxFFmpeg::ReadInternal(bool keep)
+ 
+           pPacket->pts =
+               ConvertTimestamp(m_pkt.pkt.pts, stream->time_base.den, stream->time_base.num);
+-          pPacket->dts =
+-              ConvertTimestamp(m_pkt.pkt.dts, stream->time_base.den, stream->time_base.num);
++          // a dual-track EL is paired with its BL by the dts; one coded with a
++          // decode delay the BL does not have starts its dts before the BL's
++          // (negative), and ConvertTimestamp() clamps that to 0, where it hits
++          // the next EL packet. Shift it onto the BL's decode timeline first.
++          int64_t dts = m_pkt.pkt.dts;
++          if (dts != AV_NOPTS_VALUE)
++            dts += GetElDtsLead(m_pkt.pkt.stream_index);
++          pPacket->dts = ConvertTimestamp(dts, stream->time_base.den, stream->time_base.num);
+           pPacket->duration = DVD_SEC_TO_TIME((double)m_pkt.pkt.duration * stream->time_base.num /
+                                               stream->time_base.den);
+ 
+@@ -2072,6 +2134,7 @@ void CDVDDemuxFFmpeg::ClearProbedStreamParameters()
+ 
+ void CDVDDemuxFFmpeg::DisposeStreams()
+ {
++  m_elDtsLead.clear();
+   std::map<int, CDemuxStream*>::iterator it;
+   for(it = m_streams.begin(); it != m_streams.end(); ++it)
+     delete it->second;
+diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
+index 913c039c60..7375ed3016 100644
+--- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
++++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
+@@ -152,6 +152,9 @@ protected:
+   void ResetVideoStreams();
+   AVDictionary* GetFFMpegOptionsFromInput();
+   double ConvertTimestamp(int64_t pts, int den, int num);
++  // dual-track Dolby Vision: how far the EL track's decode timeline starts
++  // ahead of the BL's, in the EL stream's time base (see Read())
++  int64_t GetElDtsLead(int streamIndex);
+   bool IsProgramChange();
+   unsigned int HLSSelectProgram();
+ 
+@@ -209,6 +212,7 @@ protected:
+ 
+   bool m_streaminfo;
+   bool m_checkTransportStream;
++  std::map<int, int64_t> m_elDtsLead; // stream index -> lead, once known
+   int m_displayTime = 0;
+   double m_dtsAtDisplayTime;
+   bool m_seekToKeyFrame = false;
+-- 
+2.43.0
+
