@@ -4,6 +4,8 @@ Subject: arm64: dts: amlogic: add Dune HD Pro 8K Plus
 S928X box on the AX201-v2 reference design. The Ugoos SK1 tree runs it;
 on top of that, the internal HDD bay is powered through GPIOT_13 like the
 vendor tree does, and the TCA6507 LED controller of the SK1 is disabled.
+I2C2 moves to GPIOA_4/GPIOA_5 like in the vendor tree: GPIOT_0/GPIOT_1
+carry the TM1628 front display, which openvfd drives.
 ---
 --- a/common_drivers/arch/arm64/boot/dts/amlogic/Makefile	2026-09-28 17:48:33.753522414 +0200
 +++ b/common_drivers/arch/arm64/boot/dts/amlogic/Makefile	2026-09-28 17:48:33.756918458 +0200
@@ -16,16 +18,19 @@ vendor tree does, and the TCA6507 LED controller of the SK1 is disabled.
  dtb-y += s5_s928x_x96_x10_4g.dtb
  dtb-y += s5_s928x_x96_x10_8g.dtb
 --- a/common_drivers/arch/arm64/boot/dts/amlogic/s5_s928x_dune_hd_pro_8k_plus.dts	1970-01-01 01:00:00.000000000 +0100
-+++ b/common_drivers/arch/arm64/boot/dts/amlogic/s5_s928x_dune_hd_pro_8k_plus.dts	2026-09-28 17:48:33.760725276 +0200
-@@ -0,0 +1,36 @@
++++ b/common_drivers/arch/arm64/boot/dts/amlogic/s5_s928x_dune_hd_pro_8k_plus.dts	2026-09-30 14:55:18.259148887 +0200
+@@ -0,0 +1,43 @@
 +// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
 +/*
 + * Dune HD Pro 8K Plus (Amlogic S928X, AX201-v2 based)
 + *
 + * The Ugoos SK1 tree runs the board; on top of it, from the vendor device
 + * tree, the power of the internal HDD bay. The board has no TCA6507 LED
-+ * controller; the RTC and LED driver of the vendor tree are reference design
-+ * leftovers that do not answer on the I2C buses.
++ * controller.
++ *
++ * I2C2 is on GPIOA_4/GPIOA_5 like in the vendor tree: GPIOT_0/GPIOT_1 carry
++ * the TM1628 front display (data, clock; GPIOT_2 is its strobe), driven by
++ * openvfd. The HYM8563 RTC the vendor tree has there does not answer.
 + */
 +
 +#include "s5_s928x_ugoos_sk1_8g.dts"
@@ -42,6 +47,10 @@ vendor tree does, and the TCA6507 LED controller of the SK1 is disabled.
 +		output-high;
 +		line-name = "hdd_pwr_en";
 +	};
++};
++
++&i2c2 {
++	pinctrl-0 = <&i2c2_pins1>;
 +};
 +
 +&tca6507 {
