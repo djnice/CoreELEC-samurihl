@@ -1,0 +1,101 @@
+From: djnice <djnice@freemail.hu>
+Subject: arm64: dts: amlogic: add R_volution PlayerPro 8K
+
+S928X player on the AX201-v2 reference design, like the Dune HD Pro 8K
+Plus. The Ugoos SK1 tree runs it; on top of that, from the vendor tree: the
+rear USB power (GPIOT_22, claimed by the reference smartcard node, which is
+disabled), the HDD and fan power, the power button on GPIOT_10, the analog
+output mute on GPIOA_8 and I2C2 on
+GPIOA_4/GPIOA_5, leaving GPIOT_0/GPIOT_1 to the TM1628 front display.
+---
+--- a/common_drivers/arch/arm64/boot/dts/amlogic/Makefile	2026-09-30 15:00:53.988951469 +0200
++++ b/common_drivers/arch/arm64/boot/dts/amlogic/Makefile	2026-09-30 15:00:53.989774957 +0200
+@@ -48,6 +48,7 @@
+ dtb-y += s5_s928x_ugoos_am8_4g.dtb
+ dtb-y += s5_s928x_ugoos_am8_8g.dtb
+ dtb-y += s5_s928x_dune_hd_pro_8k_plus.dtb
++dtb-y += s5_s928x_rvolution_playerpro_8k.dtb
+ dtb-y += s5_s928x_ugoos_sk1_8g.dtb
+ dtb-y += s5_s928x_x96_x10_4g.dtb
+ dtb-y += s5_s928x_x96_x10_8g.dtb
+--- a/common_drivers/arch/arm64/boot/dts/amlogic/s5_s928x_rvolution_playerpro_8k.dts	1970-01-01 01:00:00.000000000 +0100
++++ b/common_drivers/arch/arm64/boot/dts/amlogic/s5_s928x_rvolution_playerpro_8k.dts	2026-09-30 20:05:09.048583872 +0200
+@@ -0,0 +1,78 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
++/*
++ * R_volution PlayerPro 8K (Amlogic S928X, AX201-v2 based)
++ *
++ * The vendor device tree (Android firmware "tyson") is the AX201-v2 reference
++ * design, the same one the Dune HD Pro 8K Plus uses, so the Ugoos SK1 tree
++ * runs the board. On top of it, from the vendor tree:
++ * - the power of the rear USB port (GPIOT_22, a gpio-leds "rear_usb_power"
++ *   in the vendor tree); the reference design smartcard node claims the same
++ *   pin, the vendor tree disables it,
++ * - the HDD and fan power enables,
++ * - the front power button on GPIOT_10 (GPIOD_2, the Ugoos power key, is the
++ *   bluetooth key of the vendor tree),
++ * - the analog output mute on GPIOA_8 (GPIOA_7, the X96 one, is an input
++ *   there).
++ * The board has no TCA6507 LED controller.
++ *
++ * I2C2 is on GPIOA_4/GPIOA_5 like in the vendor tree: GPIOT_0/GPIOT_1 carry
++ * the TM1628 front display (data, clock; GPIOT_2 is its strobe), driven by
++ * openvfd.
++ */
++
++#include "s5_s928x_ugoos_sk1_8g.dts"
++
++/ {
++	model = "R_volution PlayerPro 8K";
++	coreelec-dt-id = "s5_s928x_rvolution_playerpro_8k";
++
++	gpio_keypad {
++		key-gpios = <&gpio GPIOT_10 GPIO_ACTIVE_HIGH>;
++	};
++
++	auge_sound {
++		avout_mute-gpios = <&gpio GPIOA_8 GPIO_ACTIVE_HIGH>;
++	};
++};
++
++&{/smartcard} {
++	status = "disabled";
++};
++
++&gpio {
++	rear_usb_power {
++		gpio-hog;
++		gpios = <GPIOT_22 GPIO_ACTIVE_HIGH>;
++		output-high;
++		line-name = "rear_usb_power";
++	};
++
++	hdd_pwr_en {
++		gpio-hog;
++		gpios = <GPIOT_13 GPIO_ACTIVE_HIGH>;
++		output-high;
++		line-name = "hdd_pwr_en";
++	};
++
++	fan_pwr_en {
++		gpio-hog;
++		gpios = <GPIOT_14 GPIO_ACTIVE_HIGH>;
++		output-high;
++		line-name = "fan_pwr_en";
++	};
++};
++
++&i2c2 {
++	pinctrl-0 = <&i2c2_pins1>;
++};
++
++&tca6507 {
++	status = "disabled";
++};
++
++&amhdmitx {
++	vend_data {
++		vendor_name = "R_volution";
++		product_desc = "PlayerPro 8K";
++	};
++};
