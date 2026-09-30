@@ -1,0 +1,44 @@
+diff --git a/drivers/frame_provider/decoder/h265_fb/vh265_fb.c b/drivers/frame_provider/decoder/h265_fb/vh265_fb.c
+--- a/drivers/frame_provider/decoder/h265_fb/vh265_fb.c
++++ b/drivers/frame_provider/decoder/h265_fb/vh265_fb.c
+@@ -16799,13 +16799,33 @@
+ 	}
+ 
+ #ifdef CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION
+-	if (hevc->switch_dvlayer_flag) {
+-		if (vdec->slave)
+-			vdec_set_next_sched(vdec, vdec->slave);
+-		else if (vdec->master)
+-			vdec_set_next_sched(vdec, vdec->master);
+-	} else if (vdec->slave || vdec->master)
+-		vdec_set_next_sched(vdec, vdec);
++	/*
++	 * dual layer: switch_dvlayer_flag tells the layer of the next NAL
++	 * only when this run ended at a layer boundary (DEC_RESULT_DV_DONE).
++	 * After any other end (a run repeated for lack of a buffer or input,
++	 * a skipped RASL picture, ...) it is left over from an earlier
++	 * switch, and following it started the other layer on this layer's
++	 * data: the EL on BL slices gave error pictures and 200 ms timeouts,
++	 * and the EL trailed the BL. A repeated run goes on with the same
++	 * layer, the BL after any other end too. The EL after any other end
++	 * (a picture skipped for a missing reference, a timeout, ...) gives
++	 * the stream back to the BL, which switches to it again at its next
++	 * NAL or goes on with the next BL picture: an EL going on by itself
++	 * took the next BL picture for an EL one.
++	 */
++	if (vdec->slave || vdec->master) {
++		struct vdec_s *next = vdec;
++
++		if (hevc->dec_result == DEC_RESULT_DV_DONE) {
++			if (hevc->switch_dvlayer_flag)
++				next = vdec->slave ? vdec->slave : vdec->master;
++		} else if (vdec->master &&
++			hevc->dec_result != DEC_RESULT_AGAIN &&
++			hevc->dec_result != DEC_RESULT_WAIT_BUFFER) {
++			next = vdec->master;
++		}
++		vdec_set_next_sched(vdec, next);
++	}
+ #endif
+ 
+ 	if (from == 1) {

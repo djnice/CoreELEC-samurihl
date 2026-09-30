@@ -1,0 +1,40 @@
+diff --git a/drivers/frame_provider/decoder/h265_fb/vh265_fb.c b/drivers/frame_provider/decoder/h265_fb/vh265_fb.c
+--- a/drivers/frame_provider/decoder/h265_fb/vh265_fb.c
++++ b/drivers/frame_provider/decoder/h265_fb/vh265_fb.c
+@@ -1875,6 +1875,7 @@
+ 	unsigned char m_ins_flag;
+ 	unsigned char dolby_enhance_flag;
+ 	unsigned char dv_el_out_pending; /* EL: output at the end of the work */
++	int first_out_poc;	/* POC of the fast output first picture */
+ 	u32 dv_pair_seq;	/* BL: last dv_pair_id given out */
+ 	unsigned long buf_start;
+ 	u32 buf_size;
+@@ -5197,7 +5198,15 @@
+ 		}
+ 	}
+ 
+-	if (pic_display && hevc->sps_num_reorder_pics_0 &&
++	/*
++	 * the first picture was output ahead (fast output): the next one to
++	 * come out is it again, marked at the next slice header. Dual layer
++	 * streams without reordering have it too; there it was shown twice,
++	 * one frame more in this layer than in the other one.
++	 */
++	if (pic_display && (hevc->sps_num_reorder_pics_0 ||
++		((hw_to_vdec(hevc)->master || hw_to_vdec(hevc)->slave) &&
++		pic_display->POC == hevc->first_out_poc)) &&
+ 		(hevc->vf_pre_count == 1) && (hevc->first_pic_flag == 1)) {
+ 		if (pic_display->output_ready == 1)
+ 			pic_display->output_ready = 0;
+@@ -5242,8 +5251,10 @@
+ 					pic_display->output_ready = 0;
+ 				} else {
+ 					prepare_display_buf (hw_to_vdec(hevc), pic_display);
+-					if (ones)
++					if (ones) {
+ 						hevc->first_pic_flag = 1;
++						hevc->first_out_poc = pic_display->POC;
++					}
+ 					if (get_dbg_flag(hevc) & H265_DEBUG_BUFMGR) {
+ 						hevc_print(hevc, 0,
+ 							"[BM] Display: POC %d, ", pic_display->POC);

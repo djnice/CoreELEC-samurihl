@@ -1,0 +1,62 @@
+diff --git drivers/frame_provider/decoder/h265_fb/vh265_fb.c drivers/frame_provider/decoder/h265_fb/vh265_fb.c
+index b0e351d..21d7b72 100644
+--- a/drivers/frame_provider/decoder/h265_fb/vh265_fb.c
++++ b/drivers/frame_provider/decoder/h265_fb/vh265_fb.c
+@@ -1589,6 +1589,12 @@ struct PIC_s {
+ 	unsigned int header_adr;
+ #ifdef CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION
+ 	unsigned char dv_enhance_exist;
++	/*
++	 * dual layer: the access unit of the picture, the same for the BL and
++	 * the EL picture decoded from it (vf->frame_index of both), so a
++	 * receiver can pair them whatever their output order
++	 */
++	u32 dv_pair_id;
+ #endif
+ 	char *aux_data_buf;
+ 	int aux_data_size;
+@@ -1866,6 +1872,7 @@ struct hevc_state_s {
+ 	struct device *cma_dev;
+ 	unsigned char m_ins_flag;
+ 	unsigned char dolby_enhance_flag;
++	u32 dv_pair_seq;	/* BL: last dv_pair_id given out */
+ 	unsigned long buf_start;
+ 	u32 buf_size;
+ 	u32 mv_buf_size;
+@@ -8746,10 +8753,23 @@ static int hevc_slice_segment_header_process(struct hevc_state_s *hevc,
+ #endif
+ #ifdef CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION
+ 			hevc->cur_pic->dv_enhance_exist = 0;
+-			if (vdec->slave)
++			hevc->cur_pic->dv_pair_id = 0;
++			if (vdec->slave) {
++				/* a new BL picture: a new access unit */
++				if (++hevc->dv_pair_seq == 0)
++					hevc->dv_pair_seq = 1;
++				hevc->cur_pic->dv_pair_id = hevc->dv_pair_seq;
+ 				hevc_print(hevc, H265_DEBUG_DV,
+ 				"Clear bl (poc %d) dv_enhance_exist flag\n",
+ 				hevc->curr_POC);
++			} else if (vdec->master) {
++				/* the EL picture of the BL picture being decoded */
++				struct hevc_state_s *hevc_ba =
++					(struct hevc_state_s *)vdec->master->private;
++
++				if (hevc_ba->cur_pic)
++					hevc->cur_pic->dv_pair_id = hevc_ba->cur_pic->dv_pair_id;
++			}
+ 			if (vdec->master == NULL &&
+ 				vdec->slave == NULL)
+ 				set_aux_data(hevc, hevc->cur_pic, 0, 0); /*prefix*/
+@@ -11234,6 +11254,11 @@ static int post_video_frame(struct vdec_s *vdec, struct PIC_s *pic)
+ 
+ 	if (vf) {
+ 		vf->frame_type = 0;
++#ifdef CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION
++		/* dual layer: pairs the BL and EL picture of an access unit */
++		if (vdec->master || vdec->slave)
++			vf->frame_index = pic->dv_pair_id;
++#endif
+ 
+ 		if (hevc->enable_fence) {
+ 			/* fill fence information. */

@@ -1,0 +1,74 @@
+diff --git a/drivers/frame_provider/decoder/h265_fb/vh265_fb.c b/drivers/frame_provider/decoder/h265_fb/vh265_fb.c
+--- a/drivers/frame_provider/decoder/h265_fb/vh265_fb.c
++++ b/drivers/frame_provider/decoder/h265_fb/vh265_fb.c
+@@ -1877,6 +1877,8 @@
+ 	unsigned char dv_el_out_pending; /* EL: output at the end of the work */
+ 	int first_out_poc;	/* POC of the fast output first picture */
+ 	u32 dv_pair_seq;	/* BL: last dv_pair_id given out */
++	u32 dv_out_seq;		/* dual layer: pictures output */
++	u8 dv_reordered;	/* BL: the EL has another picture order */
+ 	unsigned long buf_start;
+ 	u32 buf_size;
+ 	u32 mv_buf_size;
+@@ -10752,6 +10754,10 @@
+ #endif
+ 		hevc->show_frame_num++;
+ 		vf->index_disp = atomic_read(&hevc->vf_get_count);
++#ifdef CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION
++		/* dual layer: keep the pairing label of post_video_frame() */
++		if (!(hw_to_vdec(hevc)->master || hw_to_vdec(hevc)->slave))
++#endif
+ 		vf->frame_index = atomic_read(&hevc->vf_get_count);
+ 
+ 
+@@ -11304,9 +11310,23 @@
+ 	if (vf) {
+ 		vf->frame_type = 0;
+ #ifdef CONFIG_AMLOGIC_MEDIA_ENHANCEMENT_DOLBYVISION
+-		/* dual layer: pairs the BL and EL picture of an access unit */
+-		if (vdec->master || vdec->slave)
+-			vf->frame_index = pic->dv_pair_id;
++		/*
++		 * dual layer label: bits 0-15 pair a BL and an EL picture, bits
++		 * 16-31 are the access unit the picture was coded in. The pair
++		 * is the access unit, unless the EL has another picture order
++		 * than the BL (dv_reordered): then it is the display order, the
++		 * n-th picture output by each layer, and the receiver takes the
++		 * RPU of the EL picture's access unit.
++		 */
++		if (vdec->master || vdec->slave) {
++			struct hevc_state_s *bl = vdec->slave ? hevc :
++				(struct hevc_state_s *)vdec->master->private;
++
++			hevc->dv_out_seq++;
++			vf->frame_index = (pic->dv_pair_id << 16) |
++				((bl->dv_reordered ? hevc->dv_out_seq :
++				pic->dv_pair_id) & 0xffff);
++		}
+ #endif
+ 
+ 		if (hevc->enable_fence) {
+@@ -13226,6 +13246,23 @@
+ 				struct hevc_state_s *hevc_ba =
+ 					(struct hevc_state_s *)vdec->master->private;
+ 				hevc->switch_dvlayer_flag = 1;
++				/*
++				 * the EL picture of an access unit shown at another
++				 * time than its BL picture: the EL has another picture
++				 * order (a dual track EL muxed by decode time), pair
++				 * the layers by display order from here on
++				 */
++				if (!hevc_ba->dv_reordered && hevc->cur_pic &&
++					hevc_ba->cur_pic &&
++					hevc->cur_pic->dv_pair_id ==
++					hevc_ba->cur_pic->dv_pair_id &&
++					hevc->cur_pic->POC != hevc_ba->cur_pic->POC) {
++					hevc_ba->dv_reordered = 1;
++					hevc_print(hevc, 0,
++						"dual layer: EL poc %d, BL poc %d in access unit %u, pairing by display order\n",
++						hevc->cur_pic->POC, hevc_ba->cur_pic->POC,
++						hevc->cur_pic->dv_pair_id);
++				}
+ 				hevc->no_switch_dvlayer_count = 0;
+ 				hevc_ba->start_parser_type = next_parser_type;
+ 				if (hevc->cur_pic)
