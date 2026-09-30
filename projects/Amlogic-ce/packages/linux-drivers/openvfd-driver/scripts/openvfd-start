@@ -13,6 +13,9 @@ case $DT_ID in
   *dune_hd_pro_8k_plus*)
     SYSCONFFILE="$SYSCONFDIR/dune_hd_pro_8k_plus.conf"
     ;;
+  *rvolution_playerpro_8k*)
+    SYSCONFFILE="$SYSCONFDIR/rvolution_playerpro_8k.conf"
+    ;;
 esac
 
 if [ "$(tr -d '\0' < $PROC_DT/openvfd/compatible)" = "open,vfd" ]; then
