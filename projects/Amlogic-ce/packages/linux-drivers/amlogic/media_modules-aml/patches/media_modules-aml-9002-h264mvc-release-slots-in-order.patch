@@ -1,0 +1,71 @@
+diff --git drivers/frame_provider/decoder/h264_mvc/vh264_mvc.c drivers/frame_provider/decoder/h264_mvc/vh264_mvc.c
+index b62cde7..69e68c8 100644
+--- a/drivers/frame_provider/decoder/h264_mvc/vh264_mvc.c
++++ b/drivers/frame_provider/decoder/h264_mvc/vh264_mvc.c
+@@ -305,6 +305,7 @@ static s32 view1_vfbuf_use[DECODE_BUFFER_NUM_MAX];
+ static s32 fill_ptr, get_ptr, putting_ptr, put_ptr;
+ static s32 dirty_frame_num;
+ static s32 enable_recycle;
++static u8 vf_putted[VF_POOL_SIZE];
+ 
+ static s32 init_drop_frame_id[INIT_DROP_FRAME_CNT];
+ #define INCPTR(p) ptr_atomic_wrap_inc(&p)
+@@ -632,30 +633,30 @@ static struct vframe_s *vh264mvc_vf_get(void *op_arg)
+ static void vh264mvc_vf_put(struct vframe_s *vf, void *op_arg)
+ {
+ 
++	int idx = vf - vfpool;
++
+ 	if (vf_buf_init_flag == 0)
+ 		return;
+-	if (vf->frame_dirty) {
+-
+-		vf->frame_dirty = 0;
+-		dirty_frame_num++;
+-		enable_recycle = 0;
+-		if (dbg_mode & PUT_PRINT_ENABLE) {
+-			pr_info("invalid: dirty_frame_num is !!! %d\n",
+-				   dirty_frame_num);
+-		}
+-	} else {
++	if (idx < 0 || idx >= VF_POOL_SIZE)
++		return;
++	/*
++	 * The receiver may put frames out of get order (a late frame is
++	 * skipped while the previous one is still on screen, S5 video_sink).
++	 * Counting puts would hand the oldest slot - the frame on screen -
++	 * back to the firmware, which then decodes into it (tearing, older
++	 * pictures flashing up). Mark the slot and release slots only in
++	 * order, up to the oldest one still held by the receiver.
++	 */
++	vf_putted[idx] = 1;
++	vf->frame_dirty = 0;
++	while (putting_ptr != get_ptr && vf_putted[putting_ptr]) {
++		vf_putted[putting_ptr] = 0;
+ 		INCPTR(putting_ptr);
+-		while (dirty_frame_num > 0) {
+-			INCPTR(putting_ptr);
+-			dirty_frame_num--;
+-		}
+-		enable_recycle = 1;
+-		if (dbg_mode & PUT_PRINT_ENABLE) {
+-			pr_info("valid: dirty_frame_num is @@@ %d\n",
+-				   dirty_frame_num);
+-		}
+-		/* send_drop_cmd(); */
+ 	}
++	enable_recycle = 1;
++	if (dbg_mode & PUT_PRINT_ENABLE)
++		pr_info("put slot %d, putting_ptr %d, get_ptr %d\n",
++			idx, putting_ptr, get_ptr);
+ 
+ }
+ 
+@@ -1528,6 +1529,7 @@ static int vh264mvc_local_init(void)
+ 	max_dec_frame_buffering[1] = -1;
+ 	fill_ptr = get_ptr = put_ptr = putting_ptr = 0;
+ 	dirty_frame_num = 0;
++	memset(vf_putted, 0, sizeof(vf_putted));
+ 	for (i = 0; i < DECODE_BUFFER_NUM_MAX; i++) {
+ 		view0_vfbuf_use[i] = 0;
+ 		view1_vfbuf_use[i] = 0;
