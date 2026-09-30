@@ -5,7 +5,9 @@ S928X box on the AX201-v2 reference design. The Ugoos SK1 tree runs it;
 on top of that, the internal HDD bay is powered through GPIOT_13 like the
 vendor tree does, and the TCA6507 LED controller of the SK1 is disabled.
 I2C2 moves to GPIOA_4/GPIOA_5 like in the vendor tree: GPIOT_0/GPIOT_1
-carry the TM1628 front display, which openvfd drives.
+carry the TM1628 front display, which openvfd drives. USB autosuspend is
+off (coreelec,usb-no-autosuspend): on the Pro One 8K Plus, the VL817 hub of
+the USB 3.0 ports never wakes the xHCI.
 ---
 --- a/common_drivers/arch/arm64/boot/dts/amlogic/Makefile	2026-09-28 17:48:33.753522414 +0200
 +++ b/common_drivers/arch/arm64/boot/dts/amlogic/Makefile	2026-09-28 17:48:33.756918458 +0200
@@ -18,8 +20,8 @@ carry the TM1628 front display, which openvfd drives.
  dtb-y += s5_s928x_x96_x10_4g.dtb
  dtb-y += s5_s928x_x96_x10_8g.dtb
 --- a/common_drivers/arch/arm64/boot/dts/amlogic/s5_s928x_dune_hd_pro_8k_plus.dts	1970-01-01 01:00:00.000000000 +0100
-+++ b/common_drivers/arch/arm64/boot/dts/amlogic/s5_s928x_dune_hd_pro_8k_plus.dts	2026-09-30 14:55:18.259148887 +0200
-@@ -0,0 +1,43 @@
++++ b/common_drivers/arch/arm64/boot/dts/amlogic/s5_s928x_dune_hd_pro_8k_plus.dts	2026-09-30 20:09:58.106454720 +0200
+@@ -0,0 +1,45 @@
 +// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
 +/*
 + * Dune HD Pro 8K Plus (Amlogic S928X, AX201-v2 based)
@@ -38,6 +40,8 @@ carry the TM1628 front display, which openvfd drives.
 +/ {
 +	model = "Dune HD Pro 8K Plus";
 +	coreelec-dt-id = "s5_s928x_dune_hd_pro_8k_plus";
++	/* the VL817 hub of the Pro One USB 3.0 ports never wakes the xHCI */
++	coreelec,usb-no-autosuspend;
 +};
 +
 +&gpio {
