@@ -1,0 +1,119 @@
+From: djnice <djnice@freemail.hu>
+Subject: openvfd: let transposed panels place every char on its own segment line
+
+With the common anode (transposed) flag the chars can only land on SEG1-SEG8
+in a fixed order. Some TM1628 boards route their digits to arbitrary segment
+lines, SEG9/SEG10 included (R_volution PlayerPro 8K). With the new flag 0x02
+(together with 0x01) each vfd_chars entry is the segment line of that char
+(0 = SEG1) and grid n shows bit n of its glyph.
+---
+diff --git a/README.md b/README.md
+index c9d1070..0b90425 100644
+--- a/README.md
++++ b/README.md
+@@ -125,7 +125,7 @@ vfd_display_type='0x01,0x00,0x00,0x00'  # type,reserved,flags,controller
+ `vfd_display_type` byte breakdown:
+ - Byte 0: Display type (see table above)
+ - Byte 1: Reserved (`0x00`)
+-- Byte 2: Flags (`0x01` = common anode, `0x40` = low frequency)
++- Byte 2: Flags (`0x01` = common anode, `0x02` = with `0x01`: `vfd_chars` give the segment line of each char, 0 = SEG1, `0x40` = low frequency)
+ - Byte 3: Controller (`0x00`=FD628, `0x01`=FD620, `0x02`=TM1618, `0x03`=FD650…)
+ 
+ ---
+diff --git a/driver/controllers/fd628.c b/driver/controllers/fd628.c
+index e27374d..bc3fd77 100644
+--- a/driver/controllers/fd628.c
++++ b/driver/controllers/fd628.c
+@@ -318,7 +318,21 @@ static size_t fd628_write_data(const unsigned char *_data, size_t length)
+ 	else
+ 		data[0] |= (dev->status_led_mask & ~dtb->led_dots[LED_DOT_SEC]);
+ 
+-	switch (dtb->display.type) {
++	if ((dtb->display.flags & DISPLAY_FLAG_TRANSPOSED) && (dtb->display.flags & DISPLAY_FLAG_SEG_LINES)) {
++		// Common anode panel wired freely: grid n is bit n of the glyph and
++		// every char names its own segment line (0 = SEG1).
++		size_t g;
++		for (i = 0; i < length; i++) {
++			unsigned char pos = dtb->dat_index[i];
++
++			if (pos >= sizeof(dev->wbuf[0]) * 8)
++				continue;
++			for (g = 0; g < ram_grid_count; g++)
++				if (data[i] & (1 << g))
++					dev->wbuf[g] |= 1 << pos;
++		}
++		length = ram_grid_count;
++	} else switch (dtb->display.type) {
+ 	case DISPLAY_TYPE_5D_7S_NORMAL:
+ 	case DISPLAY_TYPE_5D_7S_T95:
+ 	case DISPLAY_TYPE_5D_7S_X92:
+@@ -349,7 +363,7 @@ static size_t fd628_write_data(const unsigned char *_data, size_t length)
+ 		break;
+ 	}
+ 
+-	if (dtb->display.flags & DISPLAY_FLAG_TRANSPOSED) {
++	if ((dtb->display.flags & DISPLAY_FLAG_TRANSPOSED) && !(dtb->display.flags & DISPLAY_FLAG_SEG_LINES)) {
+ 		unsigned char trans[8];
+ 		length = ram_grid_count;
+ 		memset(trans, 0, sizeof(trans));
+diff --git a/driver/openvfd_drv.c b/driver/openvfd_drv.c
+index 7576ccc..191cbec 100644
+--- a/driver/openvfd_drv.c
++++ b/driver/openvfd_drv.c
+@@ -344,9 +344,11 @@ static void sanitize_dat_index(struct vfd_dev *dev)
+ 	size_t i;
+ 	const size_t n = sizeof(dev->dtb_active.dat_index) / sizeof(dev->dtb_active.dat_index[0]);
+ 	const size_t wbuf_n = sizeof(dev->wbuf) / sizeof(dev->wbuf[0]);
++	const size_t limit = (dev->dtb_active.display.flags & DISPLAY_FLAG_SEG_LINES) ?
++		sizeof(dev->wbuf[0]) * 8 : wbuf_n;
+ 
+ 	for (i = 0; i < n; i++) {
+-		if (dev->dtb_active.dat_index[i] >= wbuf_n)
++		if (dev->dtb_active.dat_index[i] >= limit)
+ 			dev->dtb_active.dat_index[i] = (i < wbuf_n) ? (u_int8)i : 0;
+ 	}
+ }
+@@ -906,13 +908,13 @@ static int verify_module_params(struct vfd_dev *dev)
+ 			dev->dtb_active.dat_index[i] = (u_int8)vfd_chars[i];
+ 			dev->dtb_active.led_dot_index[i] = (u_int8)vfd_dot_bits[i];
+ 		}
+-		sanitize_dat_index(dev);
+ 		for (i = 0; i < 8; i++)
+ 			dev->dtb_active.led_dots[i] = (u_int8)ledDots[vfd_dot_bits[i]];
+ 		dev->dtb_active.display.type = (u_int8)vfd_display_type[0];
+ 		dev->dtb_active.display.reserved = (u_int8)vfd_display_type[1];
+ 		dev->dtb_active.display.flags = (u_int8)vfd_display_type[2];
+ 		dev->dtb_active.display.controller = (u_int8)vfd_display_type[3];
++		sanitize_dat_index(dev);
+ 	}
+ 
+ 	return ret >= 0;
+@@ -1016,7 +1018,6 @@ static int openvfd_driver_probe(struct platform_device *pdev)
+ 				pdata->dev->dtb_active.dat_index[i] = c[i];
+ 				pr_dbg2("char #%d: %d\n", i, c[i]);
+ 			}
+-			sanitize_dat_index(pdata->dev);
+ 		}
+ 
+ 		dot_bits_prop = of_find_property(pdev->dev.of_node, MOD_NAME_DOTS, NULL);
+@@ -1046,6 +1047,7 @@ static int openvfd_driver_probe(struct platform_device *pdev)
+ 		display_type_prop = of_find_property(pdev->dev.of_node, MOD_NAME_TYPE, NULL);
+ 		if (display_type_prop && display_type_prop->value)
+ 			of_property_read_u32(pdev->dev.of_node, MOD_NAME_TYPE, (int*)&pdata->dev->dtb_active.display);
++		sanitize_dat_index(pdata->dev);
+ 		pr_dbg2("display.type = %d, display.controller = %d, pdata->dev->dtb_active.display.flags = 0x%02X\n",
+ 			pdata->dev->dtb_active.display.type, pdata->dev->dtb_active.display.controller, pdata->dev->dtb_active.display.flags);
+ 	}
+diff --git a/driver/openvfd_drv.h b/driver/openvfd_drv.h
+index 26106e3..3b3cae9 100644
+--- a/driver/openvfd_drv.h
++++ b/driver/openvfd_drv.h
+@@ -224,6 +224,8 @@ enum {
+ 
+ #define DISPLAY_FLAG_TRANSPOSED	0x01
+ #define DISPLAY_FLAG_TRANSPOSED_INT	0x00010000
++#define DISPLAY_FLAG_SEG_LINES		0x02	/* transposed: chars give the segment line (0 = SEG1) */
++#define DISPLAY_FLAG_SEG_LINES_INT	0x00020000
+ #define DISPLAY_FLAG_LOW_FREQ		0x40
+ #define DISPLAY_FLAG_LOW_FREQ_INT	0x00400000
+ 
