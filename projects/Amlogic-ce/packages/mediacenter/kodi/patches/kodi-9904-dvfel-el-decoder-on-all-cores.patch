@@ -1,0 +1,45 @@
+From cd062b0ea377b9caa3ad2d01442495e4387281c3 Mon Sep 17 00:00:00 2001
+From: djnice <djnice77@gmail.com>
+Date: Tue, 29 Sep 2026 20:01:03 +0200
+Subject: [PATCH] dvfel: decode the EL on every core, wait 80 ms for it
+
+The FEL of heavy UHD remuxes (70-90 Mbit/s: Airplane!, Jurassic Park) needs
+more than 3 frame threads in busy scenes: the EL fell behind and whole
+stretches were shown without it (flicker between FEL and BL). The hardware
+decoder leaves the cores idle, so use all of them, and give a late EL
+picture up to 80 ms (the kernel waits 150 ms for the compositor).
+Jurassic Park, 28 s: 152 -> 14 frames without EL.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp
+index eec80575fb..d376ce4ba3 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp
+@@ -49,7 +49,7 @@ namespace
+ constexpr const char* DVFEL_DEV = "/dev/dvfel";
+ constexpr int GPU_BUFFERS = 3;
+ constexpr int EL_TAPS = 6;             // Lanczos-3, see felgpu.h
+-constexpr int EL_WAIT_MS = 40;         // wait for the EL frame of a job
++constexpr int EL_WAIT_MS = 80;         // wait for the EL frame of a job (the kernel waits 150)
+ // Kodi feeds packets ~1.2 s ahead of display; EL decoding is paced to stay
+ // at most EL_LEAD_US ahead of the frame the kernel asked for last
+ constexpr int64_t EL_LEAD_US = 350000;
+@@ -475,7 +475,10 @@ void CAMLDvFel::ElThread()
+   AVCodecContext* ctx = codec ? avcodec_alloc_context3(codec) : nullptr;
+   if (!ctx)
+     return;
+-  ctx->thread_count = 3;
++  // frame threads on every core: the EL of a heavy remux (70-90 Mbit/s) needs
++  // more than 3 in its busy scenes, and the hardware decoder leaves them idle
++  ctx->thread_count = static_cast<int>(
++      std::clamp(std::thread::hardware_concurrency(), 3u, 8u));
+   ctx->thread_type = FF_THREAD_FRAME;
+   if (avcodec_open2(ctx, codec, nullptr) < 0)
+   {
+-- 
+2.43.0
+
