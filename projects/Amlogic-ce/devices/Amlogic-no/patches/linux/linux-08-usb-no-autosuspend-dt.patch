@@ -1,0 +1,38 @@
+From: djnice <djnice@freemail.hu>
+Subject: usb: core: let the device tree disable autosuspend
+
+The Dune HD Pro One 8K Plus has a VIA VL817 hub on its USB 3.0 ports. Once
+runtime suspended, its remote wakeup never reaches the xHCI, so devices
+plugged later, or a boot disk that comes up late, are never seen and the
+box cannot boot from those ports. usbcore.autosuspend=-1 fixes it; allow
+the board device tree to ask for the same with "coreelec,usb-no-autosuspend"
+in its root node.
+---
+--- a/drivers/usb/core/usb.c	2026-09-30 20:09:20.602077121 +0200
++++ b/drivers/usb/core/usb.c	2026-09-30 20:09:20.619359886 +0200
+@@ -33,6 +33,7 @@
+ #include <linux/spinlock.h>
+ #include <linux/errno.h>
+ #include <linux/usb.h>
++#include <linux/of.h>
+ #include <linux/usb/hcd.h>
+ #include <linux/mutex.h>
+ #include <linux/workqueue.h>
+@@ -1131,6 +1132,17 @@
+ 		pr_info("%s: USB support disabled\n", usbcore_name);
+ 		return 0;
+ 	}
++#ifdef CONFIG_PM
++	/*
++	 * Some boards have a USB 3.0 hub whose remote wakeup never reaches the
++	 * host controller: once suspended, it misses every new device. Let the
++	 * device tree keep USB devices awake, like usbcore.autosuspend=-1.
++	 */
++	if (of_property_read_bool(of_root, "coreelec,usb-no-autosuspend")) {
++		pr_info("%s: autosuspend disabled by the device tree\n", usbcore_name);
++		usb_autosuspend_delay = -1;
++	}
++#endif
+ 	usb_init_pool_max();
+ 
+ 	usb_debugfs_init();
