@@ -1,0 +1,144 @@
+From: djnice <djnice@freemail.hu>
+Subject: openvfd: add the Dune HD Pro 8K Plus display type
+
+The front display of the Dune HD Pro 8K Plus (S928X) is a TM1628 wired as a
+common anode panel (transposed: the grids drive the segments, the segment
+lines the digits). Its grids carry the segments in the order a, g, b, c, f,
+e, d (top, middle, upper right, lower right, upper left, lower left,
+bottom), which none of the existing glyph tables matches. Add a table for it
+as display type 0x0B; the vendor kernel calls it tm1628 display_type 1.
+---
+diff --git a/OpenVFDService.c b/OpenVFDService.c
+index c0ab7a2..4391675 100644
+--- a/OpenVFDService.c
++++ b/OpenVFDService.c
+@@ -515,6 +515,9 @@ void select_display_type()
+ 			case DISPLAY_TYPE_5D_7S_TAP1:
+ 				ledCodes = LED_decode_tab5;
+ 				break;
++			case DISPLAY_TYPE_5D_7S_DUNE:
++				ledCodes = LED_decode_tab6;
++				break;
+ 			default:
+ 				ledCodes = LED_decode_tab2;
+ 				break;
+diff --git a/README.md b/README.md
+index f208e97..c9d1070 100644
+--- a/README.md
++++ b/README.md
+@@ -41,6 +41,7 @@ This repository contains the Linux kernel driver and userspace service for FD628
+ | `0x08` | 4D_7S_FREESATGTC | Freesat GTC |
+ | `0x09` | 5D_7S_TAP1 | TAP1 |
+ | `0x0A` | 5D_X96_X9 | X96/X9 |
++| `0x0B` | 5D_7S_DUNE | Dune HD Pro 8K Plus |
+ 
+ ### Display Modes
+ 
+@@ -166,6 +167,7 @@ vfd_display_type='0x01,0x00,0x00,0x00'  # type,reserved,flags,controller
+ | `0x08` | 4D_7S_FREESATGTC | Freesat GTC |
+ | `0x09` | 5D_7S_TAP1 | TAP1 |
+ | `0x0A` | 5D_X96_X9 | X96/X9 |
++| `0x0B` | 5D_7S_DUNE | Dune HD Pro 8K Plus |
+ 
+ ### 显示模式
+ 
+diff --git a/driver/controllers/fd628.c b/driver/controllers/fd628.c
+index 9799962..e27374d 100644
+--- a/driver/controllers/fd628.c
++++ b/driver/controllers/fd628.c
+@@ -93,6 +93,9 @@ static unsigned char fd628_init(void)
+ 		case DISPLAY_TYPE_5D_7S_TAP1:
+ 			ledCodes = LED_decode_tab5;
+ 			break;
++		case DISPLAY_TYPE_5D_7S_DUNE:
++			ledCodes = LED_decode_tab6;
++			break;
+ 		default:
+ 			ledCodes = LED_decode_tab2;
+ 			break;
+diff --git a/driver/glyphs.h b/driver/glyphs.h
+index 2e3badf..93ae2d5 100644
+--- a/driver/glyphs.h
++++ b/driver/glyphs.h
+@@ -336,4 +336,69 @@ static const led_bitmap LED_decode_tab5[] = {
+ 	{'_', a5}, {'-', g5}, {' ', 0}, { 0xB0, c5|d5|e5|g5 }
+ };
+ 
++#define a6 0x40
++#define b6 0x20
++#define c6 0x10
++#define d6 0x01
++#define e6 0x04
++#define f6 0x08
++#define g6 0x02
++#define p6 0x80
++
++static const led_bitmap LED_decode_tab6[] = {
++/*
++ * Dune HD Pro 8K Plus (TM1628, transposed: grid n = bit n).
++ *
++ *  dp
++ *       +--d/01--+
++ *       |        |
++ *  c/10 |        | e/04
++ *       +--g/02--+
++ *       |        |
++ *  b/20 |        | f/08
++ *       +--a/40--+
++ *
++ */
++
++	{0,   a6|b6|c6|d6|e6|f6   },	{1,   e6|f6               },
++	{2,   a6|b6|d6|e6|g6      },	{3,   a6|d6|e6|f6|g6      },
++	{4,   c6|e6|f6|g6         },	{5,   a6|c6|d6|f6|g6      },
++	{6,   a6|b6|c6|d6|f6|g6   },	{7,   d6|e6|f6            },
++	{8,   a6|b6|c6|d6|e6|f6|g6},	{9,   a6|c6|d6|e6|f6|g6   },
++
++	{'0', a6|b6|c6|d6|e6|f6   },	{'1', e6|f6               },
++	{'2', a6|b6|d6|e6|g6      },	{'3', a6|d6|e6|f6|g6      },
++	{'4', c6|e6|f6|g6         },	{'5', a6|c6|d6|f6|g6      },
++	{'6', a6|b6|c6|d6|f6|g6   },	{'7', d6|e6|f6            },
++	{'8', a6|b6|c6|d6|e6|f6|g6},	{'9', a6|c6|d6|e6|f6|g6   },
++
++	{'a', b6|c6|d6|e6|f6|g6   },	{'A', b6|c6|d6|e6|f6|g6   },
++	{'b', a6|b6|c6|f6|g6      },	{'B', a6|b6|c6|f6|g6      },
++	{'c', a6|b6|c6|d6         },	{'C', a6|b6|c6|d6         },
++	{'d', a6|b6|e6|f6|g6      },	{'D', a6|b6|e6|f6|g6      },
++	{'e', a6|b6|c6|d6|g6      },	{'E', a6|b6|c6|d6|g6      },
++	{'f', b6|c6|d6|g6         },	{'F', b6|c6|d6|g6         },
++	{'g', a6|b6|c6|d6|f6      },	{'G', a6|b6|c6|d6|f6      },
++	{'h', b6|c6|f6|g6         },	{'H', b6|c6|f6|g6         },
++	{'i', b6|c6               },	{'I', b6|c6               },
++	{'j', a6|b6|e6|f6         },	{'J', a6|b6|e6|f6         },
++	{'k', b6|c6|d6|f6|g6      },	{'K', b6|c6|d6|f6|g6      },
++	{'l', a6|b6|c6            },	{'L', a6|b6|c6            },
++	{'m', b6|d6|f6            },	{'M', b6|d6|f6            },
++	{'n', b6|c6|d6|e6|f6      },	{'N', b6|c6|d6|e6|f6      },
++	{'o', a6|b6|f6|g6         },	{'O', a6|b6|f6|g6         },
++	{'p', b6|c6|d6|e6|g6      },	{'P', b6|c6|d6|e6|g6      },
++	{'q', c6|d6|e6|f6|g6      },	{'Q', c6|d6|e6|f6|g6      },
++	{'r', b6|g6               },	{'R', b6|g6               },
++	{'s', a6|c6|d6|f6|g6      },	{'S', a6|c6|d6|f6|g6      },
++	{'t', a6|b6|c6|g6         },	{'T', a6|b6|c6|g6         },
++	{'u', a6|b6|f6            },	{'U', a6|b6|f6            },
++	{'v', a6|b6|c6|e6|f6      },	{'V', a6|b6|c6|e6|f6      },
++	{'w', a6|c6|e6            },	{'W', a6|c6|e6            },
++	{'x', b6|c6|e6|f6|g6      },	{'X', b6|c6|e6|f6|g6      },
++	{'y', a6|c6|e6|f6|g6      },	{'Y', a6|c6|e6|f6|g6      },
++	{'z', a6|b6|d6|e6|g6      },	{'Z', a6|b6|d6|e6|g6      },
++	{'_', a6}, {'-', g6}, {' ', 0}, { 0xB0, c6|d6|e6|g6 }
++};
++
+ #endif
+diff --git a/driver/openvfd_drv.h b/driver/openvfd_drv.h
+index 11d0569..26106e3 100644
+--- a/driver/openvfd_drv.h
++++ b/driver/openvfd_drv.h
+@@ -218,6 +218,7 @@ enum {
+ 	DISPLAY_TYPE_4D_7S_FREESATGTC,
+ 	DISPLAY_TYPE_5D_7S_TAP1,
+ 	DISPLAY_TYPE_5D_X96_X9,
++	DISPLAY_TYPE_5D_7S_DUNE,	// Dune HD Pro 8K Plus (TM1628, transposed)
+ 	DISPLAY_TYPE_MAX,
+ };
+ 
