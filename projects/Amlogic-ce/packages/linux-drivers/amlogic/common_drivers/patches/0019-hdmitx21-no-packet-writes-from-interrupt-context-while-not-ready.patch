@@ -1,0 +1,67 @@
+From: djnice <djnice77@gmail.com>
+Date: Wed, 30 Sep 2026 09:00:00 +0200
+Subject: [PATCH] hdmitx21: no packet writes from interrupt context while not ready
+
+A mode setting (a playback start switching 1080p60 -> 2160p24) disables
+the output (ready = 0), then enable_mode resets and reprograms the
+transmitter (hdmi_hwp_init). The packet setters let a clear through
+while not ready, and the Dolby Vision vsync handler clears the VSIF
+right then: amdolby_vision_process -> send_hdmi_pkt ->
+hdmitx_set_vsif_pkt -> hdmi_vend_infoframe_rawset -> hdmitx21_wr_reg
+into the block in reset: asynchronous SError, kernel panic (Dune HD Pro
+8K Plus, S928X, starting a Dolby Vision title).
+
+Not ready, the VSIF/DRM/HDR10+ setters now leave the hardware alone when
+called from interrupt context. The mode setting's own calls (process
+context) are unchanged, and it sends the packets of the new mode itself.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/drivers/media/vout/hdmitx21/hdmi_tx_main.c
++++ b/drivers/media/vout/hdmitx21/hdmi_tx_main.c
+@@ -886,6 +886,18 @@
+ 	}
+ 	spin_lock_irqsave(&hdev->tx_comm.edid_spinlock, flags);
+ 
++	/*
++	 * Not ready from interrupt context (the Dolby Vision / HDR vsync
++	 * handlers): the output is being disabled or reprogrammed by a mode
++	 * setting, which resets the transmitter. A packet write then hits a
++	 * block in reset: asynchronous SError, kernel panic. The mode setting
++	 * sends the packets of the new mode itself; a clear is only safe from
++	 * its own context.
++	 */
++	if (hdev->tx_comm.ready == 0 && in_interrupt()) {
++		spin_unlock_irqrestore(&hdev->tx_comm.edid_spinlock, flags);
++		return;
++	}
+ 	/* if ready is 0, only can clear pkt */
+ 	if (hdev->tx_comm.ready == 0 && data) {
+ 		if (hdr_transfer_feature != T_BT709 ||
+@@ -1240,8 +1252,13 @@
+ 	vsif_debug_info.type = type;
+ 	vsif_debug_info.tunnel_mode = tunnel_mode;
+ 	vsif_debug_info.signal_sdr = signal_sdr;
+-	/* if ready is 0, only can clear pkt */
+-	if (hdev->tx_comm.ready == 0 && type != EOTF_T_NULL) {
++	/*
++	 * if ready is 0, only can clear pkt, and not from interrupt context:
++	 * the transmitter may be in reset for a mode setting (see
++	 * hdmitx_set_drm_pkt())
++	 */
++	if (hdev->tx_comm.ready == 0 &&
++	    (type != EOTF_T_NULL || in_interrupt())) {
+ 		ltype = EOTF_T_NULL;
+ 		ltmode = -1;
+ 		spin_unlock_irqrestore(&hdev->tx_comm.edid_spinlock, flags);
+@@ -1582,8 +1599,8 @@
+ 
+ 	if (hdev->bist_lock)
+ 		return;
+-	/* if ready is 0, only can clear pkt */
+-	if (hdev->tx_comm.ready == 0 && data)
++	/* if ready is 0, only can clear pkt, not from interrupt context */
++	if (hdev->tx_comm.ready == 0 && (data || in_interrupt()))
+ 		return;
+ 	/* save vic to AVI when send HDR10P_VSIF */
+ 	if (vic == HDMI_95_3840x2160p30_16x9 ||
