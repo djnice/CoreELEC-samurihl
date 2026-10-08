@@ -1,0 +1,500 @@
+From: djnice <djnice@freemail.hu>
+Subject: [PATCH] VideoInfoScanner: scrape new movies of a folder four at a time
+
+A library scan scraped one movie after the other, ~2.6 s each on S928X
+(TMDB search + details in two languages + collection + fanart.tv, python
+start-up, stream details with a decoded HDR frame). The new plain movie files
+of a directory listing are now fetched ahead on 4 threads (search, details,
+stream details); the serial loop picks the results up in order, so everything
+that touches the library stays serial. Each thread uses its own database
+connection and scraper instance. Nfo, identifiers in filenames, stacks and
+discs still go the serial way, and a result is only used when it searched for
+the same title and year the serial path would.
+
+Two things had to change for concurrent runs of one scraper:
+- CScriptInvocationManager: the reusable invoker is checked and taken in
+  separate steps, so threads running the same reusable script at once (the
+  TMDB scraper has reuselanguageinvoker) got the same invoker and plugin handle
+  and each other's results (one movie got another's details). A thread-local
+  flag makes the scanner threads use one-off invokers.
+- CPythonInvoker: sub-interpreters are created and ended one at a time (a
+  crash in PyEval_RestoreThread with four starting at once).
+
+Measured on S928X: 108 movies in 114 s (was ~280 s), titles identical file by
+file to the serial scan.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../interfaces/generic/ScriptInvocationManager.cpp |  37 +++-
+ xbmc/interfaces/generic/ScriptInvocationManager.h  |  10 +
+ xbmc/interfaces/python/PythonInvoker.cpp           |  13 ++
+ xbmc/video/VideoInfoScanner.cpp                    | 237 +++++++++++++++++++++
+ xbmc/video/VideoInfoScanner.h                      |  16 ++
+ 5 files changed, 312 insertions(+), 1 deletion(-)
+
+diff --git a/xbmc/interfaces/generic/ScriptInvocationManager.cpp b/xbmc/interfaces/generic/ScriptInvocationManager.cpp
+index c6fe84593a..314825d7aa 100644
+--- a/xbmc/interfaces/generic/ScriptInvocationManager.cpp
++++ b/xbmc/interfaces/generic/ScriptInvocationManager.cpp
+@@ -157,8 +157,26 @@ bool CScriptInvocationManager::HasLanguageInvoker(const std::string &script) con
+   return it != m_invocationHandlers.end() && it->second != nullptr;
+ }
+ 
++namespace
++{
++thread_local bool t_exclusiveInvokers{false};
++} // namespace
++
++void CScriptInvocationManager::SetExclusiveInvokers(bool exclusive)
++{
++  t_exclusiveInvokers = exclusive;
++}
++
++bool CScriptInvocationManager::HasExclusiveInvokers()
++{
++  return t_exclusiveInvokers;
++}
++
+ int CScriptInvocationManager::GetReusablePluginHandle(const std::string& script)
+ {
++  if (t_exclusiveInvokers)
++    return -1;
++
+   std::unique_lock lock(m_critSection);
+ 
+   if (m_lastInvokerThread)
+@@ -176,7 +194,7 @@ std::shared_ptr<ILanguageInvoker> CScriptInvocationManager::GetLanguageInvoker(
+ {
+   std::unique_lock lock(m_critSection);
+ 
+-  if (m_lastInvokerThread)
++  if (m_lastInvokerThread && !t_exclusiveInvokers)
+   {
+     if (m_lastInvokerThread->Reuseable(script))
+     {
+@@ -238,6 +256,23 @@ int CScriptInvocationManager::ExecuteAsync(
+ 
+   std::unique_lock lock(m_critSection);
+ 
++  if (t_exclusiveInvokers)
++  {
++    // A one-off invoker that leaves the reusable one alone
++    auto invokerThread = std::make_shared<CLanguageInvokerThread>(languageInvoker, this, false);
++    if (addon != nullptr)
++      invokerThread->SetAddon(addon);
++    invokerThread->SetId(m_nextId++);
++
++    LanguageInvokerThread thread = {invokerThread, script, false};
++    m_scripts.insert(std::make_pair(invokerThread->GetId(), thread));
++    m_scriptPaths.insert(std::make_pair(script, invokerThread->GetId()));
++    lock.unlock();
++    invokerThread->Execute(script, arguments);
++
++    return invokerThread->GetId();
++  }
++
+   if (m_lastInvokerThread && m_lastInvokerThread->GetInvoker() == languageInvoker)
+   {
+     if (addon != nullptr)
+diff --git a/xbmc/interfaces/generic/ScriptInvocationManager.h b/xbmc/interfaces/generic/ScriptInvocationManager.h
+index 6ae97a48ee..11dc92c4c8 100644
+--- a/xbmc/interfaces/generic/ScriptInvocationManager.h
++++ b/xbmc/interfaces/generic/ScriptInvocationManager.h
+@@ -38,6 +38,16 @@ public:
+   */
+   int GetReusablePluginHandle(const std::string& script);
+ 
++  /*!
++   * \brief While set on the calling thread, the scripts it runs neither take nor replace the
++   *        reusable invoker (\ref GetReusablePluginHandle): each gets a fresh one of its own.
++   *        The reusable invoker is checked and taken in separate steps, so threads running the
++   *        same reusable script at the same time (the video scanner scraping several movies at
++   *        once) were handed the same invoker and plugin handle and got each other's results.
++   */
++  static void SetExclusiveInvokers(bool exclusive);
++  static bool HasExclusiveInvokers();
++
+   /*!
+    * \brief Executes the given script asynchronously in a separate thread.
+    *
+diff --git a/xbmc/interfaces/python/PythonInvoker.cpp b/xbmc/interfaces/python/PythonInvoker.cpp
+index ef608a4b86..0e26bac20d 100644
+--- a/xbmc/interfaces/python/PythonInvoker.cpp
++++ b/xbmc/interfaces/python/PythonInvoker.cpp
+@@ -138,6 +138,16 @@ bool CPythonInvoker::execute(const std::string& script, const std::vector<std::s
+   return execute(script, w_arguments);
+ }
+ 
++namespace
++{
++//! Sub-interpreters are created and torn down one at a time. Several invokers starting at once
++//! (e.g. the movie scraper run for several files in parallel by the video scanner) crashed in
++//! PyEval_RestoreThread on a just created interpreter while others were being created or ended.
++//! Only the lifecycle is serialised, the scripts themselves still run concurrently. Always taken
++//! before the GIL, never while holding it, so it cannot deadlock against a running script.
++std::mutex s_interpreterLifecycle;
++} // namespace
++
+ bool CPythonInvoker::execute(const std::string& script, std::vector<std::wstring>& arguments)
+ {
+   // copy the code/script into a local string buffer
+@@ -159,6 +169,7 @@ bool CPythonInvoker::execute(const std::string& script, std::vector<std::wstring
+   // set m_threadState if it's not set.
+   PyThreadState* l_threadState = nullptr;
+   bool newInterp = false;
++  std::unique_lock lifecycleLock(s_interpreterLifecycle);
+   {
+     if (!m_threadState)
+     {
+@@ -192,6 +203,7 @@ bool CPythonInvoker::execute(const std::string& script, std::vector<std::wstring
+ 
+   // get the GIL
+   PyEval_RestoreThread(l_threadState);
++  lifecycleLock.unlock();
+   if (newInterp)
+   {
+     m_languageHook = new XBMCAddon::Python::PythonLanguageHook(l_threadState->interp);
+@@ -587,6 +599,7 @@ void CPythonInvoker::onExecutionDone()
+   {
+     CLog::Log(LOGDEBUG, "{}({}, {})", __FUNCTION__, GetId(), m_sourceFile);
+ 
++    std::unique_lock lifecycleLock(s_interpreterLifecycle);
+     PyEval_RestoreThread(m_threadState);
+ 
+     onDeinitialization();
+diff --git a/xbmc/video/VideoInfoScanner.cpp b/xbmc/video/VideoInfoScanner.cpp
+index 3de2da3659..ed4a3b6ba5 100644
+--- a/xbmc/video/VideoInfoScanner.cpp
++++ b/xbmc/video/VideoInfoScanner.cpp
+@@ -31,6 +31,7 @@
+ #include "guilib/GUIComponent.h"
+ #include "guilib/GUIWindowManager.h"
+ #include "interfaces/AnnouncementManager.h"
++#include "interfaces/generic/ScriptInvocationManager.h"
+ #include "messaging/helpers/DialogHelper.h"
+ #include "messaging/helpers/DialogOKHelper.h"
+ #include "playlists/PlayListFileItemClassify.h"
+@@ -63,11 +64,15 @@
+ 
+ #include <algorithm>
+ #include <chrono>
++#include <condition_variable>
+ #include <map>
+ #include <memory>
++#include <mutex>
+ #include <ranges>
+ #include <set>
+ #include <string>
++#include <thread>
++#include <unordered_map>
+ #include <unordered_map>
+ #include <utility>
+ 
+@@ -805,6 +810,10 @@ CVideoInfoScanner::~CVideoInfoScanner()
+ 
+     m_database.Open();
+ 
++    // Scrape new plain movie files several at a time ahead of the loop below
++    if (!pURL && items.Size() > 1)
++      StartMoviePrefetch(items, bDirNames, useLocal);
++
+     bool FoundSomeInfo = false;
+     std::vector<int> seenPaths;
+     seenPaths.reserve(items.Size());
+@@ -912,6 +921,7 @@ CVideoInfoScanner::~CVideoInfoScanner()
+     if(pDlgProgress)
+       pDlgProgress->ShowProgressBar(false);
+ 
++    StopMoviePrefetch();
+     m_database.Close();
+     return FoundSomeInfo;
+   }
+@@ -1377,6 +1387,161 @@ CVideoInfoScanner::~CVideoInfoScanner()
+     return edition;
+   }
+ 
++  //! Runs the network and file probing part of RetrieveInfoForMovie() for the new plain movie
++  //! files of one directory listing on a few threads. Each thread has its own database
++  //! connection and its own scraper instance (a CScraper is not synchronised), so nothing is
++  //! shared but the job list.
++  class CVideoInfoScanner::CMoviePrefetcher
++  {
++  public:
++    struct Job
++    {
++      std::shared_ptr<CFileItem> item; //!< private copy, receives the details
++      std::string scraperPath; //!< path whose scraper and settings apply
++      std::string title; //!< what the serial path searches for
++      int year{-1};
++      bool done{false};
++      bool found{false};
++    };
++
++    CMoviePrefetcher(std::vector<Job> jobs,
++                     bool bDirNames,
++                     bool useLocal,
++                     const std::atomic<bool>& stop,
++                     size_t threads)
++      : m_jobs(std::move(jobs)),
++        m_dirNames(bDirNames),
++        m_useLocal(useLocal),
++        m_extractFlags(CServiceBroker::GetSettingsComponent()->GetSettings()->GetBool(
++            CSettings::SETTING_MYVIDEOS_EXTRACTFLAGS)),
++        m_stop(stop)
++    {
++      for (size_t i = 0; i < m_jobs.size(); ++i)
++        m_index.try_emplace(m_jobs[i].item->GetPath(), i);
++      for (size_t i = 0; i < threads; ++i)
++        m_threads.emplace_back([this] { Worker(); });
++    }
++
++    ~CMoviePrefetcher()
++    {
++      m_abort = true;
++      for (auto& thread : m_threads)
++        thread.join();
++    }
++
++    CMoviePrefetcher(const CMoviePrefetcher&) = delete;
++    CMoviePrefetcher& operator=(const CMoviePrefetcher&) = delete;
++
++    //! \brief The job of \p path once it is done, nullptr if there is none or the scan stops
++    const Job* Wait(const std::string& path, const std::atomic<bool>& stop)
++    {
++      const auto it{m_index.find(path)};
++      if (it == m_index.end())
++        return nullptr;
++
++      std::unique_lock lock(m_mutex);
++      const Job& job{m_jobs[it->second]};
++      while (!job.done)
++      {
++        if (stop)
++          return nullptr;
++        m_done.wait_for(lock, std::chrono::milliseconds(100));
++      }
++      return &job;
++    }
++
++  private:
++    void Worker()
++    {
++      // The movie scraper is a reusable plugin script: concurrent runs must not share one
++      CScriptInvocationManager::SetExclusiveInvokers(true);
++
++      CVideoDatabase db;
++      const bool dbOpen{db.Open()};
++      while (true)
++      {
++        const size_t i{m_next++};
++        if (i >= m_jobs.size())
++          break;
++
++        Job& job{m_jobs[i]};
++        const bool found{dbOpen && !m_abort && !m_stop && Fetch(db, job)};
++        {
++          std::unique_lock lock(m_mutex);
++          job.found = found;
++          job.done = true;
++        }
++        m_done.notify_all();
++      }
++      if (dbOpen)
++        db.Close();
++    }
++
++    bool Fetch(CVideoDatabase& db, Job& job) const
++    {
++      // A fresh instance for this thread, with the path's settings
++      const ScraperPtr scraper{db.GetScraperForPath(job.scraperPath)};
++      if (!scraper || scraper->Content() != ContentType::MOVIES)
++        return false;
++
++      CFileItem& item{*job.item};
++
++      // What the serial path reads first: anything but embedded title tags (an nfo, a url)
++      // goes the serial way
++      if (m_useLocal)
++      {
++        const std::unique_ptr<IVideoInfoTagLoader> loader{
++            CVideoInfoTagLoaderFactory::CreateLoader(item, scraper, m_dirNames)};
++        if (loader)
++        {
++          CVideoInfoTag tag;
++          const InfoType result{loader->Load(tag, false)};
++          if (result == InfoType::TITLE)
++          {
++            job.title = tag.GetTitle();
++            job.year = tag.GetYear();
++          }
++          else if (result != InfoType::NONE)
++            return false;
++        }
++      }
++
++      CVideoInfoDownloader downloader(scraper);
++      MOVIELIST movies;
++      if (downloader.FindMovie(job.title, job.year, movies) <= 0 || movies.empty() || m_abort ||
++          m_stop)
++        return false;
++
++      CVideoInfoTag details;
++      if (!downloader.GetDetails({}, movies[0], details) || m_abort || m_stop)
++        return false;
++
++      *item.GetVideoInfoTag() = details;
++
++      // The serial path extracts these only when missing, so the slow file part is done here
++      // as well
++      if (m_extractFlags)
++        CDVDFileInfo::GetFileStreamDetails(&item);
++
++      CLog::Log(LOGDEBUG, "VideoInfoScanner: fetched ahead '{}' for {}", details.m_strTitle,
++                CURL::GetRedacted(item.GetPath()));
++      return true;
++    }
++
++    std::vector<Job> m_jobs;
++    std::unordered_map<std::string, size_t> m_index;
++    const bool m_dirNames;
++    const bool m_useLocal;
++    const bool m_extractFlags;
++    const std::atomic<bool>& m_stop;
++    std::atomic<bool> m_abort{false};
++    std::atomic<size_t> m_next{0};
++    std::mutex m_mutex;
++    std::condition_variable m_done;
++    std::vector<std::thread> m_threads;
++  };
++
++
+   CInfoScanner::InfoRet CVideoInfoScanner::RetrieveInfoForMovie(CFileItem* pItem,
+                                                                 bool bDirNames,
+                                                                 ScraperPtr& info2,
+@@ -1614,6 +1779,24 @@ CVideoInfoScanner::~CVideoInfoScanner()
+         return HandleMovieSetAndVersions();
+     }
+ 
++    // Fetched ahead by StartMoviePrefetch(), if it searched for the same title and year
++    if (m_moviePrefetcher && !(pURL && pURL->HasUrls()) &&
++        (result == InfoType::NONE || result == InfoType::TITLE))
++    {
++      const auto* job{m_moviePrefetcher->Wait(pItem->GetPath(), m_bStop)};
++      if (m_bStop)
++        return InfoRet::CANCELLED;
++      if (job && job->found && job->title == movieTitle && job->year == movieYear)
++      {
++        CLog::Log(LOGDEBUG, "VideoInfoScanner: using the details fetched ahead for {}",
++                  CURL::GetRedacted(pItem->GetPath()));
++        if (m_handle)
++          m_handle->SetText(job->item->GetVideoInfoTag()->m_strTitle);
++        *pItem->GetVideoInfoTag() = *job->item->GetVideoInfoTag();
++        return HandleMovieSetAndVersions();
++      }
++    }
++
+     if (pURL && pURL->HasUrls())
+       url = *pURL;
+     else if ((retVal = FindVideo(movieTitle, movieYear, info2, url, pDlgProgress)) <= 0)
+@@ -1632,6 +1815,60 @@ CVideoInfoScanner::~CVideoInfoScanner()
+     return InfoRet::NOT_FOUND;
+   }
+ 
++  void CVideoInfoScanner::StartMoviePrefetch(const CFileItemList& items,
++                                             bool bDirNames,
++                                             bool useLocal)
++  {
++    //! Several movies at once, but few enough for the scraper sites and for decoding a frame of
++    //! each file for its HDR details
++    constexpr size_t PREFETCH_THREADS{4};
++
++    StopMoviePrefetch();
++
++    const ScraperPtr scraper{m_database.GetScraperForPath(items.GetPath(), &m_scraperCache)};
++    if (!scraper || scraper->Content() != ContentType::MOVIES)
++      return;
++
++    std::vector<CMoviePrefetcher::Job> jobs;
++    for (const auto& item : items)
++    {
++      const std::string& path{item->GetPath()};
++      if (item->IsFolder() || !IsVideo(*item) || item->IsNFO() || PLAYLIST::IsPlayList(*item) ||
++          URIUtils::IsStack(path) || IsDisc(path) ||
++          CUtil::ExcludeFileOrFolder(path, m_advancedSettings->m_moviesExcludeFromScanRegExps,
++                                     &m_regexpCache) ||
++          m_database.HasMovieInfo(item->GetDynPath()))
++        continue;
++
++      // An identifier in the filename is looked up directly by the serial path
++      const CFilenameAttributes attributes(URIUtils::GetFileName(path), &m_regexpCache);
++      std::string identifierType;
++      std::string identifier;
++      if (scraper->IsPython() && attributes.GetIdentifier(identifierType, identifier))
++        continue;
++
++      CMoviePrefetcher::Job job;
++      job.item = std::make_shared<CFileItem>(*item);
++      job.scraperPath = items.GetPath();
++      job.title = item->GetMovieName(bDirNames);
++      jobs.emplace_back(std::move(job));
++    }
++
++    if (jobs.size() < 2)
++      return;
++
++    const size_t threads{std::min(PREFETCH_THREADS, jobs.size())};
++    CLog::Log(LOGINFO, "VideoInfoScanner: fetching {} new movies of {} ahead on {} threads",
++              jobs.size(), CURL::GetRedacted(items.GetPath()), threads);
++    m_moviePrefetcher =
++        std::make_unique<CMoviePrefetcher>(std::move(jobs), bDirNames, useLocal, m_bStop, threads);
++  }
++
++  void CVideoInfoScanner::StopMoviePrefetch()
++  {
++    m_moviePrefetcher.reset();
++  }
++
+   CInfoScanner::InfoRet CVideoInfoScanner::RetrieveInfoForMusicVideo(
+       CFileItem* pItem,
+       bool bDirNames,
+diff --git a/xbmc/video/VideoInfoScanner.h b/xbmc/video/VideoInfoScanner.h
+index 33e43e0549..34552bc6f2 100644
+--- a/xbmc/video/VideoInfoScanner.h
++++ b/xbmc/video/VideoInfoScanner.h
+@@ -19,6 +19,7 @@
+ #include <atomic>
+ #include <cstdint>
+ #include <functional>
++#include <memory>
+ #include <set>
+ #include <string>
+ #include <string_view>
+@@ -330,6 +331,18 @@ namespace KODI::VIDEO
+     std::pair<InfoType, std::unique_ptr<IVideoInfoTagLoader>> ReadInfoTag(
+         CFileItem& item, const ADDON::ScraperPtr& scraper, bool lookInFolder, bool resetTag);
+ 
++    /*!
++     * \brief Scrape the new plain movie files of a directory listing several at a time, ahead of
++     *        the serial loop in RetrieveVideoInfo(), which then picks the results up in order.
++     *        Only the network and file probing part runs ahead (search, details, stream details);
++     *        everything that touches the library stays in the serial loop.
++     * \param[in] items The directory listing about to be processed
++     * \param[in] bDirNames whether directory names are used for identification
++     * \param[in] useLocal whether local information (nfo, embedded tags) is read
++     */
++    void StartMoviePrefetch(const CFileItemList& items, bool bDirNames, bool useLocal);
++    void StopMoviePrefetch();
++
+     //! Sticky - never reset, so a scanner instance is good for one scan only
+     std::atomic<bool> m_bStop{false};
+     bool m_scanAll;
+@@ -381,6 +394,9 @@ namespace KODI::VIDEO
+ 
+     mutable KODI::REGEXP::RegExpCache m_regexpCache;
+ 
++    class CMoviePrefetcher;
++    std::unique_ptr<CMoviePrefetcher> m_moviePrefetcher;
++
+     //! Editions known to the library, cached for the duration of a scan
+     std::vector<std::string> m_videoVersionTypes;
+     bool m_videoVersionTypesCached{false};
