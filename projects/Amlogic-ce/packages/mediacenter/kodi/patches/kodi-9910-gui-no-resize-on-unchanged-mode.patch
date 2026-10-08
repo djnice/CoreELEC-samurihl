@@ -1,0 +1,67 @@
+From: djnice <djnice77@gmail.com>
+Subject: [PATCH] GraphicContext: no GUI resize broadcast when the mode did not
+ change
+
+On Amlogic every SetVideoResolution is forced, so PlaybackCleanup after a
+windowed video (a background trailer) re-applies the unchanged GUI mode and
+broadcasts GUI_MSG_WINDOW_RESIZE. That frees every large texture and reloads
+the fonts for nothing: one near-black frame and a visible redraw of the whole
+GUI each time a trailer stops. The broadcast is now sent only when the GUI
+geometry (GUI and screen size, pixel ratio, overscan, insets, subtitle line,
+stereo flags) really changed.
+
+Measured on S928X with the VPP output read back by VDIN1: leaving an info
+screen with a playing trailer showed a frame at mean luma 18 between two at
+84; with the patch the transition has no such frame.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ xbmc/windowing/GraphicContext.cpp | 27 ++++++++++++++++++++++++++-
+ 1 file changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/xbmc/windowing/GraphicContext.cpp b/xbmc/windowing/GraphicContext.cpp
+index 0249ce4403..ee45faf96e 100644
+--- a/xbmc/windowing/GraphicContext.cpp
++++ b/xbmc/windowing/GraphicContext.cpp
+@@ -445,6 +445,9 @@ void CGraphicContext::SetVideoResolutionInternal(RESOLUTION res, bool forceUpdat
+   int origScreenWidth = m_iScreenWidth;
+   int origScreenHeight = m_iScreenHeight;
+   float origFPSOverride = m_fFPSOverride;
++  const bool lastResValid = IsValidResolution(lastRes);
++  const RESOLUTION_INFO lastInfo =
++      lastResValid ? CDisplaySettings::GetInstance().GetResolutionInfo(lastRes) : RESOLUTION_INFO();
+ 
+   UpdateInternalStateWithResolution(res);
+   RESOLUTION_INFO info_org  = CDisplaySettings::GetInstance().GetResolutionInfo(res);
+@@ -478,8 +481,30 @@ void CGraphicContext::SetVideoResolutionInternal(RESOLUTION res, bool forceUpdat
+     // update anyone that relies on sizing information
+     CServiceBroker::GetInputManager().SetMouseResolution(info_org.iWidth, info_org.iHeight, 1, 1);
+ 
++    // A forced re-apply of an unchanged mode (on Amlogic every update is forced, e.g. the
++    // PlaybackCleanup after a windowed trailer) leaves the GUI geometry as it was. The resize
++    // broadcast would free every large texture and reload the fonts for nothing: one
++    // near-black frame and a visible redraw of the whole GUI.
++    const RESOLUTION_INFO newInfo = CDisplaySettings::GetInstance().GetResolutionInfo(res);
++    const bool geometryChanged =
++        !lastResValid || lastInfo.iWidth != newInfo.iWidth ||
++        lastInfo.iHeight != newInfo.iHeight || lastInfo.iScreenWidth != newInfo.iScreenWidth ||
++        lastInfo.iScreenHeight != newInfo.iScreenHeight ||
++        lastInfo.iBlanking != newInfo.iBlanking || lastInfo.iSubtitles != newInfo.iSubtitles ||
++        lastInfo.fPixelRatio != newInfo.fPixelRatio ||
++        lastInfo.Overscan.left != newInfo.Overscan.left ||
++        lastInfo.Overscan.top != newInfo.Overscan.top ||
++        lastInfo.Overscan.right != newInfo.Overscan.right ||
++        lastInfo.Overscan.bottom != newInfo.Overscan.bottom ||
++        lastInfo.guiInsets.left != newInfo.guiInsets.left ||
++        lastInfo.guiInsets.top != newInfo.guiInsets.top ||
++        lastInfo.guiInsets.right != newInfo.guiInsets.right ||
++        lastInfo.guiInsets.bottom != newInfo.guiInsets.bottom ||
++        (lastInfo.dwFlags & D3DPRESENTFLAG_MODEMASK) != (newInfo.dwFlags & D3DPRESENTFLAG_MODEMASK) ||
++        origScreenWidth != m_iScreenWidth || origScreenHeight != m_iScreenHeight;
++
+     CGUIComponent *gui = CServiceBroker::GetGUI();
+-    if (gui)
++    if (gui && geometryChanged)
+       gui->GetWindowManager().SendMessage(GUI_MSG_NOTIFY_ALL, 0, 0, GUI_MSG_WINDOW_RESIZE);
+   }
+   else
