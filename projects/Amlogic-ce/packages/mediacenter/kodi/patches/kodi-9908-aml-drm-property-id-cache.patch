@@ -1,0 +1,314 @@
+From: djnice <djnice77@gmail.com>
+Subject: [PATCH] AMLDisplay: look DRM property ids up once instead of on every
+ page flip
+
+set_drmProp walked all properties of the object (drmModeObjectGetProperties
+plus drmModeGetProperty for each) for every value it set, so a GUI page flip
+cost ~12 walks, ~24 OBJ_GETPROPERTIES and ~160 GETPROPERTY ioctls.
+OBJ_GETPROPERTIES takes all modeset locks, and while the previous non-blocking
+commit still held them it slept up to one or two vblanks (single calls of 16
+and 32 ms measured). With a video under the GUI the flip is synchronous, so
+those frames missed their vsync: 2 to 4 GUI stalls a second on S928X during
+playback, very visible on any GUI animation (a rotating disc on the info
+screen over a trailer).
+
+Property ids and flags never change for an object while the device is open:
+cache them per (object id, type) by lowercase name, cleared with the device
+state. set_drmProp now adds the cached id to the atomic request without any
+ioctl and get_drmProp reads the value with one property list walk. Measured
+on S928X with a 1080p60 GUI over a 23.976 fps video: 899 frames in 15 s,
+none longer than 25 ms (before: 27-74), 0 property ioctls per frame.
+
+set_drmProp takes a uint64_t value: OUT_FENCE_PTR passes a pointer.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ xbmc/windowing/amlogic/AMLDisplay.cpp | 187 +++++++++++++++-----------
+ xbmc/windowing/amlogic/AMLDisplay.h   |  18 ++-
+ 2 files changed, 123 insertions(+), 82 deletions(-)
+
+diff --git a/xbmc/windowing/amlogic/AMLDisplay.cpp b/xbmc/windowing/amlogic/AMLDisplay.cpp
+index 1f6b7d8154..2313375901 100644
+--- a/xbmc/windowing/amlogic/AMLDisplay.cpp
++++ b/xbmc/windowing/amlogic/AMLDisplay.cpp
+@@ -253,6 +253,60 @@ void CAMLDRMUtils::CleanAndClose()
+   }
+ 
+   m_connection = DRM_MODE_DISCONNECTED;
++  clear_drmPropCache();
++}
++
++void CAMLDRMUtils::clear_drmPropCache()
++{
++  std::unique_lock lock(m_propCacheLock);
++  m_propCache.clear();
++}
++
++// Property ids and flags never change for a DRM object while the device is open, so
++// they are read once per object and looked up by name from then on. set_drmProp used
++// to walk all properties of the object (drmModeObjectGetProperties plus a
++// drmModeGetProperty for each) for every value it set: ~12 walks and ~180 ioctls for
++// each GUI page flip. drmModeObjectGetProperties takes all modeset locks, so while the
++// previous non-blocking commit still held them it slept up to one or two vblanks and
++// the GUI frame missed its vsync - 2 to 4 visible stalls a second on S928X whenever a
++// video plays under the GUI (the page flip is synchronous then).
++bool CAMLDRMUtils::find_drmProp(uint32_t obj_id,
++                                uint32_t obj_type,
++                                const std::string& name,
++                                DrmProp& prop)
++{
++  std::unique_lock lock(m_propCacheLock);
++
++  auto obj = m_propCache.find({obj_id, obj_type});
++  if (obj == m_propCache.end())
++  {
++    drmModeObjectPropertiesPtr props = drmModeObjectGetProperties(m_fd, obj_id, obj_type);
++    if (!props)
++    {
++      CLog::Log(LOGERROR, "CAMLDRMUtils::{} - failed to get properties", __FUNCTION__);
++      return false;
++    }
++
++    std::map<std::string, DrmProp> byName;
++    for (uint32_t i = 0; i < props->count_props; i++)
++    {
++      drmModePropertyPtr p = drmModeGetProperty(m_fd, props->props[i]);
++      if (!p)
++        continue;
++      byName[StringUtils::ToLower(p->name)] = {p->prop_id, p->flags};
++      drmModeFreeProperty(p);
++    }
++    drmModeFreeObjectProperties(props);
++
++    obj = m_propCache.emplace(std::make_pair(obj_id, obj_type), std::move(byName)).first;
++  }
++
++  auto it = obj->second.find(StringUtils::ToLower(name));
++  if (it == obj->second.end())
++    return false;
++
++  prop = it->second;
++  return true;
+ }
+ 
+ void CAMLDRMUtils::aml_init_drmDevice()
+@@ -631,73 +685,66 @@ int CAMLDRMUtils::get_drmProp(
+     unsigned int id, std::string name, unsigned int obj_type, void* data, int* data_len)
+ {
+   int ret = -1;
+-  unsigned int i;
+-  drmModeObjectPropertiesPtr props = NULL;
+ 
+   if (!id)
+     return ret;
+ 
+-  props = drmModeObjectGetProperties(m_fd, id, obj_type);
++  DrmProp prop;
++  if (!find_drmProp(id, obj_type, name, prop))
++    return ret;
++
++  // the current value still needs the object's property list, but one walk of it
++  drmModeObjectPropertiesPtr props = drmModeObjectGetProperties(m_fd, id, obj_type);
+   if (!props)
+   {
+     CLog::Log(LOGERROR, "CAMLDRMUtils::{} - failed to get properties", __FUNCTION__);
+     return ret;
+   }
+ 
+-  for (i = 0; i < props->count_props; i++)
++  for (uint32_t i = 0; i < props->count_props; i++)
+   {
+-    drmModePropertyPtr prop = drmModeGetProperty(m_fd, props->props[i]);
+-
+-    if (!prop)
++    if (props->props[i] != prop.id)
+       continue;
+ 
+-    if (StringUtils::EqualsNoCase(prop->name, name))
++    if (data && data_len && (prop.flags & DRM_MODE_PROP_BLOB))
+     {
+-      if (data && data_len && (prop->flags & DRM_MODE_PROP_BLOB))
+-      {
+-        drmModePropertyBlobPtr blob = drmModeGetPropertyBlob(m_fd, props->prop_values[i]);
+-
+-        if (!blob)
+-        {
+-          CLog::Log(LOGERROR, "CAMLDRMUtils::{} - failed to get blob data for property '{}'",
+-                    __FUNCTION__, prop->name);
+-          drmModeFreeProperty(prop);
+-          break;
+-        }
+-
+-        int copy_len = static_cast<int>(blob->length);
+-        if (copy_len > *data_len)
+-        {
+-          CLog::Log(LOGWARNING,
+-                    "CAMLDRMUtils::{} - blob property '{}' truncated, "
+-                    "blob size: {}, buffer size: {}",
+-                    __FUNCTION__, prop->name, blob->length, *data_len);
+-          copy_len = *data_len;
+-        }
+-
+-        memcpy(data, blob->data, copy_len);
+-        *data_len = static_cast<int>(blob->length);
+-        ret = static_cast<int>(blob->id);
++      drmModePropertyBlobPtr blob = drmModeGetPropertyBlob(m_fd, props->prop_values[i]);
+ 
+-        CLog::Log(LOGDEBUG,
+-                  "CAMLDRMUtils::{} - get blob property '{}', "
+-                  "blob id: {}, length: {}",
+-                  __FUNCTION__, prop->name, blob->id, blob->length);
+-
+-        drmModeFreePropertyBlob(blob);
++      if (!blob)
++      {
++        CLog::Log(LOGERROR, "CAMLDRMUtils::{} - failed to get blob data for property '{}'",
++                  __FUNCTION__, name);
++        break;
+       }
+-      else
++
++      int copy_len = static_cast<int>(blob->length);
++      if (copy_len > *data_len)
+       {
+-        ret = (int)props->prop_values[i];
+-        CLog::Log(LOGDEBUG, LOGWINDOWING, "CAMLDRMUtils::{} - get property '{}', value: {:d}",
+-                  __FUNCTION__, prop->name, ret);
++        CLog::Log(LOGWARNING,
++                  "CAMLDRMUtils::{} - blob property '{}' truncated, "
++                  "blob size: {}, buffer size: {}",
++                  __FUNCTION__, name, blob->length, *data_len);
++        copy_len = *data_len;
+       }
+ 
+-      drmModeFreeProperty(prop);
+-      break;
+-    }
++      memcpy(data, blob->data, copy_len);
++      *data_len = static_cast<int>(blob->length);
++      ret = static_cast<int>(blob->id);
++
++      CLog::Log(LOGDEBUG,
++                "CAMLDRMUtils::{} - get blob property '{}', "
++                "blob id: {}, length: {}",
++                __FUNCTION__, name, blob->id, blob->length);
+ 
+-    drmModeFreeProperty(prop);
++      drmModeFreePropertyBlob(blob);
++    }
++    else
++    {
++      ret = (int)props->prop_values[i];
++      CLog::Log(LOGDEBUG, LOGWINDOWING, "CAMLDRMUtils::{} - get property '{}', value: {:d}",
++                __FUNCTION__, name, ret);
++    }
++    break;
+   }
+ 
+   drmModeFreeObjectProperties(props);
+@@ -763,51 +810,29 @@ bool CAMLDRMUtils::aml_output_wire_stale()
+ }
+ 
+ void CAMLDRMUtils::set_drmProp(unsigned int id, std::string name,
+-  unsigned int obj_type, unsigned int value, drmModeAtomicReqPtr req)
++  unsigned int obj_type, uint64_t value, drmModeAtomicReqPtr req)
+ {
+-  unsigned int i;
+   int res;
+-  drmModeObjectPropertiesPtr props = NULL;
+ 
+   if (!id)
+     return;
+ 
+-  props = drmModeObjectGetProperties(m_fd, id, obj_type);
+-  if (!props)
+-  {
+-    CLog::Log(LOGERROR, "CAMLDRMUtils::{} - failed to get properties", __FUNCTION__);
++  DrmProp prop;
++  if (!find_drmProp(id, obj_type, name, prop))
+     return;
+-  }
+ 
+-  for(i = 0; i < props->count_props; i++)
++  if (req == NULL)
+   {
+-    drmModePropertyPtr prop = drmModeGetProperty(m_fd, props->props[i]);
+-
+-    if (!prop)
+-      continue;
+-
+-    if (StringUtils::EqualsNoCase(prop->name, name))
+-    {
+-      if (req == NULL)
+-      {
+-        if ((res = drmModeObjectSetProperty(m_fd, id, obj_type, props->props[i], value)) != 0)
+-          CLog::Log(LOGERROR, "CAMLDRMUtils::{} - unable to set property '{}', value: {:d}, res: {:d}", __FUNCTION__, prop->name, value, res);
+-      }
+-      else
+-      {
+-        if ((res = drmModeAtomicAddProperty(req, id, props->props[i], value)) < 0)
+-          CLog::Log(LOGERROR, "CAMLDRMUtils::{} - unable to add property '{}', value: {:d}, res: {:d}", __FUNCTION__, prop->name, value, res);
+-      }
+-
+-      CLog::Log(LOGDEBUG, LOGWINDOWING, "CAMLDRMUtils::{} - set property '{}', value: {:d}", __FUNCTION__, prop->name, value);
+-      drmModeFreeProperty(prop);
+-      break;
+-    }
+-
+-    drmModeFreeProperty(prop);
++    if ((res = drmModeObjectSetProperty(m_fd, id, obj_type, prop.id, value)) != 0)
++      CLog::Log(LOGERROR, "CAMLDRMUtils::{} - unable to set property '{}', value: {:d}, res: {:d}", __FUNCTION__, name, value, res);
++  }
++  else
++  {
++    if ((res = drmModeAtomicAddProperty(req, id, prop.id, value)) < 0)
++      CLog::Log(LOGERROR, "CAMLDRMUtils::{} - unable to add property '{}', value: {:d}, res: {:d}", __FUNCTION__, name, value, res);
+   }
+ 
+-  drmModeFreeObjectProperties(props);
++  CLog::Log(LOGDEBUG, LOGWINDOWING, "CAMLDRMUtils::{} - set property '{}', value: {:d}", __FUNCTION__, name, value);
+ }
+ 
+ // get a property
+diff --git a/xbmc/windowing/amlogic/AMLDisplay.h b/xbmc/windowing/amlogic/AMLDisplay.h
+index b8d338ef17..8c48839f26 100644
+--- a/xbmc/windowing/amlogic/AMLDisplay.h
++++ b/xbmc/windowing/amlogic/AMLDisplay.h
+@@ -8,7 +8,10 @@
+ #include <gbm.h>
+ #include <xf86drm.h>
+ #include <xf86drmMode.h>
++#include <map>
+ #include <memory>
++#include <mutex>
++#include <string>
+ #include <unistd.h>
+ #include <utility>
+ #include <vector>
+@@ -128,9 +131,22 @@ private:
+   void apply_dv_wire_format();
+   bool leaving_dv_wire() const;
+   void set_drmProp(unsigned int id, std::string name,
+-    unsigned int obj_type, unsigned int value, drmModeAtomicReqPtr req);
++    unsigned int obj_type, uint64_t value, drmModeAtomicReqPtr req);
+   bool SupportsFormat(drmModePlane *plane, uint32_t format);
++
++  struct DrmProp
++  {
++    uint32_t id;
++    uint32_t flags;
++  };
++  bool find_drmProp(uint32_t obj_id, uint32_t obj_type, const std::string& name, DrmProp& prop);
++  void clear_drmPropCache();
++
+   int m_fd{-1};
++  // property id and flags by lowercase name, per (object id, object type); read once,
++  // see find_drmProp()
++  std::map<std::pair<uint32_t, uint32_t>, std::map<std::string, DrmProp>> m_propCache;
++  std::mutex m_propCacheLock;
+   // The last mode set left the link in a DV tunnel format: TV-led (RGB/444
+   // 8-bit) or player-led/LLDV (YUV422 12-bit). Either one has to be handed back
+   // to the kernel on the way out - see leaving_dv_wire().
+-- 
+2.43.0
+
