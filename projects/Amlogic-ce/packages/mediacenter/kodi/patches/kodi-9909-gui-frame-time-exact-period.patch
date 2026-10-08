@@ -1,0 +1,88 @@
+From: djnice <djnice77@gmail.com>
+Subject: [PATCH] CTimeUtils: advance the GUI frame time by the exact display
+ frame period
+
+UpdateFrameTime stepped the frame time by the period truncated to whole
+milliseconds (16 ms at 60 and 59.94 Hz instead of 16.67), fell behind the
+clock and caught up with a double step on every 24th frame, so every
+continuous GUI animation (a rotating disc on an info screen) jerked 2.5 times
+a second. The exact period is kept now, and each frame takes as many steps as
+display frames have really passed; the frame time trails the clock by half a
+period so jitter in when this runs never adds or drops a step, and a long gap
+(start, stall) resynchronises it.
+
+Measured on S928X with the VPP output read back by VDIN1 (600 frames of a
+rotating disc, video layer hidden): before 25-27 double steps, after none.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ xbmc/utils/TimeUtils.cpp | 41 ++++++++++++++++++++++++++++------------
+ 1 file changed, 29 insertions(+), 12 deletions(-)
+
+diff --git a/xbmc/utils/TimeUtils.cpp b/xbmc/utils/TimeUtils.cpp
+index 649d66c96d..386cb53ca0 100644
+--- a/xbmc/utils/TimeUtils.cpp
++++ b/xbmc/utils/TimeUtils.cpp
+@@ -22,9 +22,14 @@
+ #include <time.h>
+ #endif
+ 
++#include <algorithm>
++#include <cmath>
++
+ namespace
+ {
+ auto startTime = std::chrono::steady_clock::now();
++// frameTime with the fractional part of the display frame period kept
++double frameTimeExact = 0.0;
+ }
+ 
+ int64_t CurrentHostCounter(void)
+@@ -61,20 +66,32 @@ int64_t CurrentHostFrequency(void)
+ 
+ unsigned int CTimeUtils::frameTime = 0;
+ 
++// The frame time advances in whole display frames, so an animation moves by the
++// same amount on every frame. It used to step by the period truncated to whole
++// milliseconds (16 ms at 60 Hz instead of 16.67), fell behind the clock and caught
++// up with a double step on every ~24th frame: a continuous GUI animation (a
++// rotating disc) jerked 2.5 times a second at 60 and 59.94 Hz. Now the exact
++// period is kept and each frame takes as many steps as display frames have
++// really passed - one, or two after a frame missed its vsync. The frame time
++// trails the clock by half a period, so jitter in when this runs never adds or
++// drops a step; a long gap (start, a stall) resynchronises it.
+ void CTimeUtils::UpdateFrameTime(bool flip)
+ {
+-  auto now = std::chrono::steady_clock::now();
+-  auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - startTime);
+-
+-  unsigned int currentTime = duration.count();
+-  unsigned int last = frameTime;
+-  while (frameTime < currentTime)
+-  {
+-    frameTime += (unsigned int)(1000 / CServiceBroker::GetWinSystem()->GetGfxContext().GetFPS());
+-    // observe wrap around
+-    if (frameTime < last)
+-      break;
+-  }
++  const auto now = std::chrono::steady_clock::now();
++  const double currentTime =
++      std::chrono::duration<double, std::milli>(now - startTime).count();
++  const double period =
++      1000.0 / static_cast<double>(CServiceBroker::GetWinSystem()->GetGfxContext().GetFPS());
++
++  const double target = currentTime - period / 2;
++  const double steps = std::round((target - frameTimeExact) / period);
++  if (steps > 8)
++    frameTimeExact = std::max(frameTimeExact, target);
++  else if (steps > 0)
++    frameTimeExact += steps * period;
++
++  // milliseconds wrap around like the old unsigned counter did
++  frameTime = static_cast<unsigned int>(static_cast<uint64_t>(frameTimeExact));
+ }
+ 
+ unsigned int CTimeUtils::GetFrameTime()
+-- 
+2.43.0
+
