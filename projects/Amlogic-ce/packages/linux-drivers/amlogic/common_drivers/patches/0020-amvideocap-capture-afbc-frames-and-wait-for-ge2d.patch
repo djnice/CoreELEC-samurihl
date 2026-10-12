@@ -1,0 +1,868 @@
+From: djnice <djnice@freemail.hu>
+Subject: amvideocap: capture AFBC frames, wait for GE2D, optional HDR to SDR
+
+Video captures through /dev/amvideocap0 came out as garbage or partly
+written on S5:
+
+- The source was the VD1 canvas register, which is not updated for an AFBC
+  frame without double write (the usual HEVC/VP9/AV1 frame) and may already
+  hold the next frame at the frame-end callback. GE2D cannot read AFBC.
+- The GE2D blit was queued without waiting and the result copied out right
+  away, so a large source (4K double write) was cut off.
+
+The frame-end callback runs in the vsync interrupt, so it now only takes a
+copy of the picked vframe and of its linear planes. The conversion runs
+afterwards in the reader's context: the planes go into canvases of our own
+for a blocking GE2D blit, and an AFBC-only frame is first decompressed and
+scaled by VICP into 10-bit 4:4:4 (its 8-bit modes misplace pixel groups).
+The current-frame capture now works while paused and reports -ENODATA with
+the video layer off.
+
+Colour: GE2D converts with the frame's own matrix (BT.2020, BT.709 or BT.601
+from its signal type) instead of always BT.601. An HDR10/HLG source (also the
+Dolby Vision profile 8.1 base layer; told by the signal type when the source
+format is empty) is mapped to SDR by VICP unless AMVIDEOCAP_IOW_SET_WANTFRAME_TONEMAP
+asks to keep its coding; AMVIDEOCAP_IOR_GET_FRAME_TONEMAPPED reports whether
+the last frame was mapped.
+
+vicp: the HDR block is programmed with the rest of the configuration, which
+is only reloaded when the geometry changes; reload it when the HDR mapping
+changes too, else a capture with and one without the mapping in a row both
+got the first one's.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/drivers/media/video_sink/amvideocap.c
++++ b/drivers/media/video_sink/amvideocap.c
+@@ -49,6 +49,9 @@
+ #include <linux/dma-mapping.h>
+ 
+ #include <linux/amlogic/media/codec_mm/codec_mm.h>
++#if IS_ENABLED(CONFIG_AMLOGIC_MEDIA_VICP)
++#include <linux/amlogic/media/vicp/vicp.h>
++#endif
+ 
+ #include "amvideocap_priv.h"
+ #include "video_priv.h"
+@@ -154,12 +157,20 @@
+ 		return -ENOMEM;
+ 	}
+ 	memset(priv, 0, sizeof(struct amvideocap_private));
++	priv->pick = kzalloc(sizeof(*priv->pick), GFP_KERNEL);
++	if (!priv->pick) {
++		kfree(priv);
++		gUNLOCK();
++		pr_err("alloc memory failed for amvideo cap\n");
++		return -ENOMEM;
++	}
+ 	getgctrl()->opened_cnt++;
+ 	gUNLOCK();
+ 	file->private_data = priv;
+ 	priv->phyaddr = getgctrl()->phyaddr;
+ 	priv->vaddr = (u8 *) getgctrl()->vaddr;
+ 	priv->want = getgctrl()->want;
++	priv->want_tonemap = 1;
+ 	priv->src_rect.x = -1;
+ 	priv->src_rect.y = -1;
+ 	priv->src_rect.width = -1;
+@@ -170,6 +181,7 @@
+ static int amvideocap_release(struct inode *inode, struct file *file)
+ {
+ 	struct amvideocap_private *priv = file->private_data;
++	kfree(priv->pick);
+ 	kfree(priv);
+ #ifdef CONFIG_CMA
+ 	if (use_cma && amvideocap_pdev) {
+@@ -217,12 +229,6 @@
+ 	return ret;
+ }
+ 
+-static int amvideocap_capture_put_frame
+-(struct amvideocap_private *priv, struct vframe_s *vf)
+-{
+-	return ext_put_video_frame(vf);
+-}
+-
+ static int amvideocap_get_input_format(struct vframe_s *vf)
+ {
+ 	int format = GE2D_FORMAT_M24_NV21;
+@@ -260,164 +266,203 @@
+ 	return format;
+ }
+ 
+-static ssize_t amvideocap_YUV_to_RGB(
+-	struct amvideocap_private *priv,
+-	u32 cur_index, int w, int h,
+-	struct vframe_s *vf, int outfmt)
++/*
++ * Take the copy of a picked frame. Runs in the vsync interrupt for a capture at
++ * the frame end: no sleeping, the conversion comes later. The linear planes are
++ * recorded here because the canvases they sit in are reused afterwards (the
++ * display rotates its canvases, a decoder reconfigures its own).
++ */
++static void amvideocap_snapshot(struct amvideocap_src *s, struct vframe_s *vf)
++{
++	int i;
++
++	s->vf = *vf;
++	s->nplanes = 0;
++	if (vf->canvas0Addr == (u32)-1) {
++		for (i = 0; i < vf->plane_num && i < 3; i++) {
++			const struct canvas_config_s *c = &vf->canvas0_config[i];
++
++			memset(&s->plane[i], 0, sizeof(s->plane[i]));
++			s->plane[i].addr = c->phy_addr;
++			s->plane[i].width = c->width;
++			s->plane[i].height = c->height;
++			s->plane[i].blkmode = c->block_mode;
++			s->plane[i].endian = c->endian;
++		}
++		s->nplanes = i;
++	} else if (vf->canvas0Addr) {
++		canvas_read(vf->canvas0Addr & 0xff, &s->plane[0]);
++		canvas_read((vf->canvas0Addr >> 8) & 0xff, &s->plane[1]);
++		canvas_read((vf->canvas0Addr >> 16) & 0xff, &s->plane[2]);
++		s->nplanes = 3;
++	}
++	/* a compressed frame without double write has no linear planes */
++}
++
++/*
++ * Limited-range YCbCr -> full-range RGB for the GE2D custom matrix: rows R, G,
++ * B over Y, Cb, Cr, Q10 in 13-bit two's complement; the pre offsets subtract
++ * 16 and 128. (The built-in conversion only knows BT.601.)
++ */
++enum amvideocap_matrix {
++	AMVIDEOCAP_MATRIX_BT601,
++	AMVIDEOCAP_MATRIX_BT709,
++	AMVIDEOCAP_MATRIX_BT2020,
++};
++
++static const struct ge2d_matrix_s amvideocap_matrices[] = {
++	[AMVIDEOCAP_MATRIX_BT601] = {
++		.pre_offset0 = 0x1f0, .pre_offset1 = 0x180, .pre_offset2 = 0x180,
++		.coef0 = 0x4a8, .coef1 = 0,      .coef2 = 0x662,
++		.coef3 = 0x4a8, .coef4 = 0x1e6f, .coef5 = 0x1cc0,
++		.coef6 = 0x4a8, .coef7 = 0x812,  .coef8 = 0,
++		.sat_in_en = 1,
++	},
++	[AMVIDEOCAP_MATRIX_BT709] = {
++		.pre_offset0 = 0x1f0, .pre_offset1 = 0x180, .pre_offset2 = 0x180,
++		.coef0 = 0x4a8, .coef1 = 0,      .coef2 = 0x72c,
++		.coef3 = 0x4a8, .coef4 = 0x1f26, .coef5 = 0x1dde,
++		.coef6 = 0x4a8, .coef7 = 0x873,  .coef8 = 0,
++		.sat_in_en = 1,
++	},
++	[AMVIDEOCAP_MATRIX_BT2020] = {
++		.pre_offset0 = 0x1f0, .pre_offset1 = 0x180, .pre_offset2 = 0x180,
++		.coef0 = 0x4a8, .coef1 = 0,      .coef2 = 0x6b7,
++		.coef3 = 0x4a8, .coef4 = 0x1f40, .coef5 = 0x1d66,
++		.coef6 = 0x4a8, .coef7 = 0x891,  .coef8 = 0,
++		.sat_in_en = 1,
++	},
++};
++
++/* the signal type carries the colour description (bit 24 set) */
++static bool amvideocap_has_colour(struct vframe_s *vf)
+ {
+-	struct config_para_ex_s ge2d_config;
+-	struct canvas_s cs0, cs1, cs2, cd;
+-	int height_after_di;
++	return (vf->signal_type & (1 << 29)) && (vf->signal_type & (1 << 24));
++}
+ 
+-	const char *amvideocap_owner = "amvideocapframe";
+-	int canvas_idx = canvas_pool_map_alloc_canvas(amvideocap_owner);
+-	int y_index = cur_index & 0xff;
+-	int u_index = (cur_index >> 8) & 0xff;
+-	int v_index = (cur_index >> 16) & 0xff;
+-	int input_x, input_y, input_width, input_height, intfmt;
+-	memset(&ge2d_config, 0, sizeof(struct config_para_ex_s));
+-	intfmt = amvideocap_get_input_format(vf);
++/*
++ * HDR10 (also for the Dolby Vision profile 8.1 base layer), HLG or SDR: the
++ * source format when the decoder filled it in, else the transfer of the
++ * signal type (the source format is often left empty on the way to display).
++ */
++static enum vframe_signal_fmt_e amvideocap_frame_hdr(struct vframe_s *vf)
++{
++	switch (get_vframe_src_fmt(vf)) {
++	case VFRAME_SIGNAL_FMT_HDR10:
++	case VFRAME_SIGNAL_FMT_HDR10PLUS:
++	case VFRAME_SIGNAL_FMT_HDR10PRIME:
++	case VFRAME_SIGNAL_FMT_DOVI:
++	case VFRAME_SIGNAL_FMT_DOVI_LL:
++		return VFRAME_SIGNAL_FMT_HDR10;
++	case VFRAME_SIGNAL_FMT_HLG:
++		return VFRAME_SIGNAL_FMT_HLG;
++	default:
++		break;
++	}
++	if (amvideocap_has_colour(vf)) {
++		switch ((vf->signal_type >> 8) & 0xff) {
++		case 16:	/* SMPTE ST 2084 */
++			return VFRAME_SIGNAL_FMT_HDR10;
++		case 18:	/* ARIB STD-B67 */
++			return VFRAME_SIGNAL_FMT_HLG;
++		default:
++			break;
++		}
++	}
++	return VFRAME_SIGNAL_FMT_SDR;
++}
+ 
+-	/* /unsigned long RGB_phy_addr=getgctrl()->phyaddr; */
++/* the matrix a frame was coded with: its signal type, else HDR or size */
++static enum amvideocap_matrix amvideocap_frame_matrix(struct vframe_s *vf)
++{
++	if (amvideocap_has_colour(vf)) {
++		switch (vf->signal_type & 0xff) {
++		case 1:
++			return AMVIDEOCAP_MATRIX_BT709;
++		case 5:
++		case 6:
++			return AMVIDEOCAP_MATRIX_BT601;
++		case 9:
++		case 10:
++			return AMVIDEOCAP_MATRIX_BT2020;
++		default:
++			break;
++		}
++	}
++	if (amvideocap_frame_hdr(vf) != VFRAME_SIGNAL_FMT_SDR ||
++	    get_vframe_src_fmt(vf) == VFRAME_SIGNAL_FMT_SDR_2020)
++		return AMVIDEOCAP_MATRIX_BT2020;
++	return vf->width > 1024 || vf->height > 576 ?
++		AMVIDEOCAP_MATRIX_BT709 : AMVIDEOCAP_MATRIX_BT601;
++}
++
++/*
++ * GE2D: linear YUV planes -> packed RGB w x h at priv->phyaddr. Blocking: the
++ * reader copies the result out right after (the non-blocking variant returned
++ * before the copy was done and a large source came out partly written).
++ */
++static int amvideocap_YUV_to_RGB(struct amvideocap_private *priv,
++				 const struct canvas_s *planes, int nplanes,
++				 int srcfmt, int input_x, int input_y,
++				 int input_width, int input_height,
++				 int w, int h, int outfmt,
++				 enum amvideocap_matrix matrix)
++{
++	struct config_para_ex_s ge2d_config;
++	const char *amvideocap_owner = "amvideocapframe";
++	int canvas_idx, src_idx[3] = { -1, -1, -1 };
++	u32 src_index;
++	int i, ret = -1;
+ 
+ 	if (!priv->phyaddr) {
+ 		pr_err("%s: failed to alloc y addr\n", __func__);
+ 		return -1;
+ 	}
+-	pr_debug("RGB_phy_addr:%x\n", (unsigned int)priv->phyaddr);
+-
+-	if (vf == NULL) {
+-		pr_err("%s: vf is NULL\n", __func__);
++	if (nplanes < 1 || nplanes > 3)
+ 		return -1;
+-	}
+-
+-	canvas_config(canvas_idx, priv->phyaddr,
+-				  w * amvideocap_format_to_byte4pix(outfmt), h,
+-				  CANVAS_ADDR_NOWRAP, CANVAS_BLKMODE_LINEAR);
+-	if (priv->src_rect.x < 0 || priv->src_rect.x > vf->width)
+-		input_x = 0;
+-	else
+-		input_x = priv->src_rect.x;
+-
+-	if (priv->src_rect.y < 0 || priv->src_rect.y > vf->height)
+-		input_y = 0;
+-	else
+-		input_y = priv->src_rect.y;
+-
+-	if (priv->src_rect.width < 0)
+-		input_width = vf->width;
+-	else if ((priv->src_rect.x + priv->src_rect.width) > vf->width) {
+-		input_width =
+-			priv->src_rect.x + priv->src_rect.width - vf->width;
+-	} else
+-		input_width = priv->src_rect.width;
+-
+-	if (priv->src_rect.height < 0)
+-		input_height = vf->height;
+-	else if ((priv->src_rect.y + priv->src_rect.height) > vf->height) {
+-		input_height =
+-			priv->src_rect.y + priv->src_rect.height - vf->height;
+-	} else
+-		input_height = priv->src_rect.height;
+ 
+-	height_after_di = vf->height;
+-	/* nothing todo for multi-di
+-	if (((vf->bitdepth & BITDEPTH_Y10)) &&
+-		((intfmt == GE2D_FORMAT_S16_YUV422) ||
+-		((intfmt == GE2D_FORMAT_S24_YUV444) &&
+-		(cpu_type >= MESON_CPU_MAJOR_ID_TXL)))) {
+-		pr_debug("input_height = %d , vf->type_original = %x\n" ,
+-			input_height, vf->type_original);
+-		if ((vf->source_type == VFRAME_SOURCE_TYPE_HDMI) ||
+-			(vf->source_type == VFRAME_SOURCE_TYPE_CVBS) ||
+-			(vf->source_type == VFRAME_SOURCE_TYPE_TUNER)) {
+-			if (vf->type_original & VIDTYPE_INTERLACE) {
+-				height_after_di = vf->height >> 1;
+-				input_height >>= 1;
+-			} else {
+-				height_after_di = vf->height;
+-			}
+-		} else {
+-			pr_debug("vf->prog_proc_config = %d",
+-				vf->prog_proc_config);
+-			if ((!vf->prog_proc_config) &&
+-				(!(vf->type_original & VIDTYPE_INTERLACE))) {
+-				height_after_di = vf->height;
+-			} else {
+-				height_after_di = vf->height >> 1;
+-				input_height >>= 1;
+-			}
+-		}
+-	} else if (is_meson_g9tv_cpu() || is_meson_gxtvbb_cpu()) {
+-		if (vf->type_original & VIDTYPE_INTERLACE)
+-			input_height = input_height / 2;
+-	} else {
+-		if (intfmt == GE2D_FORMAT_S16_YUV422)
+-			input_height = input_height / 2;
+-	}
+-	*/
++	canvas_idx = canvas_pool_map_alloc_canvas(amvideocap_owner);
++	for (i = 0; i < nplanes; i++)
++		src_idx[i] = canvas_pool_map_alloc_canvas(amvideocap_owner);
++	if (canvas_idx < 0)
++		goto out;
++	for (i = 0; i < nplanes; i++)
++		if (src_idx[i] < 0)
++			goto out;
+ 
+-	if (vf->type & VIDTYPE_MVC)
+-		input_height = vf->left_eye.height;
++	canvas_config(canvas_idx, priv->phyaddr,
++		      w * amvideocap_format_to_byte4pix(outfmt), h,
++		      CANVAS_ADDR_NOWRAP, CANVAS_BLKMODE_LINEAR);
++	for (i = 0; i < nplanes; i++)
++		canvas_config_ex(src_idx[i], planes[i].addr, planes[i].width,
++				 planes[i].height, CANVAS_ADDR_NOWRAP,
++				 planes[i].blkmode, planes[i].endian);
++	src_index = src_idx[0] |
++		    (src_idx[nplanes > 1 ? 1 : 0] << 8) |
++		    (src_idx[nplanes > 2 ? 2 : nplanes - 1] << 16);
+ 
++	memset(&ge2d_config, 0, sizeof(struct config_para_ex_s));
+ 	ge2d_config.alu_const_color = 0;
+ 	ge2d_config.bitmask_en = 0;
+ 	ge2d_config.src1_gb_alpha = 0;
+ 	ge2d_config.dst_xy_swap = 0;
+ 
+-	canvas_read(y_index, &cs0);
+-	canvas_read(u_index, &cs1);
+-	canvas_read(v_index, &cs2);
+-
+-	pr_debug("y_index=[0x%x]  u_index=[0x%x] cur_index:%x\n", y_index,
+-			u_index, cur_index);
+-
+-	ge2d_config.src_planes[0].addr = cs0.addr;
+-	ge2d_config.src_planes[0].w = cs0.width;
+-	ge2d_config.src_planes[0].h = cs0.height;
+-	ge2d_config.src_planes[1].addr = cs1.addr;
+-	ge2d_config.src_planes[1].w = cs1.width;
+-	ge2d_config.src_planes[1].h = cs1.height;
+-	ge2d_config.src_planes[2].addr = cs2.addr;
+-	ge2d_config.src_planes[2].w = cs2.width;
+-	ge2d_config.src_planes[2].h = cs2.height;
+-	pr_debug("w=%d-height=%d cur_index:%x\n",
+-		cs0.width, cs0.height, cur_index);
++	for (i = 0; i < 3; i++) {
++		const struct canvas_s *p = &planes[i < nplanes ? i : nplanes - 1];
++
++		ge2d_config.src_planes[i].addr = p->addr;
++		ge2d_config.src_planes[i].w = p->width;
++		ge2d_config.src_planes[i].h = p->height;
++	}
+ 
+ 	ge2d_config.src_key.key_enable = 0;
+ 	ge2d_config.src_key.key_mask = 0;
+ 	ge2d_config.src_key.key_mode = 0;
+ 	ge2d_config.src_key.key_color = 0;
+ 
+-	ge2d_config.src_para.canvas_index = cur_index;
+-
++	ge2d_config.src_para.canvas_index = src_index;
+ 	ge2d_config.src_para.mem_type = CANVAS_TYPE_INVALID;
+-
+-	if (intfmt == GE2D_FORMAT_S16_YUV422) {
+-		if ((vf->bitdepth & BITDEPTH_Y10) &&
+-			(vf->bitdepth & FULL_PACK_422_MODE)) {
+-			pr_debug("format is yuv422 10bit .\n");
+-			ge2d_config.src_para.format =
+-				GE2D_FORMAT_S16_10BIT_YUV422;
+-		} else if (vf->bitdepth & BITDEPTH_Y10) {
+-			pr_debug("format is yuv422 12bit .\n");
+-			ge2d_config.src_para.format =
+-				GE2D_FORMAT_S16_12BIT_YUV422;
+-		} else {
+-			ge2d_config.src_para.format = intfmt;
+-		}
+-	} else if (intfmt == GE2D_FORMAT_S24_YUV444) {
+-		if (vf->bitdepth & BITDEPTH_Y10) {
+-			pr_debug("format is yuv444 10bit .\n");
+-			ge2d_config.src_para.format =
+-				GE2D_FORMAT_S24_10BIT_YUV444;
+-		} else {
+-			ge2d_config.src_para.format = intfmt;
+-		}
+-	} else {
+-		ge2d_config.src_para.format = intfmt;
+-	}
+-
++	ge2d_config.src_para.format = srcfmt | GE2D_MATRIX_CUSTOM;
+ 	ge2d_config.src_para.fill_color_en = 0;
+ 	ge2d_config.src_para.fill_mode = 0;
+ 	ge2d_config.src_para.x_rev = 0;
+@@ -428,11 +473,9 @@
+ 	ge2d_config.src_para.width = input_width;
+ 	ge2d_config.src_para.height = input_height;
+ 
+-	canvas_read(canvas_idx, &cd);
+-	pr_debug("cd.addr:%x\n", (unsigned int)cd.addr);
+-	ge2d_config.dst_planes[0].addr = cd.addr;
+-	ge2d_config.dst_planes[0].w = cd.width;
+-	ge2d_config.dst_planes[0].h = cd.height;
++	ge2d_config.dst_planes[0].addr = priv->phyaddr;
++	ge2d_config.dst_planes[0].w = w * amvideocap_format_to_byte4pix(outfmt);
++	ge2d_config.dst_planes[0].h = h;
+ 
+ 	ge2d_config.dst_para.canvas_index = canvas_idx;
+ 	ge2d_config.dst_para.mem_type = CANVAS_TYPE_INVALID;
+@@ -452,71 +495,204 @@
+ 
+ 	if (ge2d_context_config_ex(ge2d_amvideocap_context, &ge2d_config) < 0) {
+ 		pr_err("++ge2d configuration error.\n");
+-		return -1;
++		goto out;
+ 	}
++	/* taken over when the blit is queued */
++	ge2d_amvideocap_context->config.matrix_custom = amvideocap_matrices[matrix];
+ 
+-	stretchblt_noalpha_noblk(ge2d_amvideocap_context,
+-					   0,
+-					   0,
+-					   ge2d_config.src_para.width,
+-					   ge2d_config.src_para.height,
+-					   0,
+-					   0,
+-					   ge2d_config.dst_para.width,
+-					   ge2d_config.dst_para.height);
+-	if (canvas_idx)
++	stretchblt_noalpha(ge2d_amvideocap_context,
++			   0, 0, input_width, input_height,
++			   0, 0, w, h);
++	ret = 0;
++out:
++	for (i = 0; i < 3; i++)
++		if (src_idx[i] >= 0)
++			canvas_pool_map_free_canvas(src_idx[i]);
++	if (canvas_idx >= 0)
+ 		canvas_pool_map_free_canvas(canvas_idx);
++	return ret;
++}
++
++/* a frame with linear planes (no compression, or double write) */
++static int amvideocap_linear_to_RGB(struct amvideocap_private *priv,
++				    struct amvideocap_src *s,
++				    int w, int h, int outfmt)
++{
++	struct vframe_s *vf = &s->vf;
++	int input_x, input_y, input_width, input_height, intfmt, srcfmt;
++
++	intfmt = amvideocap_get_input_format(vf);
++
++	if (priv->src_rect.x < 0 || priv->src_rect.x > vf->width)
++		input_x = 0;
++	else
++		input_x = priv->src_rect.x;
++
++	if (priv->src_rect.y < 0 || priv->src_rect.y > vf->height)
++		input_y = 0;
++	else
++		input_y = priv->src_rect.y;
++
++	if (priv->src_rect.width < 0)
++		input_width = vf->width;
++	else if ((priv->src_rect.x + priv->src_rect.width) > vf->width)
++		input_width =
++			priv->src_rect.x + priv->src_rect.width - vf->width;
++	else
++		input_width = priv->src_rect.width;
++
++	if (priv->src_rect.height < 0)
++		input_height = vf->height;
++	else if ((priv->src_rect.y + priv->src_rect.height) > vf->height)
++		input_height =
++			priv->src_rect.y + priv->src_rect.height - vf->height;
++	else
++		input_height = priv->src_rect.height;
++
++	if (vf->type & VIDTYPE_MVC)
++		input_height = vf->left_eye.height;
++
++	if (intfmt == GE2D_FORMAT_S16_YUV422) {
++		if ((vf->bitdepth & BITDEPTH_Y10) &&
++		    (vf->bitdepth & FULL_PACK_422_MODE))
++			srcfmt = GE2D_FORMAT_S16_10BIT_YUV422;
++		else if (vf->bitdepth & BITDEPTH_Y10)
++			srcfmt = GE2D_FORMAT_S16_12BIT_YUV422;
++		else
++			srcfmt = intfmt;
++	} else if (intfmt == GE2D_FORMAT_S24_YUV444) {
++		if (vf->bitdepth & BITDEPTH_Y10)
++			srcfmt = GE2D_FORMAT_S24_10BIT_YUV444;
++		else
++			srcfmt = intfmt;
++	} else {
++		srcfmt = intfmt;
++	}
+ 
++	priv->out_tonemapped = 0;
++	return amvideocap_YUV_to_RGB(priv, s->plane, s->nplanes, srcfmt,
++				     input_x, input_y, input_width,
++				     input_height, w, h, outfmt,
++				     amvideocap_frame_matrix(vf));
++}
++
++#if IS_ENABLED(CONFIG_AMLOGIC_MEDIA_VICP)
++/*
++ * The VICP write MIF derives its line stride from the background width
++ * assuming 30 bits per pixel, but writes 32 bits per pixel in 10-bit 4:4:4
++ * mode: pick the background width whose stride is exactly 4 * w.
++ */
++static u32 amvideocap_vicp_bg_width(u32 w)
++{
++	u32 bw;
++
++	for (bw = w; bw <= w * 2; bw++)
++		if (ALIGN(DIV_ROUND_UP(bw * 30, 128) * 16, 64) == w * 4)
++			return bw;
+ 	return 0;
+ }
+ 
+-static int amvideocap_capture_one_frame_l(
+-		struct amvideocap_private *priv,
+-		int curindex, int w, int h,
+-		struct vframe_s *vf, int outge2dfmt)
+-{
++/*
++ * A compressed frame without double write (the usual HEVC/VP9/AV1 frame):
++ * GE2D cannot read AFBC, so VICP decompresses and scales it first, into
++ * 10-bit 4:4:4 (one 32-bit word per pixel; its 8-bit modes come out with
++ * misplaced pixel groups). VICP also maps an HDR10/HLG source to SDR.
++ */
++static int amvideocap_afbc_to_RGB(struct amvideocap_private *priv,
++				  struct amvideocap_src *s,
++				  int w, int h, int outfmt)
++{
++	struct vicp_data_config_s cfg;
++	struct vframe_s *vf = &s->vf;
++	struct canvas_s plane;
++	enum vframe_signal_fmt_e fmt;
++	enum amvideocap_matrix matrix;
++	bool mapped;
++	u32 bw, size;
++	ulong buf;
+ 	int ret;
+-	/* TODO: mod gate */
+-	/* switch_mod_gate_by_name("ge2d", 1); */
+-	ret = amvideocap_YUV_to_RGB(priv, curindex, w, h, vf, outge2dfmt);
+-	/* TODO: mod gate */
+-	/* switch_mod_gate_by_name("ge2d", 0); */
++
++	bw = amvideocap_vicp_bg_width(w);
++	if (!bw)
++		return -EINVAL;
++	size = PAGE_ALIGN(w * 4 * h);
++	buf = codec_mm_alloc_for_dma(DRIVER_NAME, size / PAGE_SIZE,
++				     4 + PAGE_SHIFT, CODEC_MM_FLAGS_DMA);
++	if (!buf) {
++		pr_err("%s: no memory for %dx%d\n", __func__, w, h);
++		return -ENOMEM;
++	}
++
++	fmt = amvideocap_frame_hdr(vf);
++	mapped = priv->want_tonemap && fmt != VFRAME_SIGNAL_FMT_SDR;
++	matrix = mapped ? AMVIDEOCAP_MATRIX_BT709 : amvideocap_frame_matrix(vf);
++	/* VICP maps a source whose format says HDR, and leaves any other alone */
++	vf->src_fmt.sei_magic_code = mapped ? SEI_MAGIC_CODE : 0;
++	vf->src_fmt.fmt = mapped ? fmt : VFRAME_SIGNAL_FMT_INVALID;
++
++	memset(&cfg, 0, sizeof(cfg));
++	cfg.input_data.is_vframe = true;
++	cfg.input_data.data_vf = vf;	/* the copy: VICP may change its flags */
++	cfg.output_data.phy_addr[0] = buf;
++	cfg.output_data.width = bw;
++	cfg.output_data.height = h;
++	cfg.output_data.endian = 1;
++	cfg.output_data.mif_out_en = 1;
++	cfg.output_data.mif_color_fmt = VICP_COLOR_FORMAT_YUV444;
++	cfg.output_data.mif_color_dep = 10;
++	cfg.output_data.fbc_out_en = 0;
++	cfg.output_data.fbc_color_fmt = VICP_COLOR_FORMAT_YUV420;
++	cfg.output_data.fbc_color_dep = 10;
++	cfg.output_data.out_sig_fmt = VFRAME_SIGNAL_FMT_SDR;
++	cfg.data_option.rotation_mode = VICP_ROTATION_0;
++	cfg.data_option.output_axis.width = w;
++	cfg.data_option.output_axis.height = h;
++	ret = vicp_process(&cfg);
++	priv->out_tonemapped = !ret && mapped;
++	if (!ret) {
++		memset(&plane, 0, sizeof(plane));
++		plane.addr = buf;
++		plane.width = w * 4;
++		plane.height = h;
++		ret = amvideocap_YUV_to_RGB(priv, &plane, 1,
++					    GE2D_FORMAT_S24_10BIT_YUV444,
++					    0, 0, w, h, w, h, outfmt, matrix);
++	} else {
++		pr_err("%s: vicp failed %d\n", __func__, ret);
++	}
++	codec_mm_free_for_dma(DRIVER_NAME, buf);
+ 	return ret;
+ }
++#endif
+ 
+-static int amvideocap_capture_one_frame(
+-	struct amvideocap_private *priv,
+-	struct vframe_s *vfput, int index)
+-{
+-	int w, h, ge2dfmt;
+-	int curindex;
+-	struct vframe_s *vf = vfput;
+-	int ret = 0;
+-	pr_debug("%s:start vf=%p,index=%x\n", __func__, vf, index);
+-	if (!vf)
+-		ret = amvideocap_capture_get_frame(priv, &vf, &curindex);
+-	else
+-		curindex = index;
+-	if (ret < 0 || !vf)
+-		return -EAGAIN;
+-	pr_debug("%s: get vf type=%x\n", __func__, vf->type);
++/* convert the picked frame (priv->pick) into priv->vaddr, blocking */
++static int amvideocap_convert(struct amvideocap_private *priv)
++{
++	struct amvideocap_src *s = priv->pick;
++	struct vframe_s *vf = &s->vf;
++	int w, h, ret = -EINVAL;
+ 
+ #define CHECK_AND_SETVAL(want, def) ((want) > 0 ? (want) : (def))
+-	ge2dfmt = CHECK_AND_SETVAL(priv->want.fmt, vf->type);
+ 	w = CHECK_AND_SETVAL(priv->want.width, vf->width);
+ 	h = CHECK_AND_SETVAL(priv->want.height, vf->height);
+ #undef	CHECK_AND_SETVAL
+ 
+ 	w = (w < CAP_WIDTH_MAX) ? w : CAP_WIDTH_MAX;
+ 	h = (h < CAP_HEIGHT_MAX) ? h : CAP_HEIGHT_MAX;
+-
+-	ret = amvideocap_capture_one_frame_l(priv, curindex, w, h, vf,
+-						priv->want.fmt);
+-	amvideocap_capture_put_frame(priv, vf);
++	/* whole 16-pixel groups: the RGB rows and the VICP lines stay aligned */
++	w &= ~15;
++	h &= ~1;
++
++	if (w < 16 || h < 2)
++		ret = -EINVAL;
++	else if (s->nplanes)
++		ret = amvideocap_linear_to_RGB(priv, s, w, h, priv->want.fmt);
++#if IS_ENABLED(CONFIG_AMLOGIC_MEDIA_VICP)
++	else if (vf->type & VIDTYPE_COMPRESS)
++		ret = amvideocap_afbc_to_RGB(priv, s, w, h, priv->want.fmt);
++#endif
+ 
+ 	if (!ret) {
+-		pr_debug("%s: capture ok priv->want.fmt=%d\n", __func__,
+-				priv->want.fmt);
+ 		priv->state = AMVIDEOCAP_STATE_FINISHED_CAPTURE;
+ 		priv->src.width = vf->width;
+ 		priv->src.height = vf->height;
+@@ -527,12 +703,24 @@
+ 		priv->out.width_aligned = priv->out.width;
+ 		priv->out.byte_per_pix = amvideocap_format_to_byte4pix(
+ 			priv->out.fmt);	/* RGBn */
+-	} else
++	} else {
+ 		priv->state = AMVIDEOCAP_STATE_ERROR;
+-	pr_debug("amvideocap_capture_one_frame priv->state=%d\n", priv->state);
++	}
++	pr_debug("%s: ret=%d state=%d\n", __func__, ret, priv->state);
+ 	return ret;
+ }
+ 
++/* frame-end callback, in the vsync interrupt: only pick the frame */
++static int amvideocap_capture_one_frame(struct amvideocap_private *priv,
++					struct vframe_s *vfput, int index)
++{
++	if (!vfput)
++		return -EAGAIN;
++	amvideocap_snapshot(priv->pick, vfput);
++	priv->pick_ready = 1;
++	return 0;
++}
++
+ static int amvideocap_capture_one_frame_wait(
+ 		struct amvideocap_private *priv,
+ 		int waitms)
+@@ -542,6 +730,7 @@
+ 	struct amvideocap_req_data reqdata;
+ 	struct amvideocap_req req;
+ 	priv->state = AMVIDEOCAP_STATE_ON_CAPTURE;
++	priv->pick_ready = 0;
+ 
+ 	if (priv->want.at_flags == CAP_FLAG_AT_END) {
+ 		do {
+@@ -549,7 +738,8 @@
+ 				usleep_range(3000, 5000);
+ 			ret = ext_register_end_frame_callback(NULL);
+ 
+-			if (ret == 0 && priv->state == AMVIDEOCAP_STATE_ON_CAPTURE) {
++			if (ret == 0 && priv->state == AMVIDEOCAP_STATE_ON_CAPTURE &&
++			    !priv->pick_ready) {
+ 				reqdata.privdata = priv;
+ 				req.callback = amvideocap_capture_one_frame;
+ 				req.data = (unsigned long)&reqdata;
+@@ -566,10 +756,28 @@
+ 		}
+ 
+ 		if (ret == 0)
+-			ret = (priv->state == AMVIDEOCAP_STATE_FINISHED_CAPTURE) ? 0 : -EAGAIN;
++			ret = priv->pick_ready ? 0 : -EAGAIN;
++	} else {
++		struct vframe_s *vf = NULL;
++		int index;
++
++		/* probe only: -ENODATA when the video layer is off */
++		ret = ext_register_end_frame_callback(NULL);
++		if (ret != -ENODATA) {
++			ret = amvideocap_capture_get_frame(priv, &vf, &index);
++			if (ret < 0 || !vf) {
++				ret = -EAGAIN;
++			} else {
++				amvideocap_snapshot(priv->pick, vf);
++				priv->pick_ready = 1;
++			}
++		}
+ 	}
+-	else
+-		ret = amvideocap_capture_one_frame(priv, NULL, 0);
++
++	if (ret == 0)
++		ret = amvideocap_convert(priv);
++	else if (priv->state == AMVIDEOCAP_STATE_ON_CAPTURE)
++		priv->state = AMVIDEOCAP_STATE_ERROR;
+ 
+ 	pr_debug("amvideocap_capture_one_frame ret=%d\n",
+ 			ret);
+@@ -603,6 +811,16 @@
+ 		priv->want.at_flags = arg;
+ 		break;
+ 	}
++	case AMVIDEOCAP_IOW_SET_WANTFRAME_TONEMAP: {
++		priv->want_tonemap = !!arg;
++		break;
++	}
++	case AMVIDEOCAP_IOR_GET_FRAME_TONEMAPPED: {
++		if (copy_to_user((void *)arg, (void *)&priv->out_tonemapped,
++				 sizeof(priv->out_tonemapped)))
++			ret = -EFAULT;
++		break;
++	}
+ 	case AMVIDEOCAP_IOR_GET_FRAME_FORMAT: {
+ 		if (copy_to_user
+ 			((void *)arg, (void *)&priv->out.fmt,
+--- a/drivers/media/video_sink/amvideocap_priv.h
++++ b/drivers/media/video_sink/amvideocap_priv.h
+@@ -7,6 +7,7 @@
+ #define AMVIDEOCAP_PRIV_HHH
+ #include <linux/amlogic/media/video_sink/amvideocap.h>
+ #include <linux/amlogic/media/vfm/vframe.h>
++#include <linux/amlogic/media/canvas/canvas.h>
+ 
+ struct video_frame_info {
+ 	int at_flags;
+@@ -25,6 +26,18 @@
+ 	int height;
+ };
+ 
++/*
++ * The picked frame: a copy of its vframe and of its linear planes (none for a
++ * compressed-only frame), taken when the frame is picked. The frame-end
++ * callback runs in the vsync interrupt, so it only takes this copy and the
++ * conversion runs afterwards, blocking, in the reader's context.
++ */
++struct amvideocap_src {
++	struct vframe_s vf;
++	struct canvas_s plane[3];
++	int nplanes;
++};
++
+ struct amvideocap_private {
+ 	int flags;
+ 	int buf_size;
+@@ -38,6 +51,11 @@
+ 	struct video_frame_info want;
+ 	struct video_frame_info out;
+ 	struct src_cap_rect src_rect;
++
++	struct amvideocap_src *pick;
++	int pick_ready;
++	int want_tonemap;	/* map an HDR source to SDR */
++	int out_tonemapped;	/* the last frame was mapped */
+ };
+ 
+ struct amvideocap_req_data {
+--- a/include/linux/amlogic/media/video_sink/amvideocap.h
++++ b/include/linux/amlogic/media/video_sink/amvideocap.h
+@@ -24,11 +24,15 @@
+ #define AMVIDEOCAP_IOW_SET_WANTFRAME_TIMESTAMP_MS _IOW((AC_MAGIC), 0x04, u64)
+ #define AMVIDEOCAP_IOW_SET_WANTFRAME_WAIT_MAX_MS _IOW((AC_MAGIC), 0x05, u64)
+ #define AMVIDEOCAP_IOW_SET_WANTFRAME_AT_FLAGS	_IOW((AC_MAGIC), 0x06, int)
++/* 1 (default): map an HDR source to SDR when possible; 0: keep its coding */
++#define AMVIDEOCAP_IOW_SET_WANTFRAME_TONEMAP	_IOW((AC_MAGIC), 0x07, int)
+ 
+ #define AMVIDEOCAP_IOR_GET_FRAME_FORMAT	_IOR((AC_MAGIC), 0x10, int)
+ #define AMVIDEOCAP_IOR_GET_FRAME_WIDTH	_IOR((AC_MAGIC), 0x11, int)
+ #define AMVIDEOCAP_IOR_GET_FRAME_HEIGHT	_IOR((AC_MAGIC), 0x12, int)
+ #define AMVIDEOCAP_IOR_GET_FRAME_TIMESTAMP_MS	_IOR((AC_MAGIC), 0x13, int)
++/* 1 when the last frame was mapped from HDR to SDR (BT.709) */
++#define AMVIDEOCAP_IOR_GET_FRAME_TONEMAPPED	_IOR((AC_MAGIC), 0x14, int)
+ 
+ #define AMVIDEOCAP_IOR_GET_SRCFRAME_FORMAT	_IOR((AC_MAGIC), 0x20, int)
+ #define AMVIDEOCAP_IOR_GET_SRCFRAME_WIDTH	_IOR((AC_MAGIC), 0x21, int)
+--- a/drivers/media/common/vicp/vicp_process.c
++++ b/drivers/media/common/vicp/vicp_process.c
+@@ -34,6 +34,8 @@
+ static u32 last_output_w, last_output_h, last_output_fbcfmt, last_output_miffmt;
+ static u32 last_fbcoutput_en, last_mifoutput_en;
+ static u32 last_output_begin_v, last_output_begin_h, last_output_end_v, last_output_end_h;
++/* the HDR block is programmed with the rest: a change must reload it too */
++static int last_hdr_in_fmt = -1;
+ static struct vicp_device_data_s vicp_dev;
+ static u32 dump_reg_start, dump_reg_end;
+ 
+@@ -2431,8 +2433,12 @@
+ 			last_output_begin_v != vid_cmpr_top->out_win_bgn_v ||
+ 			last_output_end_v != vid_cmpr_top->out_win_end_v ||
+ 			last_output_begin_h != vid_cmpr_top->out_win_bgn_h ||
+-			last_output_end_h != vid_cmpr_top->out_win_end_h) {
++			last_output_end_h != vid_cmpr_top->out_win_end_h ||
++			last_hdr_in_fmt != (vid_cmpr_top->hdr_config.hdr2_en ?
++				(int)vid_cmpr_top->hdr_config.input_sig_fmt : -1)) {
+ 			is_need_update_all = true;
++			last_hdr_in_fmt = vid_cmpr_top->hdr_config.hdr2_en ?
++				(int)vid_cmpr_top->hdr_config.input_sig_fmt : -1;
+ 			last_input_w = vid_cmpr_top->src_hsize;
+ 			last_input_h = vid_cmpr_top->src_vsize;
+ 			last_input_fmt = vid_cmpr_top->src_fmt_mode;
