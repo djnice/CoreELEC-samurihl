@@ -1,0 +1,501 @@
+From e1e3cdb2312577f136d6867edf22fc228f800cf9 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Mon, 12 Oct 2026 10:00:21 +0200
+Subject: [PATCH] Thumbnails: Dolby Vision profile 5 and bookmarks on Amlogic
+
+Chapter / video thumbnails of a Dolby Vision profile 5 file were green and
+purple: its base layer is IPT-PQ-c2, not BT.2020 YCbCr. The software decoder
+now hands the frame's AVDOVIMetadata to the picture, and PictureToTexture
+rebuilds profile 5 (BL compatibility id 0) like libplacebo: reshaping
+(polynomial / MMR), the RPU's ycc_to_rgb matrix, PQ EOTF, rgb_to_lms and the
+ICtCp LMS -> BT.2020 matrix into PQ RGB48 tagged with the L1 max, then the
+usual sws_scale_frame perceptual tonemap.
+
+User bookmarks got only a placeholder where the renderer cannot capture the
+video (Amlogic: own plane, no readback): the capture callback now falls back
+to decoding the bookmarked picture from the file (ExtractThumbToTexture with
+a time, decoding on from the keyframe to that time).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../DVDCodecs/Video/DVDVideoCodec.cpp         |   1 +
+ .../DVDCodecs/Video/DVDVideoCodec.h           |   5 +
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp   |   4 +
+ xbmc/cores/VideoPlayer/DVDFileInfo.cpp        | 288 ++++++++++++++++--
+ xbmc/cores/VideoPlayer/DVDFileInfo.h          |   9 +-
+ .../video/dialogs/GUIDialogVideoBookmarks.cpp |  19 +-
+ 6 files changed, 297 insertions(+), 29 deletions(-)
+
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp
+index 59388e3940..429d544b10 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp
+@@ -51,6 +51,7 @@ void VideoPicture::Reset()
+   pict_type = 0;
+ 
+   hdrType = StreamHdrType::HDR_TYPE_NONE;
++  doviMetadata.reset();
+ 
+   hasDisplayMetadata = false;
+   hasLightMetadata = false;
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h
+index e5e23d6c70..a9e6783bcc 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h
+@@ -18,6 +18,8 @@ extern "C" {
+ #include <libavutil/mastering_display_metadata.h>
+ }
+ 
++#include <cstdint>
++#include <memory>
+ #include <vector>
+ #include <string>
+ #include <map>
+@@ -70,6 +72,9 @@ public:
+   StreamHdrType hdrType;
+   StreamHdrType hdrTypeAlt;
+   std::string strDVELType;
++  //! the frame's AVDOVIMetadata blob (self-contained, offsets inside), set by the software decoder
++  //! for Dolby Vision; the thumbnail extractor rebuilds profile 5 pictures from it
++  std::shared_ptr<const std::vector<uint8_t>> doviMetadata;
+ 
+   bool hasDisplayMetadata = false;
+   AVMasteringDisplayMetadata displayMetadata;
+diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+index a7d4d30386..f484c4d5ac 100644
+--- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
++++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
+@@ -1152,11 +1152,15 @@ bool CDVDVideoCodecFFmpeg::GetPictureCommon(VideoPicture* pVideoPicture)
+     pVideoPicture->hasLightMetadata = true;
+   }
+ 
++  pVideoPicture->doviMetadata.reset();
+   if (pVideoPicture->hdrType == StreamHdrType::HDR_TYPE_DOLBYVISION)
+   {
+     sd = av_frame_get_side_data(m_pFrame, AV_FRAME_DATA_DOVI_METADATA);
+     if (sd)
+     {
++      // kept for the thumbnail extractor (profile 5 has no displayable base layer)
++      pVideoPicture->doviMetadata =
++          std::make_shared<const std::vector<uint8_t>>(sd->data, sd->data + sd->size);
+       AVDOVIMetadata* dovi = (AVDOVIMetadata*)sd->data;
+       const AVDOVIRpuDataHeader* hdr = av_dovi_get_header(dovi);
+       const AVDOVIDataMapping* mapping = av_dovi_get_mapping(dovi);
+diff --git a/xbmc/cores/VideoPlayer/DVDFileInfo.cpp b/xbmc/cores/VideoPlayer/DVDFileInfo.cpp
+index c6af78ae26..ae71ee3e85 100644
+--- a/xbmc/cores/VideoPlayer/DVDFileInfo.cpp
++++ b/xbmc/cores/VideoPlayer/DVDFileInfo.cpp
+@@ -44,6 +44,8 @@
+ #include "cores/FFmpeg.h"
+ #include "filesystem/File.h"
+ 
++#include <algorithm>
++#include <cmath>
+ #include <cstdlib>
+ #include <memory>
+ #include <string>
+@@ -51,6 +53,7 @@
+ extern "C" {
+ #include <libavcodec/avcodec.h>
+ #include <libavformat/avformat.h>
++#include <libavutil/dovi_meta.h>
+ #include <libavutil/mastering_display_metadata.h>
+ #include <libswscale/swscale.h>
+ }
+@@ -148,6 +151,214 @@ bool CDVDFileInfo::SeekAndDecodeFirstPicture(CDVDDemux& demuxer,
+ 
+ namespace
+ {
++/*! After SeekAndDecodeFirstPicture (the keyframe before the time): decode on until the picture
++ * at seekTo_ms, so a bookmark thumbnail shows the bookmarked moment. Bounded by packets and time;
++ * keeps the last good picture. */
++void DecodeOnToTime(CDVDDemux& demuxer,
++                    CDVDVideoCodec& codec,
++                    int videoStream,
++                    int64_t seekTo_ms,
++                    VideoPicture& picture,
++                    int& packetsTried)
++{
++  const double target = static_cast<double>(seekTo_ms) * DVD_TIME_BASE / 1000.0;
++  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
++  for (int packets = 0; packets < 600; packets++)
++  {
++    if (picture.pts == DVD_NOPTS_VALUE || picture.pts >= target - DVD_TIME_BASE / 50.0 ||
++        std::chrono::steady_clock::now() > deadline)
++      return;
++    DemuxPacket* pPacket = demuxer.Read();
++    packetsTried++;
++    if (!pPacket)
++      return;
++    if (pPacket->iStreamId != videoStream || pPacket->isELPackage)
++    {
++      CDVDDemuxUtils::FreeDemuxPacket(pPacket);
++      continue;
++    }
++    codec.AddData(*pPacket);
++    CDVDDemuxUtils::FreeDemuxPacket(pPacket);
++
++    VideoPicture next = {};
++    CDVDVideoCodec::VCReturn state = CDVDVideoCodec::VC_NONE;
++    while (state == CDVDVideoCodec::VC_NONE)
++      state = codec.GetPicture(&next);
++    if (state == CDVDVideoCodec::VC_PICTURE && !(next.iFlags & DVP_FLAG_DROPPED))
++      picture.CopyRef(next);
++  }
++}
++
++/* Dolby Vision profile 5: the base layer is IPT-PQ-c2, not BT.2020 YCbCr, so without the RPU it
++ * decodes to a green/purple picture. Rebuild it like libplacebo does (pl_shader_dovi_reshape +
++ * pl_shader_decode_color): per component reshaping (polynomial or MMR) of the normalized BL, the
++ * RPU's ycc_to_rgb matrix (-> L'M'S', PQ), PQ EOTF, the RPU's rgb_to_lms matrix and the ICtCp
++ * LMS -> BT.2020 RGB matrix, PQ OETF. The result is a PQ BT.2020 RGB48 frame at the thumbnail size
++ * (box-averaged samples), tagged with the frame's L1 max as mastering peak, which then takes the
++ * same sws_scale_frame tonemap as any HDR10 picture. */
++double PqEotf(double e) // PQ signal -> linear, 1.0 = 10000 nits
++{
++  constexpr double m1 = 2610.0 / 16384, m2 = 2523.0 / 4096 * 128, c1 = 3424.0 / 4096,
++                   c2 = 2413.0 / 4096 * 32, c3 = 2392.0 / 4096 * 32;
++  if (e <= 0)
++    return 0;
++  const double p = std::pow(e, 1 / m2);
++  return std::pow(std::max(p - c1, 0.0) / (c2 - c3 * p), 1 / m1);
++}
++
++double PqOetf(double y)
++{
++  constexpr double m1 = 2610.0 / 16384, m2 = 2523.0 / 4096 * 128, c1 = 3424.0 / 4096,
++                   c2 = 2413.0 / 4096 * 32, c3 = 2392.0 / 4096 * 32;
++  if (y <= 0)
++    return 0;
++  const double p = std::pow(y, m1);
++  return std::pow((c1 + c2 * p) / (1 + c3 * p), m2);
++}
++
++double DoviReshape(const AVDOVIReshapingCurve& c,
++                   int comp,
++                   const double s3[3],
++                   double coefScale,
++                   double pivotScale)
++{
++  const double lo = c.pivots[0] * pivotScale;
++  const double hi = c.pivots[c.num_pivots - 1] * pivotScale;
++  const double s = std::clamp(s3[comp], lo, hi);
++  int i = 0;
++  while (i < c.num_pivots - 2 && s >= c.pivots[i + 1] * pivotScale)
++    i++;
++  double r = 0;
++  if (c.mapping_idc[i] == AV_DOVI_MAPPING_POLYNOMIAL)
++  {
++    for (int k = c.poly_order[i]; k >= 0; k--)
++      r = r * s + c.poly_coef[i][k] * coefScale;
++  }
++  else
++  {
++    // MMR: constant + per order the 3 components and their 4 cross products, to the order's power
++    const double x[7] = {s3[0],         s3[1],         s3[2], s3[0] * s3[1], s3[0] * s3[2],
++                         s3[1] * s3[2], s3[0] * s3[1] * s3[2]};
++    r = c.mmr_constant[i] * coefScale;
++    for (int o = 0; o < c.mmr_order[i]; o++)
++      for (int k = 0; k < 7; k++)
++        r += c.mmr_coef[i][o][k] * coefScale * std::pow(x[k], o + 1);
++  }
++  return std::clamp(r, 0.0, 1.0);
++}
++
++AVFrame* DoviProfile5ToPQ(const VideoPicture& picture,
++                          uint8_t* const planes[],
++                          const int strides[],
++                          unsigned int width,
++                          unsigned int height)
++{
++  const AVPixelFormat format = picture.videoBuffer->GetFormat();
++  const int depth =
++      format == AV_PIX_FMT_YUV420P10 ? 10 : (format == AV_PIX_FMT_YUV420P ? 8 : 0);
++  if (!depth || !picture.doviMetadata || !width || !height)
++    return nullptr;
++  const auto* md = reinterpret_cast<const AVDOVIMetadata*>(picture.doviMetadata->data());
++  const AVDOVIRpuDataHeader* hdr = av_dovi_get_header(md);
++  const AVDOVIDataMapping* map = av_dovi_get_mapping(md);
++  const AVDOVIColorMetadata* col = av_dovi_get_color(md);
++
++  const double vmax = (1 << depth) - 1;
++  const double coefScale = 1.0 / static_cast<double>(1LL << hdr->coef_log2_denom);
++  const double pivotScale = 1.0 / ((1 << hdr->bl_bit_depth) - 1);
++  // ICtCp's LMS -> BT.2020 RGB (libplacebo pl_ipt_lms2rgb), applied after the RPU's linear matrix
++  static constexpr double lms2rgb[9] = {3.43661,  -2.50645, 0.06984,  -0.79133, 1.98360,
++                                        -0.19227, -0.02595, -0.09891, 1.12486};
++  double lin[9], m[9], nl[9], off[3];
++  for (int i = 0; i < 9; i++)
++  {
++    lin[i] = av_q2d(col->rgb_to_lms_matrix[i]);
++    nl[i] = av_q2d(col->ycc_to_rgb_matrix[i]);
++  }
++  for (int i = 0; i < 3; i++)
++    off[i] = av_q2d(col->ycc_to_rgb_offset[i]);
++  for (int r = 0; r < 3; r++)
++    for (int c = 0; c < 3; c++)
++      m[r * 3 + c] = lms2rgb[r * 3 + 0] * lin[0 * 3 + c] + lms2rgb[r * 3 + 1] * lin[1 * 3 + c] +
++                     lms2rgb[r * 3 + 2] * lin[2 * 3 + c];
++
++  AVFrame* dst = av_frame_alloc();
++  if (!dst)
++    return nullptr;
++  dst->width = static_cast<int>(width);
++  dst->height = static_cast<int>(height);
++  dst->format = AV_PIX_FMT_RGB48;
++  if (av_frame_get_buffer(dst, 0) < 0)
++  {
++    av_frame_free(&dst);
++    return nullptr;
++  }
++  dst->colorspace = AVCOL_SPC_RGB;
++  dst->color_range = AVCOL_RANGE_JPEG;
++  dst->color_primaries = AVCOL_PRI_BT2020;
++  dst->color_trc = AVCOL_TRC_SMPTE2084;
++
++  const int srcW = static_cast<int>(picture.iWidth), srcH = static_cast<int>(picture.iHeight);
++  const int bw = std::max(srcW / static_cast<int>(width), 1);
++  const int bh = std::max(srcH / static_cast<int>(height), 1);
++  auto sample = [&](int p, int x, int y) -> double
++  {
++    const uint8_t* row = planes[p] + static_cast<size_t>(y) * strides[p];
++    return depth > 8 ? reinterpret_cast<const uint16_t*>(row)[x] : row[x];
++  };
++  for (unsigned int y = 0; y < height; y++)
++  {
++    auto* out = reinterpret_cast<uint16_t*>(dst->data[0] + static_cast<size_t>(y) * dst->linesize[0]);
++    const int sy = std::clamp(static_cast<int>((y + 0.5) * srcH / height) - bh / 2, 0, srcH - bh);
++    for (unsigned int x = 0; x < width; x++)
++    {
++      const int sx = std::clamp(static_cast<int>((x + 0.5) * srcW / width) - bw / 2, 0, srcW - bw);
++      double acc[3] = {0, 0, 0};
++      int n = 0, nc = 0;
++      for (int j = 0; j < bh; j++)
++        for (int i = 0; i < bw; i++, n++)
++          acc[0] += sample(0, sx + i, sy + j);
++      for (int j = 0; j < (bh + 1) / 2; j++)
++        for (int i = 0; i < (bw + 1) / 2; i++, nc++)
++          for (int p = 1; p < 3; p++)
++            acc[p] += sample(p, sx / 2 + i, sy / 2 + j);
++      const double s[3] = {acc[0] / n / vmax, acc[1] / nc / vmax, acc[2] / nc / vmax};
++      double v[3], lms[3];
++      for (int c = 0; c < 3; c++)
++        v[c] = DoviReshape(map->curves[c], c, s, coefScale, pivotScale);
++      for (int c = 0; c < 3; c++)
++        lms[c] = PqEotf(nl[c * 3 + 0] * (v[0] - off[0]) + nl[c * 3 + 1] * (v[1] - off[1]) +
++                        nl[c * 3 + 2] * (v[2] - off[2]));
++      for (int c = 0; c < 3; c++)
++      {
++        const double rgb = m[c * 3 + 0] * lms[0] + m[c * 3 + 1] * lms[1] + m[c * 3 + 2] * lms[2];
++        out[x * 3 + c] = static_cast<uint16_t>(PqOetf(std::clamp(rgb, 0.0, 1.0)) * 65535 + 0.5);
++      }
++    }
++  }
++
++  // tonemapping peak: the frame's L1 max (as a DV display would), else the source max
++  double peakPq = col->source_max_pq / 4095.0;
++  const AVDOVIDmData* l1 = av_dovi_find_level(md, 1);
++  if (l1 && l1->l1.max_pq)
++    peakPq = l1->l1.max_pq / 4095.0;
++  if (AVMasteringDisplayMetadata* mdm = av_mastering_display_metadata_create_side_data(dst))
++  {
++    static constexpr double prim[3][2] = {{0.708, 0.292}, {0.170, 0.797}, {0.131, 0.046}};
++    for (int i = 0; i < 3; i++)
++    {
++      mdm->display_primaries[i][0] = av_d2q(prim[i][0], 50000);
++      mdm->display_primaries[i][1] = av_d2q(prim[i][1], 50000);
++    }
++    mdm->white_point[0] = av_d2q(0.3127, 50000);
++    mdm->white_point[1] = av_d2q(0.3290, 50000);
++    mdm->max_luminance = av_d2q(PqEotf(peakPq) * 10000, 10000);
++    mdm->min_luminance = av_d2q(0.005, 10000);
++    mdm->has_primaries = mdm->has_luminance = 1;
++  }
++  return dst;
++}
++
+ //! Convert a decoded picture to a BGRA texture sized for the thumbnail cache.
+ std::unique_ptr<CTexture> PictureToTexture(const VideoPicture& picture, const CDVDStreamInfo& hint)
+ {
+@@ -173,36 +384,52 @@ std::unique_ptr<CTexture> PictureToTexture(const VideoPicture& picture, const CD
+ 
+ #if LIBSWSCALE_BUILD >= AV_VERSION_INT(9, 0, 100)
+   {
+-    AVFrame* srcFrame = av_frame_alloc();
++    AVFrame* srcFrame = nullptr;
++    // Dolby Vision without a compatible base layer (profile 5): rebuilt from the RPU
++    if (hint.dovi.dv_profile && hint.dovi.rpu_present_flag &&
++        hint.dovi.dv_bl_signal_compatibility_id == 0 && picture.doviMetadata)
++    {
++      srcFrame = DoviProfile5ToPQ(picture, planes, stride, nWidth, nHeight);
++      if (!srcFrame)
++        CLog::LogF(LOGWARNING, "Dolby Vision profile 5 rebuild failed, converting the base layer");
++    }
++    const bool doviRebuilt = srcFrame != nullptr;
++    if (!srcFrame)
++      srcFrame = av_frame_alloc();
+     AVFrame* dstFrame = av_frame_alloc();
+     SwsContext* sws = sws_alloc_context();
+     if (srcFrame && dstFrame && sws)
+     {
+-      srcFrame->width = static_cast<int>(picture.iWidth);
+-      srcFrame->height = static_cast<int>(picture.iHeight);
+-      srcFrame->format = picture.videoBuffer->GetFormat();
+-      for (int i = 0; i < YuvImage::MAX_PLANES; i++)
++      // a rebuilt profile 5 frame is already PQ BT.2020 RGB at the thumbnail size, with its peak
++      if (!doviRebuilt)
+       {
+-        srcFrame->data[i] = planes[i];
+-        srcFrame->linesize[i] = stride[i];
+-      }
+-      srcFrame->colorspace = picture.color_space;
+-      srcFrame->color_range = picture.color_range == 1 ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
+-      srcFrame->color_primaries = picture.color_primaries;
+-      srcFrame->color_trc = picture.color_transfer;
+-      srcFrame->chroma_location = picture.chroma_position;
++        srcFrame->width = static_cast<int>(picture.iWidth);
++        srcFrame->height = static_cast<int>(picture.iHeight);
++        srcFrame->format = picture.videoBuffer->GetFormat();
++        for (int i = 0; i < YuvImage::MAX_PLANES; i++)
++        {
++          srcFrame->data[i] = planes[i];
++          srcFrame->linesize[i] = stride[i];
++        }
++        srcFrame->colorspace = picture.color_space;
++        srcFrame->color_range = picture.color_range == 1 ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
++        srcFrame->color_primaries = picture.color_primaries;
++        srcFrame->color_trc = picture.color_transfer;
++        srcFrame->chroma_location = picture.chroma_position;
+ 
+-      if (picture.hasDisplayMetadata)
+-      {
+-        AVMasteringDisplayMetadata* mdm = av_mastering_display_metadata_create_side_data(srcFrame);
+-        if (mdm)
+-          *mdm = picture.displayMetadata;
+-      }
+-      if (picture.hasLightMetadata)
+-      {
+-        AVContentLightMetadata* clm = av_content_light_metadata_create_side_data(srcFrame);
+-        if (clm)
+-          *clm = picture.lightMetadata;
++        if (picture.hasDisplayMetadata)
++        {
++          AVMasteringDisplayMetadata* mdm =
++              av_mastering_display_metadata_create_side_data(srcFrame);
++          if (mdm)
++            *mdm = picture.displayMetadata;
++        }
++        if (picture.hasLightMetadata)
++        {
++          AVContentLightMetadata* clm = av_content_light_metadata_create_side_data(srcFrame);
++          if (clm)
++            *clm = picture.lightMetadata;
++        }
+       }
+ 
+       dstFrame->width = static_cast<int>(nWidth);
+@@ -260,7 +487,8 @@ std::unique_ptr<CTexture> PictureToTexture(const VideoPicture& picture, const CD
+ } // namespace
+ 
+ std::unique_ptr<CTexture> CDVDFileInfo::ExtractThumbToTexture(const CFileItem& fileItem,
+-                                                              int chapterNumber)
++                                                              int chapterNumber,
++                                                              int64_t seekTo_ms)
+ {
+   if (!CanExtract(fileItem))
+     return {};
+@@ -332,11 +560,13 @@ std::unique_ptr<CTexture> CDVDFileInfo::ExtractThumbToTexture(const CFileItem& f
+ 
+     if (pVideoCodec)
+     {
+-      // Thumbnail position: the chapter start, or one third in
++      // Thumbnail position: the given time, the chapter start, or one third in
+       const int nTotalLen = demuxer->GetStreamLength();
+       const bool seekToChapter = chapterNumber > 0 && demuxer->GetChapterCount() > 0;
+       const int64_t nSeekTo =
+-          seekToChapter ? demuxer->GetChapterPos(chapterNumber).count() : nTotalLen / 3;
++          seekTo_ms >= 0
++              ? seekTo_ms
++              : (seekToChapter ? demuxer->GetChapterPos(chapterNumber).count() : nTotalLen / 3);
+ 
+       CLog::LogF(LOGDEBUG, "seeking to pos {}ms (total: {}ms) in {}", nSeekTo, nTotalLen,
+                  redactPath);
+@@ -344,7 +574,11 @@ std::unique_ptr<CTexture> CDVDFileInfo::ExtractThumbToTexture(const CFileItem& f
+       VideoPicture picture = {};
+       if (SeekAndDecodeFirstPicture(*demuxer, *pVideoCodec, nVideoStream, nSeekTo, picture,
+                                     packetsTried))
++      {
++        if (seekTo_ms >= 0)
++          DecodeOnToTime(*demuxer, *pVideoCodec, nVideoStream, nSeekTo, picture, packetsTried);
+         result = PictureToTexture(picture, hint);
++      }
+       else
+         CLog::LogF(LOGDEBUG, "decode failed in {} after {} packets.", redactPath, packetsTried);
+     }
+diff --git a/xbmc/cores/VideoPlayer/DVDFileInfo.h b/xbmc/cores/VideoPlayer/DVDFileInfo.h
+index 2ac92e9d3f..17fd8ca1b7 100644
+--- a/xbmc/cores/VideoPlayer/DVDFileInfo.h
++++ b/xbmc/cores/VideoPlayer/DVDFileInfo.h
+@@ -26,8 +26,15 @@ struct VideoPicture;
+ class CDVDFileInfo
+ {
+ public:
++  /*!
++   * @brief Decode one picture of the file into a thumbnail texture.
++   * @param chapterNumber picture at the start of this chapter (> 0), else one third in
++   * @param seekTo_ms when >= 0: the picture at this time instead (bookmarks), decoded on from the
++   *        keyframe before it
++   */
+   static std::unique_ptr<CTexture> ExtractThumbToTexture(const CFileItem& fileItem,
+-                                                         int chapterNumber = 0);
++                                                         int chapterNumber = 0,
++                                                         int64_t seekTo_ms = -1);
+ 
+   /*!
+    * @brief Seek the demuxer to a position and decode the first picture that is not dropped.
+diff --git a/xbmc/video/dialogs/GUIDialogVideoBookmarks.cpp b/xbmc/video/dialogs/GUIDialogVideoBookmarks.cpp
+index a460ced7ef..446f49667d 100644
+--- a/xbmc/video/dialogs/GUIDialogVideoBookmarks.cpp
++++ b/xbmc/video/dialogs/GUIDialogVideoBookmarks.cpp
+@@ -15,10 +15,12 @@
+ #include "application/Application.h"
+ #include "application/ApplicationComponents.h"
+ #include "application/ApplicationPlayer.h"
++#include "cores/VideoPlayer/DVDFileInfo.h"
+ #include "dialogs/GUIDialogContextMenu.h"
+ #include "dialogs/GUIDialogKaiToast.h"
+ #include "guilib/GUIComponent.h"
+ #include "guilib/GUIWindowManager.h"
++#include "guilib/Texture.h"
+ #include "imagefiles/ImageFileURL.h"
+ #include "input/actions/Action.h"
+ #include "input/actions/ActionIDs.h"
+@@ -522,9 +524,24 @@ bool CGUIDialogVideoBookmarks::AddBookmark(CVideoInfoTag* tag)
+       {
+         std::vector<uint8_t> pixels(static_cast<size_t>(height) * width * 4);
+         const bool converted = CaptureToBGRA(result, width, height, pixels.data());
+-        const bool encoded =
++        bool encoded =
+             converted && CPicture::CreateThumbnailFromSurface(pixels.data(), width, height,
+                                                               width * 4, bookmark.thumbNailImage);
++        if (!converted)
++        {
++          // No frame from the renderer (e.g. Amlogic: the video is on its own plane and the
++          // renderer cannot read it back): decode the bookmarked picture from the file instead,
++          // like the chapter thumbnails (software decode, same HDR / Dolby Vision handling).
++          const CFileItem item{dynPath, false};
++          const auto texture = CDVDFileInfo::ExtractThumbToTexture(
++              item, 0, static_cast<int64_t>(bookmark.timeInSeconds * 1000));
++          encoded = texture && CPicture::CreateThumbnailFromSurface(
++                                   texture->GetPixels(), static_cast<int>(texture->GetWidth()),
++                                   static_cast<int>(texture->GetHeight()),
++                                   static_cast<int>(texture->GetPitch()), bookmark.thumbNailImage);
++          CLog::Log(LOGINFO, "CGUIDialogVideoBookmarks: thumbnail from the file at {} s: {}",
++                    bookmark.timeInSeconds, encoded ? "ok" : "failed");
++        }
+         if (!encoded)
+         {
+           CLog::Log(LOGERROR, "CGUIDialogVideoBookmarks: failed to create bookmark thumbnail");
+-- 
+2.43.0
+
