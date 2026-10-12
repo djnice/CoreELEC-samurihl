@@ -1,4 +1,4 @@
-From c6846654189c88f2e0d9e1b9ea6dc6a3e8082985 Mon Sep 17 00:00:00 2001
+From db47664be40a5f493a10b32947c39e83ff18cdd0 Mon Sep 17 00:00:00 2001
 From: djnice <djnice@freemail.hu>
 Date: Mon, 12 Oct 2026 10:13:31 +0200
 Subject: [PATCH] Screenshot: setting to tone map HDR screenshots to SDR
@@ -26,12 +26,12 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  .../HwDecRender/RendererAML.cpp               |  47 ++-
  .../VideoRenderers/HwDecRender/RendererAML.h  |   2 +
  xbmc/settings/Settings.h                      |   1 +
- xbmc/utils/IScreenshotSurface.h               |  21 ++
+ xbmc/utils/IScreenshotSurface.h               |  21 +
  xbmc/utils/Screenshot.cpp                     |  26 ++
- xbmc/utils/ScreenshotAML.cpp                  | 325 ++++++++++++++----
+ xbmc/utils/ScreenshotAML.cpp                  | 373 ++++++++++++++----
  xbmc/utils/ScreenshotAML.h                    |  52 ++-
  .../amlogic/ScreenshotSurfaceAML.cpp          |  19 +-
- 12 files changed, 439 insertions(+), 84 deletions(-)
+ 12 files changed, 477 insertions(+), 94 deletions(-)
 
 diff --git a/addons/resource.language.en_gb/resources/strings.po b/addons/resource.language.en_gb/resources/strings.po
 index 9d7d2fd423..115737335a 100644
@@ -319,7 +319,7 @@ index 623b38f3dc..9852088607 100644
    if (!lock.data())
    {
 diff --git a/xbmc/utils/ScreenshotAML.cpp b/xbmc/utils/ScreenshotAML.cpp
-index 05610c5a55..3705543072 100644
+index 05610c5a55..bb4a9c55f7 100644
 --- a/xbmc/utils/ScreenshotAML.cpp
 +++ b/xbmc/utils/ScreenshotAML.cpp
 @@ -11,6 +11,7 @@
@@ -339,8 +339,12 @@ index 05610c5a55..3705543072 100644
  
  // the capture format defaults to GE2D_FORMAT_S24_RGB, which lands as B, G, R bytes
  
-@@ -39,11 +42,21 @@ constexpr unsigned int CAPTURE_MAX_WIDTH = 3840;
+@@ -37,13 +40,25 @@ constexpr const char* CAPTURE_DEVICEPATH = "/dev/amvideocap0";
+ // the driver's limits (CAP_WIDTH_MAX, CAP_HEIGHT_MAX) and its width granularity
+ constexpr unsigned int CAPTURE_MAX_WIDTH = 3840;
  constexpr unsigned int CAPTURE_MAX_HEIGHT = 2160;
++//! below this the driver garbles the picture (see CaptureVideoFrame)
++constexpr unsigned int CAPTURE_MIN_WIDTH = 1920;
  constexpr unsigned int CAPTURE_WIDTH_ALIGN = 16;
  
 -std::mutex videoRectLock;
@@ -363,7 +367,7 @@ index 05610c5a55..3705543072 100644
  {
    const int fd = open(CAPTURE_DEVICEPATH, O_RDWR);
    if (fd < 0)
-@@ -58,10 +71,14 @@ bool ReadVideoFrame(std::vector<uint8_t>& bgr, unsigned int width, unsigned int
+@@ -58,10 +73,14 @@ bool ReadVideoFrame(std::vector<uint8_t>& bgr, unsigned int width, unsigned int
      ioctl(fd, AMVIDEOCAP_IOW_SET_WANTFRAME_WIDTH, width);
      ioctl(fd, AMVIDEOCAP_IOW_SET_WANTFRAME_HEIGHT, height);
      ioctl(fd, AMVIDEOCAP_IOW_SET_WANTFRAME_AT_FLAGS, CAP_FLAG_AT_CURRENT);
@@ -378,7 +382,7 @@ index 05610c5a55..3705543072 100644
    close(fd);
  
    if (got != size)
-@@ -72,20 +89,65 @@ bool ReadVideoFrame(std::vector<uint8_t>& bgr, unsigned int width, unsigned int
+@@ -72,20 +91,65 @@ bool ReadVideoFrame(std::vector<uint8_t>& bgr, unsigned int width, unsigned int
    return true;
  }
  
@@ -398,8 +402,7 @@ index 05610c5a55..3705543072 100644
 +}
 +
 +float NitsToPq(float nits)
- {
--  return std::min(max, gui + (video * (max - alpha) + max / 2) / max);
++{
 +  constexpr float m1 = 2610.0f / 16384.0f;
 +  constexpr float m2 = 2523.0f / 4096.0f * 128.0f;
 +  constexpr float c1 = 3424.0f / 4096.0f;
@@ -407,30 +410,30 @@ index 05610c5a55..3705543072 100644
 +  constexpr float c3 = 2392.0f / 4096.0f * 32.0f;
 +  const float y = std::pow(std::clamp(nits / 10000.0f, 0.0f, 1.0f), m1);
 +  return std::pow((c1 + c2 * y) / (1.0f + c3 * y), m2);
- }
- 
--inline unsigned int To10(uint8_t v)
++}
++
 +// HLG on a 1000 cd/m2 display; the OOTF (system gamma 1.2) applied per channel
 +constexpr float HLG_PEAK = 1000.0f;
 +
 +float HlgToNits(float v)
  {
--  return (v << 2) | (v >> 6);
+-  return std::min(max, gui + (video * (max - alpha) + max / 2) / max);
 +  constexpr float a = 0.17883277f, b = 0.28466892f, c = 0.55991073f;
 +  v = std::clamp(v, 0.0f, 1.0f);
 +  const float e = v <= 0.5f ? v * v / 3.0f : (std::exp((v - c) / a) + b) / 12.0f;
 +  return HLG_PEAK * std::pow(e, 1.2f);
  }
  
--inline uint16_t Load16(const uint8_t* p)
+-inline unsigned int To10(uint8_t v)
 +float NitsToHlg(float nits)
  {
--  return static_cast<uint16_t>(p[0] | (p[1] << 8));
+-  return (v << 2) | (v >> 6);
 +  constexpr float a = 0.17883277f, b = 0.28466892f, c = 0.55991073f;
 +  const float e = std::pow(std::clamp(nits / HLG_PEAK, 0.0f, 1.0f), 1.0f / 1.2f);
 +  return e <= 1.0f / 12.0f ? std::sqrt(3.0f * e) : a * std::log(12.0f * e - b) + c;
-+}
-+
+ }
+ 
+-inline uint16_t Load16(const uint8_t* p)
 +// the GUI's curve, as the HDR GUI composite decodes it
 +float SrgbToLinear(float v)
 +{
@@ -441,7 +444,8 @@ index 05610c5a55..3705543072 100644
 +// --- pixel access, channels as float in [0, 1] ----------------------------
 +
 +struct Pixel
-+{
+ {
+-  return static_cast<uint16_t>(p[0] | (p[1] << 8));
 +  float r, g, b, a;
 +};
 +
@@ -451,7 +455,7 @@ index 05610c5a55..3705543072 100644
  }
  
  inline void Store16(uint8_t* p, unsigned int v)
-@@ -94,63 +156,94 @@ inline void Store16(uint8_t* p, unsigned int v)
+@@ -94,98 +158,180 @@ inline void Store16(uint8_t* p, unsigned int v)
    p[1] = static_cast<uint8_t>(v >> 8);
  }
  
@@ -573,10 +577,27 @@ index 05610c5a55..3705543072 100644
 +    return frame;
 +  }
  
-   // the driver works in whole 16-pixel groups and even line counts: capture
-   // at the next such size and pick the requested grid out of it
-@@ -160,11 +253,12 @@ std::unique_ptr<uint8_t[]> CScreenshotAML::CaptureVideoFrame(unsigned int width,
-   const unsigned int capHeight = std::min(CAPTURE_MAX_HEIGHT, (height + 1) & ~1u);
+-  // the driver works in whole 16-pixel groups and even line counts: capture
+-  // at the next such size and pick the requested grid out of it
++  // The driver garbles a capture much smaller than the video (S5: 960 wide and
++  // less from a 4K frame come out as stripes), so a small capture is read at
++  // least 1920 wide and scaled down here. The driver also works in whole
++  // 16-pixel groups and even line counts: capture at the next such size and
++  // average the requested grid out of it.
++  unsigned int readWidth = width;
++  unsigned int readHeight = height;
++  if (readWidth < CAPTURE_MIN_WIDTH)
++  {
++    readHeight = static_cast<unsigned int>(
++        std::lround(static_cast<double>(height) * CAPTURE_MIN_WIDTH / width));
++    readWidth = CAPTURE_MIN_WIDTH;
++  }
+   const unsigned int capWidth =
+       std::min(CAPTURE_MAX_WIDTH,
+-               (width + CAPTURE_WIDTH_ALIGN - 1) / CAPTURE_WIDTH_ALIGN * CAPTURE_WIDTH_ALIGN);
+-  const unsigned int capHeight = std::min(CAPTURE_MAX_HEIGHT, (height + 1) & ~1u);
++               (readWidth + CAPTURE_WIDTH_ALIGN - 1) / CAPTURE_WIDTH_ALIGN * CAPTURE_WIDTH_ALIGN);
++  const unsigned int capHeight = std::min(CAPTURE_MAX_HEIGHT, (readHeight + 1) & ~1u);
  
    std::vector<uint8_t> bgr;
 -  if (!ReadVideoFrame(bgr, capWidth, capHeight))
@@ -591,8 +612,35 @@ index 05610c5a55..3705543072 100644
 +  uint8_t* out = frame.bgra.get();
    for (unsigned int y = 0; y < height; ++y)
    {
-     const uint8_t* row =
-@@ -178,14 +272,38 @@ std::unique_ptr<uint8_t[]> CScreenshotAML::CaptureVideoFrame(unsigned int width,
+-    const uint8_t* row =
+-        bgr.data() + static_cast<size_t>(y * static_cast<uint64_t>(capHeight) / height) * capWidth * 3;
++    const unsigned int sy0 = static_cast<unsigned int>(y * static_cast<uint64_t>(capHeight) / height);
++    const unsigned int sy1 = std::max(
++        sy0 + 1, static_cast<unsigned int>((y + 1) * static_cast<uint64_t>(capHeight) / height));
+     for (unsigned int x = 0; x < width; ++x, out += 4)
+     {
+-      const uint8_t* v = row + static_cast<size_t>(x * static_cast<uint64_t>(capWidth) / width) * 3;
+-      out[0] = v[0];
+-      out[1] = v[1];
+-      out[2] = v[2];
++      const unsigned int sx0 = static_cast<unsigned int>(x * static_cast<uint64_t>(capWidth) / width);
++      const unsigned int sx1 = std::max(
++          sx0 + 1, static_cast<unsigned int>((x + 1) * static_cast<uint64_t>(capWidth) / width));
++      unsigned int sum[3] = {0, 0, 0};
++      for (unsigned int sy = sy0; sy < sy1; ++sy)
++      {
++        const uint8_t* v = bgr.data() + (static_cast<size_t>(sy) * capWidth + sx0) * 3;
++        for (unsigned int sx = sx0; sx < sx1; ++sx, v += 3)
++        {
++          sum[0] += v[0];
++          sum[1] += v[1];
++          sum[2] += v[2];
++        }
++      }
++      const unsigned int n = (sy1 - sy0) * (sx1 - sx0);
++      out[0] = static_cast<uint8_t>((sum[0] + n / 2) / n);
++      out[1] = static_cast<uint8_t>((sum[1] + n / 2) / n);
++      out[2] = static_cast<uint8_t>((sum[2] + n / 2) / n);
        out[3] = 255;
      }
    }
@@ -635,7 +683,7 @@ index 05610c5a55..3705543072 100644
  
    CRect dest = GetVideoRect();
    dest.Intersect(CRect(0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height)));
-@@ -194,42 +312,123 @@ void CScreenshotAML::BlendVideoUnderGui(
+@@ -194,42 +340,123 @@ void CScreenshotAML::BlendVideoUnderGui(
    const unsigned int x1 = std::min(width, static_cast<unsigned int>(std::lround(dest.x2)));
    const unsigned int y1 = std::min(height, static_cast<unsigned int>(std::lround(dest.y2)));
    if (x1 <= x0 || y1 <= y0)
@@ -676,20 +724,24 @@ index 05610c5a55..3705543072 100644
 +  {
 +    // SDR on SDR: premultiplied GUI over the video, in code values
 +    for (unsigned int y = 0; y < videoHeight; ++y)
-+    {
+     {
+-      if (!BlendPixel(line + static_cast<size_t>(x0 + x) * bpp, v, format))
 +      uint8_t* p = line(y0 + y) + static_cast<size_t>(x0) * bpp;
 +      const uint8_t* v = video.bgra.get() + static_cast<size_t>(y) * videoWidth * 4;
 +      for (unsigned int x = 0; x < videoWidth; ++x, p += bpp, v += 4)
-+      {
+       {
+-        CLog::LogF(LOGWARNING, "readback format {} not handled; video left out",
+-                   static_cast<int>(format));
+-        return;
 +        Pixel g;
 +        LoadPixel(p, format, g);
 +        const float k = 1.0f - g.a;
 +        StorePixel(p, format, g.r + v[2] / 255.0f * k, g.g + v[1] / 255.0f * k,
 +                   g.b + v[0] / 255.0f * k);
-+      }
-+    }
+       }
+     }
 +    return false;
-+  }
+   }
 +
 +  // the video keeps its HDR coding: the whole picture takes it, the GUI
 +  // (BT.709, sRGB curve) is converted into it and blended in linear light
@@ -710,8 +762,7 @@ index 05610c5a55..3705543072 100644
 +    uint8_t* p = line(row);
 +    const bool inVideo = row >= y0 && row < y1;
 +    for (unsigned int x = 0; x < width; ++x, p += bpp)
-     {
--      if (!BlendPixel(line + static_cast<size_t>(x0 + x) * bpp, v, format))
++    {
 +      Pixel g;
 +      LoadPixel(p, format, g);
 +      float vr = 0.0f, vg = 0.0f, vb = 0.0f; // video, linear
@@ -736,21 +787,18 @@ index 05610c5a55..3705543072 100644
 +      // the GUI colour, unpremultiplied, in linear light at its white level
 +      float gr = 0.0f, gg = 0.0f, gb = 0.0f;
 +      if (g.a > 0.0f)
-       {
--        CLog::LogF(LOGWARNING, "readback format {} not handled; video left out",
--                   static_cast<int>(format));
--        return;
++      {
 +        gr = white * SrgbToLinear(g.r / g.a);
 +        gg = white * SrgbToLinear(g.g / g.a);
 +        gb = white * SrgbToLinear(g.b / g.a);
-       }
++      }
 +      const float r = M[0][0] * gr + M[0][1] * gg + M[0][2] * gb;
 +      const float gn = M[1][0] * gr + M[1][1] * gg + M[1][2] * gb;
 +      const float b = M[2][0] * gr + M[2][1] * gg + M[2][2] * gb;
 +      StorePixel(p, format, encode(r * g.a + vr * (1.0f - g.a)),
 +                 encode(gn * g.a + vg * (1.0f - g.a)), encode(b * g.a + vb * (1.0f - g.a)));
-     }
-   }
++    }
++  }
 +  color = video.color;
 +  return true;
  }
