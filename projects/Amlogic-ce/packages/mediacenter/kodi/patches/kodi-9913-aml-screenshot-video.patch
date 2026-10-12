@@ -1,0 +1,581 @@
+From a1943428bef2b40b09d7f1ce5ee60ae1039be10f Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Mon, 12 Oct 2026 10:12:53 +0200
+Subject: [PATCH 1/2] AML: put the video layer into screenshots
+
+The Amlogic video layer never reaches the framebuffer, so screenshots held the
+GUI only (the video area black) and video captures (TakeScreenshot(video),
+render captures) always failed: CScreenshotAML was no longer called anywhere.
+
+- CScreenshotSurfaceAML reads the GUI like the GLES surface and puts the video
+  picture under it where the GUI is not opaque (premultiplied over the
+  transparent clear), at the video destination rectangle the renderer
+  publishes; RGBA, BGRA, X2BGR10 and RGBA64 readbacks are handled.
+- CRendererAML::CaptureVideoFrame serves video captures as BGRA.
+- The picture is read with CAP_FLAG_AT_CURRENT: no wait for the next frame,
+  so it works while paused and does not hold the render thread for seconds.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../HwDecRender/RendererAML.cpp               |  34 +++
+ .../VideoRenderers/HwDecRender/RendererAML.h  |   4 +
+ xbmc/utils/ScreenshotAML.cpp                  | 286 +++++++++++++-----
+ xbmc/utils/ScreenshotAML.h                    |  31 +-
+ xbmc/windowing/amlogic/CMakeLists.txt         |   6 +-
+ .../amlogic/ScreenshotSurfaceAML.cpp          |  32 ++
+ xbmc/windowing/amlogic/ScreenshotSurfaceAML.h |  24 ++
+ xbmc/windowing/amlogic/WinSystemAmlogic.cpp   |   4 +-
+ 8 files changed, 334 insertions(+), 87 deletions(-)
+ create mode 100644 xbmc/windowing/amlogic/ScreenshotSurfaceAML.cpp
+ create mode 100644 xbmc/windowing/amlogic/ScreenshotSurfaceAML.h
+
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.cpp
+index fd05552a47..fff909215b 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.cpp
+@@ -13,6 +13,8 @@
+ #include "cores/VideoPlayer/VideoRenderers/RenderFactory.h"
+ #include "cores/VideoPlayer/VideoRenderers/RenderFlags.h"
+ #include "platform/linux/SysfsPath.h"
++#include "rendering/capture/CapturePixels.h"
++#include "rendering/capture/CaptureTypes.h"
+ #include "ServiceBroker.h"
+ #include "settings/AdvancedSettings.h"
+ #include "settings/MediaSettings.h"
+@@ -25,6 +27,9 @@
+ #include "windowing/amlogic/WinSystemAmlogic.h"
+ #include "windowing/WinSystem.h"
+ 
++#include <cmath>
++#include <memory>
++
+ CRendererAML::CRendererAML()
+  : m_prevVPts(DVD_NOPTS_VALUE)
+  , m_bConfigured(false)
+@@ -35,6 +40,7 @@ CRendererAML::CRendererAML()
+ CRendererAML::~CRendererAML()
+ {
+   Reset();
++  CScreenshotAML::SetVideoRect(CRect());
+ }
+ 
+ void CRendererAML::EndRenderSession()
+@@ -362,6 +368,7 @@ bool CRendererAML::Flush(bool saveBuffers)
+ void CRendererAML::RenderUpdate(int index, int index2, bool clear, unsigned int flags, unsigned int alpha)
+ {
+   ManageRenderArea();
++  CScreenshotAML::SetVideoRect(m_destRect);
+ 
+   CAMLVideoBuffer *amli = dynamic_cast<CAMLVideoBuffer *>(m_buffers[index].videoBuffer);
+   if(amli && amli->m_amlCodec)
+@@ -378,3 +385,30 @@ void CRendererAML::RenderUpdate(int index, int index2, bool clear, unsigned int
+   }
+   CAMLCodec::PollFrame();
+ }
++
++bool CRendererAML::CaptureVideoFrame(const KODI::RENDERING::CAPTURE::CaptureSpec& spec,
++                                     KODI::RENDERING::CAPTURE::CaptureResult& result)
++{
++  using namespace KODI::RENDERING::CAPTURE;
++
++  // native size: the picture as shown on screen
++  const unsigned int width =
++      spec.width ? spec.width : static_cast<unsigned int>(std::lround(m_destRect.Width()));
++  const unsigned int height =
++      spec.height ? spec.height : static_cast<unsigned int>(std::lround(m_destRect.Height()));
++  auto pixels = CScreenshotAML::CaptureVideoFrame(width, height);
++  if (!pixels)
++    return false;
++
++  result.pixels = std::make_shared<CHeapCapturePixels>(std::move(pixels));
++  result.width = width;
++  result.height = height;
++  result.stride = static_cast<int>(width * 4);
++  result.format = AV_PIX_FMT_BGRA;
++  result.content = CaptureContent::VIDEO;
++  // the driver converts to full-range RGB and maps an HDR source to SDR
++  result.color.primaries = AVCOL_PRI_BT709;
++  result.color.transfer = AVCOL_TRC_BT709;
++  result.color.range = AVCOL_RANGE_JPEG;
++  return true;
++}
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.h b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.h
+index 873cacf2f2..f69799cd09 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.h
+@@ -40,6 +40,10 @@ public:
+   virtual bool Supports(ESCALINGMETHOD method) const override { return false; };
+   virtual bool Supports(ERENDERFEATURE feature) const override;
+ 
++  // Capture: the video layer read back through the amvideocap driver
++  bool CaptureVideoFrame(const KODI::RENDERING::CAPTURE::CaptureSpec& spec,
++                         KODI::RENDERING::CAPTURE::CaptureResult& result) override;
++
+ private:
+   void Reset();
+ 
+diff --git a/xbmc/utils/ScreenshotAML.cpp b/xbmc/utils/ScreenshotAML.cpp
+index 7fa1fd1adb..05610c5a55 100644
+--- a/xbmc/utils/ScreenshotAML.cpp
++++ b/xbmc/utils/ScreenshotAML.cpp
+@@ -7,101 +7,229 @@
+  */
+ 
+ #include "utils/ScreenshotAML.h"
+-#include <errno.h>
+-#include <sys/types.h>
+-#include <sys/stat.h>
++
++#include "utils/log.h"
++
++#include <algorithm>
++#include <cerrno>
++#include <cmath>
++#include <cstdlib>
++#include <mutex>
++#include <vector>
++
+ #include <fcntl.h>
+-#include <string.h>
++#include <sys/ioctl.h>
+ #include <unistd.h>
+ 
+-#include <sys/ioctl.h>
++// taken from linux/amlogic/media/video_sink/amvideocap.h
++#define AMVIDEOCAP_IOC_MAGIC 'V'
++#define CAP_FLAG_AT_CURRENT 0
++
++#define AMVIDEOCAP_IOW_SET_WANTFRAME_WIDTH _IOW(AMVIDEOCAP_IOC_MAGIC, 0x02, int)
++#define AMVIDEOCAP_IOW_SET_WANTFRAME_HEIGHT _IOW(AMVIDEOCAP_IOC_MAGIC, 0x03, int)
++#define AMVIDEOCAP_IOW_SET_WANTFRAME_AT_FLAGS _IOW(AMVIDEOCAP_IOC_MAGIC, 0x06, int)
++
++// the capture format defaults to GE2D_FORMAT_S24_RGB, which lands as B, G, R bytes
++
++namespace
++{
++constexpr const char* CAPTURE_DEVICEPATH = "/dev/amvideocap0";
++// the driver's limits (CAP_WIDTH_MAX, CAP_HEIGHT_MAX) and its width granularity
++constexpr unsigned int CAPTURE_MAX_WIDTH = 3840;
++constexpr unsigned int CAPTURE_MAX_HEIGHT = 2160;
++constexpr unsigned int CAPTURE_WIDTH_ALIGN = 16;
++
++std::mutex videoRectLock;
++CRect videoRect;
++
++// one capture of the shown picture as B, G, R rows of width * 3 bytes
++bool ReadVideoFrame(std::vector<uint8_t>& bgr, unsigned int width, unsigned int height)
++{
++  const int fd = open(CAPTURE_DEVICEPATH, O_RDWR);
++  if (fd < 0)
++    return false;
++
++  const ssize_t size = static_cast<ssize_t>(width) * height * 3;
++  bgr.resize(static_cast<size_t>(size));
++  ssize_t got = -1;
++  for (int attempt = 0; attempt < 3 && got != size; ++attempt)
++  {
++    // the picture on screen now: no wait for the next frame, works when paused
++    ioctl(fd, AMVIDEOCAP_IOW_SET_WANTFRAME_WIDTH, width);
++    ioctl(fd, AMVIDEOCAP_IOW_SET_WANTFRAME_HEIGHT, height);
++    ioctl(fd, AMVIDEOCAP_IOW_SET_WANTFRAME_AT_FLAGS, CAP_FLAG_AT_CURRENT);
++    got = pread(fd, bgr.data(), bgr.size(), 0);
++    if (got < 0 && errno == ENODATA)
++      break; // the video layer is off
++  }
++  close(fd);
+ 
+-// taken from linux/amlogic/amports/amvideocap.h - needs to be synced - no changes expected though
+-#define AMVIDEOCAP_IOC_MAGIC    'V'
+-#define CAP_FLAG_AT_CURRENT      0
+-#define CAP_FLAG_AT_TIME_WINDOW  1
+-#define CAP_FLAG_AT_END          2
++  if (got != size)
++  {
++    CLog::LogF(LOGDEBUG, "no video frame ({}x{}, read {})", width, height, got);
++    return false;
++  }
++  return true;
++}
+ 
+-#define AMVIDEOCAP_IOW_SET_WANTFRAME_WIDTH       _IOW(AMVIDEOCAP_IOC_MAGIC, 0x02, int)
+-#define AMVIDEOCAP_IOW_SET_WANTFRAME_HEIGHT      _IOW(AMVIDEOCAP_IOC_MAGIC, 0x03, int)
+-#define AMVIDEOCAP_IOW_SET_WANTFRAME_WAIT_MAX_MS _IOW(AMVIDEOCAP_IOC_MAGIC, 0x05, unsigned long long)
+-#define AMVIDEOCAP_IOW_SET_WANTFRAME_AT_FLAGS    _IOW(AMVIDEOCAP_IOC_MAGIC, 0x06, int)
+-#define AMVIDEOCAP_IOW_SET_CANCEL_CAPTURE        _IOW(AMVIDEOCAP_IOC_MAGIC, 0x33, int)
++// x * (1 - alpha) added to a premultiplied channel, alpha in [0, max]
++inline unsigned int AddUnder(unsigned int gui, unsigned int video, unsigned int alpha, unsigned int max)
++{
++  return std::min(max, gui + (video * (max - alpha) + max / 2) / max);
++}
+ 
+-// capture format already defaults to GE2D_FORMAT_S24_RGB - no need to pull in all the ge2d headers :)
++inline unsigned int To10(uint8_t v)
++{
++  return (v << 2) | (v >> 6);
++}
+ 
+-#define CAPTURE_DEVICEPATH "/dev/amvideocap0"
+-#define AMVIDEOCAP_WAIT_MAX_MS 40
++inline uint16_t Load16(const uint8_t* p)
++{
++  return static_cast<uint16_t>(p[0] | (p[1] << 8));
++}
++
++inline void Store16(uint8_t* p, unsigned int v)
++{
++  p[0] = static_cast<uint8_t>(v);
++  p[1] = static_cast<uint8_t>(v >> 8);
++}
+ 
+-//the buffer format is BGRA (4 byte)
+-void CScreenshotAML::CaptureVideoFrame(unsigned char *buffer, int iWidth, int iHeight, bool bBlendToBuffer)
++// one GUI pixel over one B, G, R(, A) video pixel; false for an unknown format
++bool BlendPixel(uint8_t* p, const uint8_t* v, AVPixelFormat format)
+ {
+-  int captureFd = open(CAPTURE_DEVICEPATH, O_RDWR, 0);
+-  if (captureFd >= 0)
++  switch (format)
+   {
+-    int stride = ((iWidth + 31) & ~31) * 3;
+-    int buffSize = stride * iHeight;
+-    int readSize = -1;
+-    // videobuffer should be rgb according to docu - but it is bgr ...
+-    unsigned char *videoBuffer = new unsigned char[buffSize];
+-
+-    int retry = 100;
+-    while (retry > 0 && readSize < 0)
++    case AV_PIX_FMT_RGBA:
++      p[0] = AddUnder(p[0], v[2], p[3], 255);
++      p[1] = AddUnder(p[1], v[1], p[3], 255);
++      p[2] = AddUnder(p[2], v[0], p[3], 255);
++      p[3] = 255;
++      return true;
++    case AV_PIX_FMT_BGRA:
++      p[0] = AddUnder(p[0], v[0], p[3], 255);
++      p[1] = AddUnder(p[1], v[1], p[3], 255);
++      p[2] = AddUnder(p[2], v[2], p[3], 255);
++      p[3] = 255;
++      return true;
++    case AV_PIX_FMT_X2BGR10LE:
+     {
+-      if (videoBuffer != NULL)
+-      {
+-        // configure destination
+-        ioctl(captureFd, AMVIDEOCAP_IOW_SET_WANTFRAME_WIDTH, iWidth);
+-        ioctl(captureFd, AMVIDEOCAP_IOW_SET_WANTFRAME_HEIGHT, iHeight);
+-        ioctl(captureFd, AMVIDEOCAP_IOW_SET_WANTFRAME_WAIT_MAX_MS, AMVIDEOCAP_WAIT_MAX_MS);
+-        ioctl(captureFd, AMVIDEOCAP_IOW_SET_WANTFRAME_AT_FLAGS, CAP_FLAG_AT_END);
++      // R in bits 0-9, G 10-19, B 20-29, alpha 30-31 (GL_UNSIGNED_INT_2_10_10_10_REV)
++      const uint32_t w = p[0] | (p[1] << 8) | (p[2] << 16) | (static_cast<uint32_t>(p[3]) << 24);
++      const unsigned int a = (w >> 30) * 341; // 2-bit alpha on the 10-bit scale
++      const uint32_t r = AddUnder(w & 0x3ff, To10(v[2]), a, 1023);
++      const uint32_t g = AddUnder((w >> 10) & 0x3ff, To10(v[1]), a, 1023);
++      const uint32_t b = AddUnder((w >> 20) & 0x3ff, To10(v[0]), a, 1023);
++      const uint32_t o = r | (g << 10) | (b << 20) | (3u << 30);
++      p[0] = static_cast<uint8_t>(o);
++      p[1] = static_cast<uint8_t>(o >> 8);
++      p[2] = static_cast<uint8_t>(o >> 16);
++      p[3] = static_cast<uint8_t>(o >> 24);
++      return true;
++    }
++    case AV_PIX_FMT_RGBA64LE:
++    {
++      const unsigned int a = Load16(p + 6);
++      Store16(p + 0, AddUnder(Load16(p + 0), v[2] * 257u, a, 65535));
++      Store16(p + 2, AddUnder(Load16(p + 2), v[1] * 257u, a, 65535));
++      Store16(p + 4, AddUnder(Load16(p + 4), v[0] * 257u, a, 65535));
++      Store16(p + 6, 65535);
++      return true;
++    }
++    default:
++      return false;
++  }
++}
+ 
+-        readSize = pread(captureFd, videoBuffer, buffSize, 0);
++unsigned int BytesPerPixel(AVPixelFormat format)
++{
++  return format == AV_PIX_FMT_RGBA64LE ? 8 : 4;
++}
++} // namespace
+ 
+-        if (errno == ENODATA)
+-          break;
+-      }
++std::unique_ptr<uint8_t[]> CScreenshotAML::CaptureVideoFrame(unsigned int width,
++                                                             unsigned int height)
++{
++  if (width == 0 || height == 0)
++    return {};
+ 
+-      if (readSize == buffSize)
+-      {
+-        if (!bBlendToBuffer)
+-        {
+-          memset(buffer, 0xff, buffSize);
+-        }
+-
+-        for (int y = 0; y < iHeight; ++y)
+-        {
+-          unsigned char *videoPtr = videoBuffer + y * stride;
+-
+-          for (int x = 0; x < iWidth; ++x, buffer += 4, videoPtr += 3)
+-          {
+-            float alpha = buffer[3] / (float)255;
+-
+-            if (bBlendToBuffer)
+-            {
+-              //B
+-              buffer[0] = alpha * (float)buffer[0] + (1 - alpha) * (float)videoPtr[0];
+-              //G
+-              buffer[1] = alpha * (float)buffer[1] + (1 - alpha) * (float)videoPtr[1];
+-              //R
+-              buffer[2] = alpha * (float)buffer[2] + (1 - alpha) * (float)videoPtr[2];
+-              //A
+-              buffer[3] = 0xff;// we are solid now
+-            }
+-            else
+-            {
+-              memcpy(buffer, videoPtr, 3);
+-            }
+-          }
+-        }
+-      }
+-      else
++  // the driver works in whole 16-pixel groups and even line counts: capture
++  // at the next such size and pick the requested grid out of it
++  const unsigned int capWidth =
++      std::min(CAPTURE_MAX_WIDTH,
++               (width + CAPTURE_WIDTH_ALIGN - 1) / CAPTURE_WIDTH_ALIGN * CAPTURE_WIDTH_ALIGN);
++  const unsigned int capHeight = std::min(CAPTURE_MAX_HEIGHT, (height + 1) & ~1u);
++
++  std::vector<uint8_t> bgr;
++  if (!ReadVideoFrame(bgr, capWidth, capHeight))
++    return {};
++
++  auto bgra = std::make_unique<uint8_t[]>(static_cast<size_t>(width) * height * 4);
++  uint8_t* out = bgra.get();
++  for (unsigned int y = 0; y < height; ++y)
++  {
++    const uint8_t* row =
++        bgr.data() + static_cast<size_t>(y * static_cast<uint64_t>(capHeight) / height) * capWidth * 3;
++    for (unsigned int x = 0; x < width; ++x, out += 4)
++    {
++      const uint8_t* v = row + static_cast<size_t>(x * static_cast<uint64_t>(capWidth) / width) * 3;
++      out[0] = v[0];
++      out[1] = v[1];
++      out[2] = v[2];
++      out[3] = 255;
++    }
++  }
++  return bgra;
++}
++
++void CScreenshotAML::BlendVideoUnderGui(
++    uint8_t* pixels, unsigned int width, unsigned int height, int stride, AVPixelFormat format)
++{
++  if (!pixels || width == 0 || height == 0)
++    return;
++
++  CRect dest = GetVideoRect();
++  dest.Intersect(CRect(0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height)));
++  const unsigned int x0 = static_cast<unsigned int>(std::lround(dest.x1));
++  const unsigned int y0 = static_cast<unsigned int>(std::lround(dest.y1));
++  const unsigned int x1 = std::min(width, static_cast<unsigned int>(std::lround(dest.x2)));
++  const unsigned int y1 = std::min(height, static_cast<unsigned int>(std::lround(dest.y2)));
++  if (x1 <= x0 || y1 <= y0)
++    return;
++
++  const unsigned int videoWidth = x1 - x0;
++  const unsigned int videoHeight = y1 - y0;
++  const auto video = CaptureVideoFrame(videoWidth, videoHeight);
++  if (!video)
++    return;
++
++  const size_t rowBytes = static_cast<size_t>(std::abs(stride));
++  const unsigned int bpp = BytesPerPixel(format);
++  for (unsigned int y = 0; y < videoHeight; ++y)
++  {
++    // the readback is bottom-up when the stride is negative
++    const unsigned int row = y0 + y;
++    uint8_t* line = pixels + (stride < 0 ? height - 1 - row : row) * rowBytes;
++    const uint8_t* v = video.get() + static_cast<size_t>(y) * videoWidth * 4;
++    for (unsigned int x = 0; x < videoWidth; ++x, v += 4)
++    {
++      if (!BlendPixel(line + static_cast<size_t>(x0 + x) * bpp, v, format))
+       {
+-        usleep(10000);
+-        retry--;
++        CLog::LogF(LOGWARNING, "readback format {} not handled; video left out",
++                   static_cast<int>(format));
++        return;
+       }
+     }
+-    close(captureFd);
+-    delete [] videoBuffer;
+   }
+ }
++
++void CScreenshotAML::SetVideoRect(const CRect& dest)
++{
++  std::unique_lock<std::mutex> lock(videoRectLock);
++  videoRect = dest;
++}
++
++CRect CScreenshotAML::GetVideoRect()
++{
++  std::unique_lock<std::mutex> lock(videoRectLock);
++  return videoRect;
++}
+diff --git a/xbmc/utils/ScreenshotAML.h b/xbmc/utils/ScreenshotAML.h
+index 26176182a0..4fe69e3923 100644
+--- a/xbmc/utils/ScreenshotAML.h
++++ b/xbmc/utils/ScreenshotAML.h
+@@ -8,10 +8,33 @@
+ 
+ #pragma once
+ 
++#include "utils/Geometry.h"
++
++#include <cstdint>
++#include <memory>
++
++extern "C"
++{
++#include <libavutil/pixfmt.h>
++}
++
+ class CScreenshotAML
+ {
+-  public:
+-    // Captures the current visible video framebuffer and blends it into
+-    // the passed overlay. The buffer format is BGRA (4 byte)
+-    static void CaptureVideoFrame(unsigned char *buffer, int iWidth, int iHeight, bool bBlendToBuffer = true);
++public:
++  //! Read the picture shown on the video layer through the amvideocap driver,
++  //! scaled to width x height (at most 3840x2160): BGRA, opaque, top-down rows
++  //! of width * 4 bytes. Empty when no video is shown or the read fails.
++  static std::unique_ptr<uint8_t[]> CaptureVideoFrame(unsigned int width, unsigned int height);
++
++  //! Put the video picture under a GUI readback where the GUI is not opaque.
++  //! The GUI is drawn over a transparent black clear, so its colours are
++  //! premultiplied: out = gui + video * (1 - alpha). stride is signed
++  //! (negative for bottom-up rows); format is one the GL readback delivers.
++  static void BlendVideoUnderGui(
++      uint8_t* pixels, unsigned int width, unsigned int height, int stride, AVPixelFormat format);
++
++  //! The video destination rectangle in GUI coordinates, published by the
++  //! renderer; an empty rectangle while no video is shown.
++  static void SetVideoRect(const CRect& dest);
++  static CRect GetVideoRect();
+ };
+diff --git a/xbmc/windowing/amlogic/CMakeLists.txt b/xbmc/windowing/amlogic/CMakeLists.txt
+index 3c7b5796c5..d649174d80 100644
+--- a/xbmc/windowing/amlogic/CMakeLists.txt
++++ b/xbmc/windowing/amlogic/CMakeLists.txt
+@@ -7,8 +7,10 @@ set(HEADERS WinSystemAmlogic.h
+             AMLDisplay.h)
+ 
+ if(TARGET ${APP_NAME_LC}::OpenGLES)
+-  list(APPEND SOURCES WinSystemAmlogicGLESContext.cpp)
+-  list(APPEND HEADERS WinSystemAmlogicGLESContext.h)
++  list(APPEND SOURCES WinSystemAmlogicGLESContext.cpp
++                      ScreenshotSurfaceAML.cpp)
++  list(APPEND HEADERS WinSystemAmlogicGLESContext.h
++                      ScreenshotSurfaceAML.h)
+ endif()
+ 
+ core_add_library(windowing_Amlogic)
+diff --git a/xbmc/windowing/amlogic/ScreenshotSurfaceAML.cpp b/xbmc/windowing/amlogic/ScreenshotSurfaceAML.cpp
+new file mode 100644
+index 0000000000..e5e5d57aa6
+--- /dev/null
++++ b/xbmc/windowing/amlogic/ScreenshotSurfaceAML.cpp
+@@ -0,0 +1,32 @@
++/*
++ *  Copyright (C) 2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#include "ScreenshotSurfaceAML.h"
++
++#include "utils/Screenshot.h"
++#include "utils/ScreenshotAML.h"
++
++void CScreenshotSurfaceAML::Register()
++{
++  CScreenShot::Register(CScreenshotSurfaceAML::CreateSurface);
++}
++
++std::unique_ptr<IScreenshotSurface> CScreenshotSurfaceAML::CreateSurface()
++{
++  return std::make_unique<CScreenshotSurfaceAML>();
++}
++
++bool CScreenshotSurfaceAML::Read(const ScreenshotContext& ctx)
++{
++  if (!CScreenshotSurfaceGLES::Read(ctx))
++    return false;
++
++  CScreenshotAML::BlendVideoUnderGui(m_buffer, static_cast<unsigned int>(m_width),
++                                     static_cast<unsigned int>(m_height), m_stride, m_format);
++  return true;
++}
+diff --git a/xbmc/windowing/amlogic/ScreenshotSurfaceAML.h b/xbmc/windowing/amlogic/ScreenshotSurfaceAML.h
+new file mode 100644
+index 0000000000..19f59cd329
+--- /dev/null
++++ b/xbmc/windowing/amlogic/ScreenshotSurfaceAML.h
+@@ -0,0 +1,24 @@
++/*
++ *  Copyright (C) 2026 Team Kodi
++ *  This file is part of Kodi - https://kodi.tv
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ *  See LICENSES/README.md for more information.
++ */
++
++#pragma once
++
++#include "rendering/gles/ScreenshotSurfaceGLES.h"
++
++#include <memory>
++
++//! The GLES framebuffer readback with the Amlogic video layer, which is never
++//! in the framebuffer, put under the GUI.
++class CScreenshotSurfaceAML : public CScreenshotSurfaceGLES
++{
++public:
++  static void Register();
++  static std::unique_ptr<IScreenshotSurface> CreateSurface();
++
++  bool Read(const ScreenshotContext& ctx) override;
++};
+diff --git a/xbmc/windowing/amlogic/WinSystemAmlogic.cpp b/xbmc/windowing/amlogic/WinSystemAmlogic.cpp
+index 49755cee01..7ca028f09c 100644
+--- a/xbmc/windowing/amlogic/WinSystemAmlogic.cpp
++++ b/xbmc/windowing/amlogic/WinSystemAmlogic.cpp
+@@ -22,7 +22,7 @@
+ #include "windowing/Resolution.h"
+ #include "platform/linux/powermanagement/LinuxPowerSyscall.h"
+ #include "platform/linux/FDEventMonitor.h"
+-#include "rendering/gles/ScreenshotSurfaceGLES.h"
++#include "ScreenshotSurfaceAML.h"
+ #include "resources/LocalizeStrings.h"
+ #include "resources/ResourcesComponent.h"
+ #include "settings/DisplaySettings.h"
+@@ -446,7 +446,7 @@ bool CWinSystemAmlogic::InitWindowSystem()
+   RETRO::CRPProcessInfoAmlogic::Register();
+   RETRO::CRPProcessInfoAmlogic::RegisterRendererFactory(new RETRO::CRendererFactoryOpenGLES);
+   CRendererAML::Register();
+-  CScreenshotSurfaceGLES::Register();
++  CScreenshotSurfaceAML::Register();
+ 
+   auto setting = settings->GetSetting(CSettings::SETTING_VIDEOPLAYER_USEDISPLAYASCLOCK);
+   if (setting)
+-- 
+2.43.0
+
