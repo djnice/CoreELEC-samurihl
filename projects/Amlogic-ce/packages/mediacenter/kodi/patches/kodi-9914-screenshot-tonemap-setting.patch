@@ -1,0 +1,868 @@
+From 2b74e3ef15a7325ce8130e46458c6ad25fd1f2a5 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Mon, 12 Oct 2026 10:13:31 +0200
+Subject: [PATCH 2/2] Screenshot: setting to tone map HDR screenshots to SDR
+
+debug.screenshottonemap (System > Logging, default on): screenshots of HDR
+video are converted to SDR so they look right in any image viewer; off keeps
+the video's HDR coding (PQ or HLG, BT.2020) and tags the PNG with it.
+
+- The writer tone maps an HDR-tagged capture with the color managed
+  conversion (and the mastering metadata) the thumbnails use.
+- A screenshot surface may report the coding of its bytes when it is not the
+  output's; the composite tap uses it.
+- AML: the amvideocap driver is asked to map an HDR source to SDR (VICP) or
+  to keep its coding, and reports what it did; the capture is tagged with the
+  coding it is in. When the video stays HDR the GUI (BT.709, sRGB curve, white at
+  the GUI peak luminance setting) is converted into it and blended in linear
+  light, so the composite is one consistent HDR picture.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../resources/strings.po                      |  14 +-
+ system/settings/settings.xml                  |   5 +
+ xbmc/application/Application.cpp              |   3 +-
+ .../HwDecRender/RendererAML.cpp               |  42 ++-
+ .../VideoRenderers/HwDecRender/RendererAML.h  |   2 +
+ xbmc/settings/Settings.h                      |   1 +
+ xbmc/utils/IScreenshotSurface.h               |  21 ++
+ xbmc/utils/Screenshot.cpp                     |  26 ++
+ xbmc/utils/ScreenshotAML.cpp                  | 320 ++++++++++++++----
+ xbmc/utils/ScreenshotAML.h                    |  49 ++-
+ .../amlogic/ScreenshotSurfaceAML.cpp          |  19 +-
+ 11 files changed, 418 insertions(+), 84 deletions(-)
+
+diff --git a/addons/resource.language.en_gb/resources/strings.po b/addons/resource.language.en_gb/resources/strings.po
+index 9d7d2fd423..115737335a 100644
+--- a/addons/resource.language.en_gb/resources/strings.po
++++ b/addons/resource.language.en_gb/resources/strings.po
+@@ -25399,7 +25399,19 @@ msgctxt "#39217"
+ msgid "Best"
+ msgstr ""
+ 
+-#empty strings from id 39218 to 39899
++#. Label of the setting "Tone map HDR screenshots to SDR"
++#: system/settings/settings.xml
++msgctxt "#39218"
++msgid "Tone map HDR screenshots to SDR"
++msgstr ""
++
++#. Description of setting with label #39218 "Tone map HDR screenshots to SDR"
++#: system/settings/settings.xml
++msgctxt "#39219"
++msgid "Convert screenshots of HDR video to SDR, so they look right in any image viewer. When disabled the picture keeps the video's HDR coding (PQ or HLG, BT.2020) and is tagged with it."
++msgstr ""
++
++#empty strings from id 39220 to 39899
+ 
+ #. List formatting: pattern used to join a list of exactly two items, e.g. "A and B"
+ #. STR_LIST_AND_TWO
+diff --git a/system/settings/settings.xml b/system/settings/settings.xml
+index 2bc889bfc2..4208a4e22b 100755
+--- a/system/settings/settings.xml
++++ b/system/settings/settings.xml
+@@ -4088,6 +4088,11 @@
+             <heading>657</heading>
+           </control>
+         </setting>
++        <setting id="debug.screenshottonemap" type="boolean" label="39218" help="39219">
++          <level>1</level>
++          <default>true</default>
++          <control type="toggle" />
++        </setting>
+       </group>
+       <group id="2" label="14111">
+         <setting id="eventlog.enabled" type="boolean" label="14112" help="36460">
+diff --git a/xbmc/application/Application.cpp b/xbmc/application/Application.cpp
+index d26f24c8ac..9d55741f95 100644
+--- a/xbmc/application/Application.cpp
++++ b/xbmc/application/Application.cpp
+@@ -877,7 +877,8 @@ void ServiceCaptureTaps()
+   result.height = static_cast<unsigned int>(surface->GetHeight());
+   result.stride = surface->GetStride();
+   result.format = surface->GetFormat();
+-  result.color = GetOutputColorMetadata(*winSystem);
++  if (!surface->GetColor(result.color))
++    result.color = GetOutputColorMetadata(*winSystem);
+   result.content = CaptureContent::COMPOSITE; // this tap is the composite half
+ 
+   captureService->Complete(request, result);
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.cpp
+index fff909215b..b5bdd43c69 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.cpp
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.cpp
+@@ -40,7 +40,7 @@ CRendererAML::CRendererAML()
+ CRendererAML::~CRendererAML()
+ {
+   Reset();
+-  CScreenshotAML::SetVideoRect(CRect());
++  CScreenshotAML::SetVideo(CRect(), AMLVideoColor());
+ }
+ 
+ void CRendererAML::EndRenderSession()
+@@ -157,6 +157,23 @@ bool CRendererAML::Configure(const VideoPicture &picture, float fps, unsigned in
+              GetFlagsColorPrimaries(picture.color_primaries) |
+              GetFlagsStereoMode(picture.stereoMode);
+ 
++  // the coding a screenshot of this video is in when it is not tone mapped
++  m_videoColor = AMLVideoColor();
++  m_videoColor.primaries = picture.color_primaries;
++  m_videoColor.transfer = picture.color_transfer;
++  if (picture.hdrType == StreamHdrType::HDR_TYPE_HLG)
++    m_videoColor.transfer = AVCOL_TRC_ARIB_STD_B67;
++  else if (picture.hdrType != StreamHdrType::HDR_TYPE_NONE &&
++           m_videoColor.transfer != AVCOL_TRC_ARIB_STD_B67)
++    m_videoColor.transfer = AVCOL_TRC_SMPTE2084; // HDR10(+), the Dolby Vision base layer
++  if (picture.hdrType != StreamHdrType::HDR_TYPE_NONE &&
++      (picture.color_primaries <= 0 || picture.color_primaries == AVCOL_PRI_UNSPECIFIED))
++    m_videoColor.primaries = AVCOL_PRI_BT2020;
++  m_videoColor.hasDisplayMetadata = picture.hasDisplayMetadata;
++  m_videoColor.displayMetadata = picture.displayMetadata;
++  m_videoColor.hasLightMetadata = picture.hasLightMetadata;
++  m_videoColor.lightMetadata = picture.lightMetadata;
++
+   // Calculate the input frame aspect ratio.
+   CalculateFrameAspectRatio(picture.iDisplayWidth, picture.iDisplayHeight);
+   SetViewMode(m_videoSettings.m_ViewMode);
+@@ -368,7 +385,7 @@ bool CRendererAML::Flush(bool saveBuffers)
+ void CRendererAML::RenderUpdate(int index, int index2, bool clear, unsigned int flags, unsigned int alpha)
+ {
+   ManageRenderArea();
+-  CScreenshotAML::SetVideoRect(m_destRect);
++  CScreenshotAML::SetVideo(m_destRect, m_videoColor);
+ 
+   CAMLVideoBuffer *amli = dynamic_cast<CAMLVideoBuffer *>(m_buffers[index].videoBuffer);
+   if(amli && amli->m_amlCodec)
+@@ -396,19 +413,26 @@ bool CRendererAML::CaptureVideoFrame(const KODI::RENDERING::CAPTURE::CaptureSpec
+       spec.width ? spec.width : static_cast<unsigned int>(std::lround(m_destRect.Width()));
+   const unsigned int height =
+       spec.height ? spec.height : static_cast<unsigned int>(std::lround(m_destRect.Height()));
+-  auto pixels = CScreenshotAML::CaptureVideoFrame(width, height);
+-  if (!pixels)
++  const bool tonemap = CServiceBroker::GetSettingsComponent()->GetSettings()->GetBool(
++      CSettings::SETTING_DEBUG_SCREENSHOTTONEMAP);
++  AMLVideoFrame frame = CScreenshotAML::CaptureVideoFrame(width, height, tonemap);
++  if (!frame.bgra)
+     return false;
+ 
+-  result.pixels = std::make_shared<CHeapCapturePixels>(std::move(pixels));
++  result.pixels = std::make_shared<CHeapCapturePixels>(std::move(frame.bgra));
+   result.width = width;
+   result.height = height;
+   result.stride = static_cast<int>(width * 4);
+   result.format = AV_PIX_FMT_BGRA;
+   result.content = CaptureContent::VIDEO;
+-  // the driver converts to full-range RGB and maps an HDR source to SDR
+-  result.color.primaries = AVCOL_PRI_BT709;
+-  result.color.transfer = AVCOL_TRC_BT709;
+-  result.color.range = AVCOL_RANGE_JPEG;
++  result.color = frame.color;
++  if (frame.hdr)
++  {
++    // the source peak a later SDR tone map needs
++    result.hasDisplayMetadata = m_videoColor.hasDisplayMetadata;
++    result.displayMetadata = m_videoColor.displayMetadata;
++    result.hasLightMetadata = m_videoColor.hasLightMetadata;
++    result.lightMetadata = m_videoColor.lightMetadata;
++  }
+   return true;
+ }
+diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.h b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.h
+index f69799cd09..747e598969 100644
+--- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.h
++++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.h
+@@ -9,6 +9,7 @@
+ #pragma once
+ 
+ #include "cores/VideoPlayer/VideoRenderers/BaseRenderer.h"
++#include "utils/ScreenshotAML.h"
+ 
+ class CRendererAML : public CBaseRenderer
+ {
+@@ -87,5 +88,6 @@ private:
+   } m_buffers[m_numRenderBuffers];
+ 
+   uint64_t m_prevVPts;
++  AMLVideoColor m_videoColor;
+   bool m_bConfigured;
+ };
+diff --git a/xbmc/settings/Settings.h b/xbmc/settings/Settings.h
+index 7f126e503e..b22af8f693 100644
+--- a/xbmc/settings/Settings.h
++++ b/xbmc/settings/Settings.h
+@@ -466,6 +466,7 @@ public:
+   static constexpr auto SETTING_DEBUG_EXTRALOGGING = "debug.extralogging";
+   static constexpr auto SETTING_DEBUG_SETEXTRALOGLEVEL = "debug.setextraloglevel";
+   static constexpr auto SETTING_DEBUG_SCREENSHOTPATH = "debug.screenshotpath";
++  static constexpr auto SETTING_DEBUG_SCREENSHOTTONEMAP = "debug.screenshottonemap";
+   static constexpr auto SETTING_DEBUG_SHARE_LOG = "debug.sharelog";
+   static constexpr auto SETTING_EVENTLOG_ENABLED = "eventlog.enabled";
+   static constexpr auto SETTING_EVENTLOG_ENABLED_NOTIFICATIONS = "eventlog.enablednotifications";
+diff --git a/xbmc/utils/IScreenshotSurface.h b/xbmc/utils/IScreenshotSurface.h
+index 339237f0fa..4c29b1f5af 100644
+--- a/xbmc/utils/IScreenshotSurface.h
++++ b/xbmc/utils/IScreenshotSurface.h
+@@ -8,6 +8,8 @@
+ 
+ #pragma once
+ 
++#include "guilib/iimage.h"
++
+ extern "C"
+ {
+ #include <libavutil/pixfmt.h>
+@@ -39,6 +41,15 @@ public:
+   //! source coding of the delivered bytes, handed to the consumer's swscale
+   AVPixelFormat GetFormat() const { return m_format; }
+   unsigned char* GetBuffer() const { return m_buffer; }
++  //! the coding of the delivered bytes when it is not the output's (e.g. a
++  //! video plane put under the GUI in its own HDR coding); false otherwise
++  bool GetColor(ImageColorMetadata& color) const
++  {
++    if (!m_hasColor)
++      return false;
++    color = m_color;
++    return true;
++  }
+ 
+   //! \brief Transfer buffer ownership to the caller.
+   unsigned char* TakeBuffer()
+@@ -54,4 +65,14 @@ protected:
+   int m_stride{0};
+   AVPixelFormat m_format{AV_PIX_FMT_NONE};
+   unsigned char* m_buffer{nullptr};
++
++  void SetColor(const ImageColorMetadata& color)
++  {
++    m_color = color;
++    m_hasColor = true;
++  }
++
++private:
++  bool m_hasColor{false};
++  ImageColorMetadata m_color;
+ };
+diff --git a/xbmc/utils/Screenshot.cpp b/xbmc/utils/Screenshot.cpp
+index 623b38f3dc..9852088607 100644
+--- a/xbmc/utils/Screenshot.cpp
++++ b/xbmc/utils/Screenshot.cpp
+@@ -13,6 +13,7 @@
+ #include "Util.h"
+ #include "guilib/TextureFormats.h"
+ #include "pictures/Picture.h"
++#include "rendering/capture/CaptureConvert.h"
+ #include "rendering/capture/CaptureHandle.h"
+ #include "rendering/capture/CapturePixels.h"
+ #include "rendering/capture/CaptureService.h"
+@@ -27,6 +28,7 @@
+ #include "utils/log.h"
+ 
+ #include <memory>
++#include <vector>
+ 
+ std::vector<std::function<std::unique_ptr<IScreenshotSurface>()>> CScreenShot::m_screenShotSurfaces;
+ 
+@@ -74,6 +76,30 @@ void WriteCapture(const KODI::RENDERING::CAPTURE::CaptureResult& result,
+     return;
+   }
+ 
++  // HDR to SDR on request, by the same color managed conversion (with the
++  // mastering metadata) the thumbnails use
++  const bool tonemap = CServiceBroker::GetSettingsComponent()->GetSettings()->GetBool(
++      CSettings::SETTING_DEBUG_SCREENSHOTTONEMAP);
++  if (tonemap && (result.color.transfer == AVCOL_TRC_SMPTE2084 ||
++                  result.color.transfer == AVCOL_TRC_ARIB_STD_B67))
++  {
++    std::vector<uint8_t> sdr(static_cast<size_t>(result.width) * result.height * 4);
++    if (CaptureToBGRA(result, result.width, result.height, sdr.data()))
++    {
++      ImageColorMetadata color;
++      color.primaries = AVCOL_PRI_BT709;
++      color.transfer = AVCOL_TRC_BT709;
++      color.range = AVCOL_RANGE_JPEG;
++      if (!CPicture::CreateThumbnailFromSurface(sdr.data(), result.width, result.height,
++                                                result.width * 4, filename,
++                                                XB_FMT_A8R8G8B8 | XB_FMT_OPAQUE, color))
++        CLog::Log(LOGERROR, "Unable to write screenshot {}", CURL::GetRedacted(filename));
++      return;
++    }
++    CLog::Log(LOGWARNING, "Screenshot {}: tone mapping failed, keeping the HDR coding",
++              CURL::GetRedacted(filename));
++  }
++
+   CScopedCapturePixels lock(*result.pixels);
+   if (!lock.data())
+   {
+diff --git a/xbmc/utils/ScreenshotAML.cpp b/xbmc/utils/ScreenshotAML.cpp
+index 05610c5a55..285eec8827 100644
+--- a/xbmc/utils/ScreenshotAML.cpp
++++ b/xbmc/utils/ScreenshotAML.cpp
+@@ -11,6 +11,7 @@
+ #include "utils/log.h"
+ 
+ #include <algorithm>
++#include <array>
+ #include <cerrno>
+ #include <cmath>
+ #include <cstdlib>
+@@ -28,6 +29,8 @@
+ #define AMVIDEOCAP_IOW_SET_WANTFRAME_WIDTH _IOW(AMVIDEOCAP_IOC_MAGIC, 0x02, int)
+ #define AMVIDEOCAP_IOW_SET_WANTFRAME_HEIGHT _IOW(AMVIDEOCAP_IOC_MAGIC, 0x03, int)
+ #define AMVIDEOCAP_IOW_SET_WANTFRAME_AT_FLAGS _IOW(AMVIDEOCAP_IOC_MAGIC, 0x06, int)
++#define AMVIDEOCAP_IOW_SET_WANTFRAME_TONEMAP _IOW(AMVIDEOCAP_IOC_MAGIC, 0x07, int)
++#define AMVIDEOCAP_IOR_GET_FRAME_TONEMAPPED _IOR(AMVIDEOCAP_IOC_MAGIC, 0x14, int)
+ 
+ // the capture format defaults to GE2D_FORMAT_S24_RGB, which lands as B, G, R bytes
+ 
+@@ -39,11 +42,21 @@ constexpr unsigned int CAPTURE_MAX_WIDTH = 3840;
+ constexpr unsigned int CAPTURE_MAX_HEIGHT = 2160;
+ constexpr unsigned int CAPTURE_WIDTH_ALIGN = 16;
+ 
+-std::mutex videoRectLock;
++std::mutex videoLock;
+ CRect videoRect;
++AMLVideoColor videoColor;
++
++bool IsHdrTransfer(int transfer)
++{
++  return transfer == AVCOL_TRC_SMPTE2084 || transfer == AVCOL_TRC_ARIB_STD_B67;
++}
+ 
+ // one capture of the shown picture as B, G, R rows of width * 3 bytes
+-bool ReadVideoFrame(std::vector<uint8_t>& bgr, unsigned int width, unsigned int height)
++bool ReadVideoFrame(std::vector<uint8_t>& bgr,
++                    unsigned int width,
++                    unsigned int height,
++                    bool tonemap,
++                    bool& tonemapped)
+ {
+   const int fd = open(CAPTURE_DEVICEPATH, O_RDWR);
+   if (fd < 0)
+@@ -58,10 +71,14 @@ bool ReadVideoFrame(std::vector<uint8_t>& bgr, unsigned int width, unsigned int
+     ioctl(fd, AMVIDEOCAP_IOW_SET_WANTFRAME_WIDTH, width);
+     ioctl(fd, AMVIDEOCAP_IOW_SET_WANTFRAME_HEIGHT, height);
+     ioctl(fd, AMVIDEOCAP_IOW_SET_WANTFRAME_AT_FLAGS, CAP_FLAG_AT_CURRENT);
++    ioctl(fd, AMVIDEOCAP_IOW_SET_WANTFRAME_TONEMAP, tonemap ? 1 : 0);
+     got = pread(fd, bgr.data(), bgr.size(), 0);
+     if (got < 0 && errno == ENODATA)
+       break; // the video layer is off
+   }
++  int mapped = 0;
++  // a driver without the call never maps
++  tonemapped = got == size && ioctl(fd, AMVIDEOCAP_IOR_GET_FRAME_TONEMAPPED, &mapped) == 0 && mapped;
+   close(fd);
+ 
+   if (got != size)
+@@ -72,20 +89,65 @@ bool ReadVideoFrame(std::vector<uint8_t>& bgr, unsigned int width, unsigned int
+   return true;
+ }
+ 
+-// x * (1 - alpha) added to a premultiplied channel, alpha in [0, max]
+-inline unsigned int AddUnder(unsigned int gui, unsigned int video, unsigned int alpha, unsigned int max)
++// --- transfer functions, linear light in cd/m2 ---------------------------
++
++float PqToNits(float v)
++{
++  constexpr float m1 = 2610.0f / 16384.0f;
++  constexpr float m2 = 2523.0f / 4096.0f * 128.0f;
++  constexpr float c1 = 3424.0f / 4096.0f;
++  constexpr float c2 = 2413.0f / 4096.0f * 32.0f;
++  constexpr float c3 = 2392.0f / 4096.0f * 32.0f;
++  const float p = std::pow(std::max(v, 0.0f), 1.0f / m2);
++  return 10000.0f * std::pow(std::max(p - c1, 0.0f) / (c2 - c3 * p), 1.0f / m1);
++}
++
++float NitsToPq(float nits)
+ {
+-  return std::min(max, gui + (video * (max - alpha) + max / 2) / max);
++  constexpr float m1 = 2610.0f / 16384.0f;
++  constexpr float m2 = 2523.0f / 4096.0f * 128.0f;
++  constexpr float c1 = 3424.0f / 4096.0f;
++  constexpr float c2 = 2413.0f / 4096.0f * 32.0f;
++  constexpr float c3 = 2392.0f / 4096.0f * 32.0f;
++  const float y = std::pow(std::clamp(nits / 10000.0f, 0.0f, 1.0f), m1);
++  return std::pow((c1 + c2 * y) / (1.0f + c3 * y), m2);
+ }
+ 
+-inline unsigned int To10(uint8_t v)
++// HLG on a 1000 cd/m2 display; the OOTF (system gamma 1.2) applied per channel
++constexpr float HLG_PEAK = 1000.0f;
++
++float HlgToNits(float v)
+ {
+-  return (v << 2) | (v >> 6);
++  constexpr float a = 0.17883277f, b = 0.28466892f, c = 0.55991073f;
++  v = std::clamp(v, 0.0f, 1.0f);
++  const float e = v <= 0.5f ? v * v / 3.0f : (std::exp((v - c) / a) + b) / 12.0f;
++  return HLG_PEAK * std::pow(e, 1.2f);
+ }
+ 
+-inline uint16_t Load16(const uint8_t* p)
++float NitsToHlg(float nits)
+ {
+-  return static_cast<uint16_t>(p[0] | (p[1] << 8));
++  constexpr float a = 0.17883277f, b = 0.28466892f, c = 0.55991073f;
++  const float e = std::pow(std::clamp(nits / HLG_PEAK, 0.0f, 1.0f), 1.0f / 1.2f);
++  return e <= 1.0f / 12.0f ? std::sqrt(3.0f * e) : a * std::log(12.0f * e - b) + c;
++}
++
++// the GUI's curve, as the HDR GUI composite decodes it
++float SrgbToLinear(float v)
++{
++  v = std::clamp(v, 0.0f, 1.0f);
++  return v <= 0.04045f ? v / 12.92f : std::pow((v + 0.055f) / 1.055f, 2.4f);
++}
++
++// --- pixel access, channels as float in [0, 1] ----------------------------
++
++struct Pixel
++{
++  float r, g, b, a;
++};
++
++inline unsigned int Load16(const uint8_t* p)
++{
++  return p[0] | (p[1] << 8);
+ }
+ 
+ inline void Store16(uint8_t* p, unsigned int v)
+@@ -94,63 +156,89 @@ inline void Store16(uint8_t* p, unsigned int v)
+   p[1] = static_cast<uint8_t>(v >> 8);
+ }
+ 
+-// one GUI pixel over one B, G, R(, A) video pixel; false for an unknown format
+-bool BlendPixel(uint8_t* p, const uint8_t* v, AVPixelFormat format)
++inline unsigned int Quantize(float v, unsigned int max)
++{
++  return static_cast<unsigned int>(std::lround(std::clamp(v, 0.0f, 1.0f) * max));
++}
++
++bool LoadPixel(const uint8_t* p, AVPixelFormat format, Pixel& px)
+ {
+   switch (format)
+   {
+     case AV_PIX_FMT_RGBA:
+-      p[0] = AddUnder(p[0], v[2], p[3], 255);
+-      p[1] = AddUnder(p[1], v[1], p[3], 255);
+-      p[2] = AddUnder(p[2], v[0], p[3], 255);
+-      p[3] = 255;
++      px = {p[0] / 255.0f, p[1] / 255.0f, p[2] / 255.0f, p[3] / 255.0f};
+       return true;
+     case AV_PIX_FMT_BGRA:
+-      p[0] = AddUnder(p[0], v[0], p[3], 255);
+-      p[1] = AddUnder(p[1], v[1], p[3], 255);
+-      p[2] = AddUnder(p[2], v[2], p[3], 255);
+-      p[3] = 255;
++      px = {p[2] / 255.0f, p[1] / 255.0f, p[0] / 255.0f, p[3] / 255.0f};
+       return true;
+     case AV_PIX_FMT_X2BGR10LE:
+     {
+       // R in bits 0-9, G 10-19, B 20-29, alpha 30-31 (GL_UNSIGNED_INT_2_10_10_10_REV)
+       const uint32_t w = p[0] | (p[1] << 8) | (p[2] << 16) | (static_cast<uint32_t>(p[3]) << 24);
+-      const unsigned int a = (w >> 30) * 341; // 2-bit alpha on the 10-bit scale
+-      const uint32_t r = AddUnder(w & 0x3ff, To10(v[2]), a, 1023);
+-      const uint32_t g = AddUnder((w >> 10) & 0x3ff, To10(v[1]), a, 1023);
+-      const uint32_t b = AddUnder((w >> 20) & 0x3ff, To10(v[0]), a, 1023);
+-      const uint32_t o = r | (g << 10) | (b << 20) | (3u << 30);
+-      p[0] = static_cast<uint8_t>(o);
+-      p[1] = static_cast<uint8_t>(o >> 8);
+-      p[2] = static_cast<uint8_t>(o >> 16);
+-      p[3] = static_cast<uint8_t>(o >> 24);
++      px = {(w & 0x3ff) / 1023.0f, ((w >> 10) & 0x3ff) / 1023.0f, ((w >> 20) & 0x3ff) / 1023.0f,
++            (w >> 30) / 3.0f};
+       return true;
+     }
+     case AV_PIX_FMT_RGBA64LE:
+-    {
+-      const unsigned int a = Load16(p + 6);
+-      Store16(p + 0, AddUnder(Load16(p + 0), v[2] * 257u, a, 65535));
+-      Store16(p + 2, AddUnder(Load16(p + 2), v[1] * 257u, a, 65535));
+-      Store16(p + 4, AddUnder(Load16(p + 4), v[0] * 257u, a, 65535));
+-      Store16(p + 6, 65535);
++      px = {Load16(p) / 65535.0f, Load16(p + 2) / 65535.0f, Load16(p + 4) / 65535.0f,
++            Load16(p + 6) / 65535.0f};
+       return true;
+-    }
+     default:
+       return false;
+   }
+ }
+ 
++// opaque
++void StorePixel(uint8_t* p, AVPixelFormat format, float r, float g, float b)
++{
++  switch (format)
++  {
++    case AV_PIX_FMT_RGBA:
++      p[0] = Quantize(r, 255);
++      p[1] = Quantize(g, 255);
++      p[2] = Quantize(b, 255);
++      p[3] = 255;
++      break;
++    case AV_PIX_FMT_BGRA:
++      p[0] = Quantize(b, 255);
++      p[1] = Quantize(g, 255);
++      p[2] = Quantize(r, 255);
++      p[3] = 255;
++      break;
++    case AV_PIX_FMT_X2BGR10LE:
++    {
++      const uint32_t w = Quantize(r, 1023) | (Quantize(g, 1023) << 10) |
++                         (Quantize(b, 1023) << 20) | (3u << 30);
++      p[0] = static_cast<uint8_t>(w);
++      p[1] = static_cast<uint8_t>(w >> 8);
++      p[2] = static_cast<uint8_t>(w >> 16);
++      p[3] = static_cast<uint8_t>(w >> 24);
++      break;
++    }
++    case AV_PIX_FMT_RGBA64LE:
++      Store16(p + 0, Quantize(r, 65535));
++      Store16(p + 2, Quantize(g, 65535));
++      Store16(p + 4, Quantize(b, 65535));
++      Store16(p + 6, 65535);
++      break;
++    default:
++      break;
++  }
++}
++
+ unsigned int BytesPerPixel(AVPixelFormat format)
+ {
+   return format == AV_PIX_FMT_RGBA64LE ? 8 : 4;
+ }
+ } // namespace
+ 
+-std::unique_ptr<uint8_t[]> CScreenshotAML::CaptureVideoFrame(unsigned int width,
+-                                                             unsigned int height)
++AMLVideoFrame CScreenshotAML::CaptureVideoFrame(unsigned int width,
++                                                unsigned int height,
++                                                bool tonemap)
+ {
++  AMLVideoFrame frame;
+   if (width == 0 || height == 0)
+-    return {};
++    return frame;
+ 
+   // the driver works in whole 16-pixel groups and even line counts: capture
+   // at the next such size and pick the requested grid out of it
+@@ -160,11 +248,12 @@ std::unique_ptr<uint8_t[]> CScreenshotAML::CaptureVideoFrame(unsigned int width,
+   const unsigned int capHeight = std::min(CAPTURE_MAX_HEIGHT, (height + 1) & ~1u);
+ 
+   std::vector<uint8_t> bgr;
+-  if (!ReadVideoFrame(bgr, capWidth, capHeight))
+-    return {};
++  bool tonemapped = false;
++  if (!ReadVideoFrame(bgr, capWidth, capHeight, tonemap, tonemapped))
++    return frame;
+ 
+-  auto bgra = std::make_unique<uint8_t[]>(static_cast<size_t>(width) * height * 4);
+-  uint8_t* out = bgra.get();
++  frame.bgra = std::make_unique<uint8_t[]>(static_cast<size_t>(width) * height * 4);
++  uint8_t* out = frame.bgra.get();
+   for (unsigned int y = 0; y < height; ++y)
+   {
+     const uint8_t* row =
+@@ -178,14 +267,38 @@ std::unique_ptr<uint8_t[]> CScreenshotAML::CaptureVideoFrame(unsigned int width,
+       out[3] = 255;
+     }
+   }
+-  return bgra;
++
++  // the driver converts to full-range RGB with the source's matrix; an HDR
++  // source keeps its coding unless the driver mapped it to SDR
++  const AMLVideoColor source = GetVideoColor();
++  frame.hdr = !tonemapped && IsHdrTransfer(source.transfer);
++  frame.color.range = AVCOL_RANGE_JPEG;
++  if (frame.hdr)
++  {
++    frame.color.primaries =
++        source.primaries > 0 && source.primaries != AVCOL_PRI_UNSPECIFIED ? source.primaries
++                                                                           : AVCOL_PRI_BT2020;
++    frame.color.transfer = source.transfer;
++  }
++  else
++  {
++    frame.color.primaries = AVCOL_PRI_BT709;
++    frame.color.transfer = AVCOL_TRC_BT709;
++  }
++  return frame;
+ }
+ 
+-void CScreenshotAML::BlendVideoUnderGui(
+-    uint8_t* pixels, unsigned int width, unsigned int height, int stride, AVPixelFormat format)
++bool CScreenshotAML::BlendVideoUnderGui(uint8_t* pixels,
++                                        unsigned int width,
++                                        unsigned int height,
++                                        int stride,
++                                        AVPixelFormat format,
++                                        bool tonemap,
++                                        float guiWhiteNits,
++                                        ImageColorMetadata& color)
+ {
+   if (!pixels || width == 0 || height == 0)
+-    return;
++    return false;
+ 
+   CRect dest = GetVideoRect();
+   dest.Intersect(CRect(0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height)));
+@@ -194,42 +307,123 @@ void CScreenshotAML::BlendVideoUnderGui(
+   const unsigned int x1 = std::min(width, static_cast<unsigned int>(std::lround(dest.x2)));
+   const unsigned int y1 = std::min(height, static_cast<unsigned int>(std::lround(dest.y2)));
+   if (x1 <= x0 || y1 <= y0)
+-    return;
++    return false;
+ 
+   const unsigned int videoWidth = x1 - x0;
+   const unsigned int videoHeight = y1 - y0;
+-  const auto video = CaptureVideoFrame(videoWidth, videoHeight);
+-  if (!video)
+-    return;
++  const AMLVideoFrame video = CaptureVideoFrame(videoWidth, videoHeight, tonemap);
++  if (!video.bgra)
++    return false;
++
++  Pixel probe;
++  if (!LoadPixel(pixels, format, probe))
++  {
++    CLog::LogF(LOGWARNING, "readback format {} not handled; video left out",
++               static_cast<int>(format));
++    return false;
++  }
+ 
+   const size_t rowBytes = static_cast<size_t>(std::abs(stride));
+   const unsigned int bpp = BytesPerPixel(format);
+-  for (unsigned int y = 0; y < videoHeight; ++y)
+-  {
++  auto line = [&](unsigned int row) {
+     // the readback is bottom-up when the stride is negative
+-    const unsigned int row = y0 + y;
+-    uint8_t* line = pixels + (stride < 0 ? height - 1 - row : row) * rowBytes;
+-    const uint8_t* v = video.get() + static_cast<size_t>(y) * videoWidth * 4;
+-    for (unsigned int x = 0; x < videoWidth; ++x, v += 4)
++    return pixels + (stride < 0 ? height - 1 - row : row) * rowBytes;
++  };
++
++  if (!video.hdr)
++  {
++    // SDR on SDR: premultiplied GUI over the video, in code values
++    for (unsigned int y = 0; y < videoHeight; ++y)
++    {
++      uint8_t* p = line(y0 + y) + static_cast<size_t>(x0) * bpp;
++      const uint8_t* v = video.bgra.get() + static_cast<size_t>(y) * videoWidth * 4;
++      for (unsigned int x = 0; x < videoWidth; ++x, p += bpp, v += 4)
++      {
++        Pixel g;
++        LoadPixel(p, format, g);
++        const float k = 1.0f - g.a;
++        StorePixel(p, format, g.r + v[2] / 255.0f * k, g.g + v[1] / 255.0f * k,
++                   g.b + v[0] / 255.0f * k);
++      }
++    }
++    return false;
++  }
++
++  // the video keeps its HDR coding: the whole picture takes it, the GUI
++  // (BT.709, sRGB curve) is converted into it and blended in linear light
++  const bool pq = video.color.transfer == AVCOL_TRC_SMPTE2084;
++  std::array<float, 256> videoNits;
++  for (unsigned int i = 0; i < 256; ++i)
++    videoNits[i] = pq ? PqToNits(i / 255.0f) : HlgToNits(i / 255.0f);
++  auto encode = [pq](float nits) { return pq ? NitsToPq(nits) : NitsToHlg(nits); };
++  const float white = guiWhiteNits > 0.0f ? guiWhiteNits : 203.0f;
++  // BT.709 -> BT.2020 primaries, linear light
++  constexpr float M[3][3] = {{0.6274f, 0.3293f, 0.0433f},
++                             {0.0691f, 0.9195f, 0.0114f},
++                             {0.0164f, 0.0880f, 0.8956f}};
++  const float black = encode(0.0f);
++
++  for (unsigned int row = 0; row < height; ++row)
++  {
++    uint8_t* p = line(row);
++    const bool inVideo = row >= y0 && row < y1;
++    for (unsigned int x = 0; x < width; ++x, p += bpp)
+     {
+-      if (!BlendPixel(line + static_cast<size_t>(x0 + x) * bpp, v, format))
++      Pixel g;
++      LoadPixel(p, format, g);
++      float vr = 0.0f, vg = 0.0f, vb = 0.0f; // video, linear
++      if (inVideo && x >= x0 && x < x1)
++      {
++        const uint8_t* v =
++            video.bgra.get() + (static_cast<size_t>(row - y0) * videoWidth + (x - x0)) * 4;
++        if (g.a <= 0.0f)
++        {
++          StorePixel(p, format, v[2] / 255.0f, v[1] / 255.0f, v[0] / 255.0f);
++          continue;
++        }
++        vr = videoNits[v[2]];
++        vg = videoNits[v[1]];
++        vb = videoNits[v[0]];
++      }
++      else if (g.a <= 0.0f)
++      {
++        StorePixel(p, format, black, black, black);
++        continue;
++      }
++      // the GUI colour, unpremultiplied, in linear light at its white level
++      float gr = 0.0f, gg = 0.0f, gb = 0.0f;
++      if (g.a > 0.0f)
+       {
+-        CLog::LogF(LOGWARNING, "readback format {} not handled; video left out",
+-                   static_cast<int>(format));
+-        return;
++        gr = white * SrgbToLinear(g.r / g.a);
++        gg = white * SrgbToLinear(g.g / g.a);
++        gb = white * SrgbToLinear(g.b / g.a);
+       }
++      const float r = M[0][0] * gr + M[0][1] * gg + M[0][2] * gb;
++      const float gn = M[1][0] * gr + M[1][1] * gg + M[1][2] * gb;
++      const float b = M[2][0] * gr + M[2][1] * gg + M[2][2] * gb;
++      StorePixel(p, format, encode(r * g.a + vr * (1.0f - g.a)),
++                 encode(gn * g.a + vg * (1.0f - g.a)), encode(b * g.a + vb * (1.0f - g.a)));
+     }
+   }
++  color = video.color;
++  return true;
+ }
+ 
+-void CScreenshotAML::SetVideoRect(const CRect& dest)
++void CScreenshotAML::SetVideo(const CRect& dest, const AMLVideoColor& color)
+ {
+-  std::unique_lock<std::mutex> lock(videoRectLock);
++  std::unique_lock<std::mutex> lock(videoLock);
+   videoRect = dest;
++  videoColor = color;
+ }
+ 
+ CRect CScreenshotAML::GetVideoRect()
+ {
+-  std::unique_lock<std::mutex> lock(videoRectLock);
++  std::unique_lock<std::mutex> lock(videoLock);
+   return videoRect;
+ }
++
++AMLVideoColor CScreenshotAML::GetVideoColor()
++{
++  std::unique_lock<std::mutex> lock(videoLock);
++  return videoColor;
++}
+diff --git a/xbmc/utils/ScreenshotAML.h b/xbmc/utils/ScreenshotAML.h
+index 4fe69e3923..30f5b60431 100644
+--- a/xbmc/utils/ScreenshotAML.h
++++ b/xbmc/utils/ScreenshotAML.h
+@@ -8,6 +8,7 @@
+ 
+ #pragma once
+ 
++#include "guilib/iimage.h"
+ #include "utils/Geometry.h"
+ 
+ #include <cstdint>
+@@ -15,26 +16,58 @@
+ 
+ extern "C"
+ {
++#include <libavutil/mastering_display_metadata.h>
+ #include <libavutil/pixfmt.h>
+ }
+ 
++//! The coding of the shown video, published by the renderer.
++struct AMLVideoColor
++{
++  int primaries{-1}; //!< AVColorPrimaries
++  int transfer{-1}; //!< AVColorTransferCharacteristic
++  bool hasDisplayMetadata{false};
++  AVMasteringDisplayMetadata displayMetadata{};
++  bool hasLightMetadata{false};
++  AVContentLightMetadata lightMetadata{};
++};
++
++//! A picture read from the video layer.
++struct AMLVideoFrame
++{
++  std::unique_ptr<uint8_t[]> bgra; //!< opaque BGRA, top-down rows of width * 4 bytes
++  //! the coding of the pixels: full-range RGB, BT.709 SDR when the driver
++  //! mapped an HDR source (or the source is SDR), else the source's HDR coding
++  ImageColorMetadata color;
++  bool hdr{false}; //!< color.transfer is PQ or HLG
++};
++
+ class CScreenshotAML
+ {
+ public:
+   //! Read the picture shown on the video layer through the amvideocap driver,
+-  //! scaled to width x height (at most 3840x2160): BGRA, opaque, top-down rows
+-  //! of width * 4 bytes. Empty when no video is shown or the read fails.
+-  static std::unique_ptr<uint8_t[]> CaptureVideoFrame(unsigned int width, unsigned int height);
++  //! scaled to width x height (at most 3840x2160). With tonemap the driver
++  //! maps an HDR source to SDR where it can. Empty when no video is shown.
++  static AMLVideoFrame CaptureVideoFrame(unsigned int width, unsigned int height, bool tonemap);
+ 
+   //! Put the video picture under a GUI readback where the GUI is not opaque.
+   //! The GUI is drawn over a transparent black clear, so its colours are
+   //! premultiplied: out = gui + video * (1 - alpha). stride is signed
+   //! (negative for bottom-up rows); format is one the GL readback delivers.
+-  static void BlendVideoUnderGui(
+-      uint8_t* pixels, unsigned int width, unsigned int height, int stride, AVPixelFormat format);
++  //! When the video stays in an HDR coding the GUI (BT.709, sRGB curve, white at
++  //! guiWhiteNits) is converted into it and blended in linear light; color is
++  //! then set to that coding and true is returned.
++  static bool BlendVideoUnderGui(uint8_t* pixels,
++                                 unsigned int width,
++                                 unsigned int height,
++                                 int stride,
++                                 AVPixelFormat format,
++                                 bool tonemap,
++                                 float guiWhiteNits,
++                                 ImageColorMetadata& color);
+ 
+-  //! The video destination rectangle in GUI coordinates, published by the
+-  //! renderer; an empty rectangle while no video is shown.
+-  static void SetVideoRect(const CRect& dest);
++  //! The video destination rectangle in GUI coordinates and the video's
++  //! coding, published by the renderer; an empty rectangle while no video is shown.
++  static void SetVideo(const CRect& dest, const AMLVideoColor& color);
+   static CRect GetVideoRect();
++  static AMLVideoColor GetVideoColor();
+ };
+diff --git a/xbmc/windowing/amlogic/ScreenshotSurfaceAML.cpp b/xbmc/windowing/amlogic/ScreenshotSurfaceAML.cpp
+index e5e5d57aa6..888ce83d6e 100644
+--- a/xbmc/windowing/amlogic/ScreenshotSurfaceAML.cpp
++++ b/xbmc/windowing/amlogic/ScreenshotSurfaceAML.cpp
+@@ -8,8 +8,13 @@
+ 
+ #include "ScreenshotSurfaceAML.h"
+ 
++#include "ServiceBroker.h"
++#include "rendering/gles/GuiCompositeShaderGLES.h"
++#include "settings/Settings.h"
++#include "settings/SettingsComponent.h"
+ #include "utils/Screenshot.h"
+ #include "utils/ScreenshotAML.h"
++#include "windowing/WinSystem.h"
+ 
+ void CScreenshotSurfaceAML::Register()
+ {
+@@ -26,7 +31,17 @@ bool CScreenshotSurfaceAML::Read(const ScreenshotContext& ctx)
+   if (!CScreenshotSurfaceGLES::Read(ctx))
+     return false;
+ 
+-  CScreenshotAML::BlendVideoUnderGui(m_buffer, static_cast<unsigned int>(m_width),
+-                                     static_cast<unsigned int>(m_height), m_stride, m_format);
++  const bool tonemap = CServiceBroker::GetSettingsComponent()->GetSettings()->GetBool(
++      CSettings::SETTING_DEBUG_SCREENSHOTTONEMAP);
++  // the GUI white the HDR GUI composite uses (videoscreen.guipeakluminance),
++  // in cd/m2 (PeakFromPQCode gives nits / 10000)
++  const float guiWhite =
++      10000.0f * CGuiCompositeShaderGLES::PeakFromPQCode(ctx.winSystem.GetGuiSdrPeakLuminance());
++
++  ImageColorMetadata color;
++  if (CScreenshotAML::BlendVideoUnderGui(m_buffer, static_cast<unsigned int>(m_width),
++                                         static_cast<unsigned int>(m_height), m_stride, m_format,
++                                         tonemap, guiWhite, color))
++    SetColor(color); // the video kept its HDR coding and the picture took it
+   return true;
+ }
+-- 
+2.43.0
+
