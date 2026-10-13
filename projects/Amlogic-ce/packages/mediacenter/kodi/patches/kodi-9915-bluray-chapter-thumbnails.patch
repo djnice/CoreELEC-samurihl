@@ -1,0 +1,323 @@
+From 822d404c57d0245a407f8bd15c524591f595ad97 Mon Sep 17 00:00:00 2001
+From: djnice <djnice@freemail.hu>
+Date: Tue, 13 Oct 2026 12:14:13 +0200
+Subject: [PATCH] Blu-ray chapter thumbnails
+
+The chapter thumbnails of a Blu-ray (folder or ISO, menus or not) stayed
+placeholders: they were asked for as image://video@.../index.bdmv?chapter=N,
+and discs are not extracted from. The player now names the clip each chapter
+starts in (libbluray chapter clip_ref) and its time in that clip, and the
+bookmarks dialog asks for BDMV/STREAM/<clip>.m2ts at that time (new "time"
+option of the video thumbnail loader, ExtractThumbToTexture with a time).
+
+Seeking into such a clip for a thumbnail gave up after "streams x 160"
+packets of any stream; a UHD clip carries a dozen streams and TrueHD alone
+about 1200 packets a second, so most chapters ran out before the first
+keyframe. Up to 400 video packets now count, within a large overall bound.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ xbmc/application/ApplicationPlayer.cpp        |  8 ++++
+ xbmc/application/ApplicationPlayer.h          |  1 +
+ xbmc/cores/IPlayer.h                          |  6 +++
+ xbmc/cores/VideoPlayer/DVDFileInfo.cpp        | 10 ++++-
+ .../DVDInputStreams/DVDInputStreamBluray.cpp  | 10 +++++
+ .../DVDInputStreams/DVDInputStreamBluray.h    | 13 ++++++
+ xbmc/cores/VideoPlayer/VideoPlayer.cpp        | 44 +++++++++++++++++++
+ xbmc/cores/VideoPlayer/VideoPlayer.h          |  5 +++
+ xbmc/video/VideoGeneratedImageFileLoader.cpp  |  7 ++-
+ .../video/dialogs/GUIDialogVideoBookmarks.cpp | 19 ++++++--
+ 10 files changed, 117 insertions(+), 6 deletions(-)
+
+diff --git a/xbmc/application/ApplicationPlayer.cpp b/xbmc/application/ApplicationPlayer.cpp
+index 2938369d9b..2f9f9856d7 100644
+--- a/xbmc/application/ApplicationPlayer.cpp
++++ b/xbmc/application/ApplicationPlayer.cpp
+@@ -210,6 +210,14 @@ int64_t CApplicationPlayer::GetChapterPos(int chapterIdx) const
+   return -1;
+ }
+ 
++bool CApplicationPlayer::GetChapterThumbSource(int chapterIdx,
++                                               std::string& path,
++                                               int64_t& posMs) const
++{
++  const std::shared_ptr<const IPlayer> player = GetInternal();
++  return player && player->GetChapterThumbSource(chapterIdx, path, posMs);
++}
++
+ std::vector<std::chrono::milliseconds> CApplicationPlayer::GetBookmarks() const
+ {
+   const std::shared_ptr<const IPlayer> player = GetInternal();
+diff --git a/xbmc/application/ApplicationPlayer.h b/xbmc/application/ApplicationPlayer.h
+index 094c4d19c1..bce0242356 100644
+--- a/xbmc/application/ApplicationPlayer.h
++++ b/xbmc/application/ApplicationPlayer.h
+@@ -92,6 +92,7 @@ public:
+   int GetChapter() const;
+   void GetChapterName(std::string& strChapterName, int chapterIdx = -1) const;
+   int64_t GetChapterPos(int chapterIdx = -1) const;
++  bool GetChapterThumbSource(int chapterIdx, std::string& path, int64_t& posMs) const;
+   float GetPercentage() const;
+   std::string GetPlayerState();
+   KODI::PLAYLIST::Id GetPreferredPlaylist() const;
+diff --git a/xbmc/cores/IPlayer.h b/xbmc/cores/IPlayer.h
+index 5f96bc31d3..f4c7f1fa5f 100644
+--- a/xbmc/cores/IPlayer.h
++++ b/xbmc/cores/IPlayer.h
+@@ -161,6 +161,12 @@ public:
+   virtual int GetChapter() const { return -1; }
+   virtual void GetChapterName(std::string& strChapterName, int chapterIdx = -1) const {}
+   virtual int64_t GetChapterPos(int chapterIdx = -1) const { return 0; }
++  /*! \brief Where a thumbnail of a chapter is decoded from when it is not the playing file
++   (Blu-ray: the clip the chapter starts in, BDMV/STREAM/xxxxx.m2ts, and the time in it). */
++  virtual bool GetChapterThumbSource(int chapterIdx, std::string& path, int64_t& posMs) const
++  {
++    return false;
++  }
+   virtual int  SeekChapter(int iChapter)                       { return -1; }
+ //  virtual bool GetChapterInfo(int chapter, SChapterInfo &info) { return false; }
+   virtual std::vector<std::chrono::milliseconds> GetBookmarks() const { return {}; }
+diff --git a/xbmc/cores/VideoPlayer/DVDFileInfo.cpp b/xbmc/cores/VideoPlayer/DVDFileInfo.cpp
+index ae71ee3e85..e900fc1891 100644
+--- a/xbmc/cores/VideoPlayer/DVDFileInfo.cpp
++++ b/xbmc/cores/VideoPlayer/DVDFileInfo.cpp
+@@ -115,8 +115,13 @@ bool CDVDFileInfo::SeekAndDecodeFirstPicture(CDVDDemux& demuxer,
+ 
+   CDVDVideoCodec::VCReturn iDecoderState = CDVDVideoCodec::VC_NONE;
+ 
+-  // num streams * 160 frames, should get a valid frame, if not abort.
+-  for (int attemptsLeft = demuxer.GetNrOfStreams() * 160; attemptsLeft >= 0; attemptsLeft--)
++  // Up to 400 video packets (more than a GOP) to the first picture. Only the video counts: a UHD
++  // Blu-ray clip carries a dozen other streams, TrueHD audio alone about 1200 packets a second,
++  // which used up a limit over all packets before the first keyframe after a seek. The total
++  // stays bounded for a stream that never yields a picture.
++  int videoLeft = 400;
++  for (int attemptsLeft = std::max(demuxer.GetNrOfStreams() * 160, 60000);
++       attemptsLeft >= 0 && videoLeft >= 0; attemptsLeft--)
+   {
+     DemuxPacket* pPacket = demuxer.Read();
+     packetsTried++;
+@@ -129,6 +134,7 @@ bool CDVDFileInfo::SeekAndDecodeFirstPicture(CDVDDemux& demuxer,
+       CDVDDemuxUtils::FreeDemuxPacket(pPacket);
+       continue;
+     }
++    videoLeft--;
+ 
+     codec.AddData(*pPacket);
+     CDVDDemuxUtils::FreeDemuxPacket(pPacket);
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp
+index cd64ca6cca..4e11adec83 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.cpp
+@@ -998,6 +998,16 @@ std::shared_ptr<const BlurayTitleUiSnapshot> CDVDInputStreamBluray::BuildTitleUi
+     {
+       BlurayTitleUiSnapshot::SChapter ch;
+       ch.startMs = static_cast<int64_t>(m_titleInfo->chapters[i].start / 90);
++      // where a thumbnail of the chapter comes from (the clip's own timeline starts at its
++      // in_time, which is where the clip starts in the title)
++      if (const unsigned ref = m_titleInfo->chapters[i].clip_ref;
++          m_titleInfo->clips && ref < m_titleInfo->clip_count)
++      {
++        const BLURAY_CLIP_INFO& clip = m_titleInfo->clips[ref];
++        ch.clip.assign(clip.clip_id, strnlen(clip.clip_id, sizeof(clip.clip_id)));
++        if (m_titleInfo->chapters[i].start >= clip.start_time)
++          ch.clipMs = static_cast<int64_t>((m_titleInfo->chapters[i].start - clip.start_time) / 90);
++      }
+ #if (BLURAY_VERSION >= BLURAY_VERSION_CODE(1, 5, 0))
+       // Chapter names come from the disc's metadata (bdmt_xxx.xml), exposed
+       // in title info since libbluray 1.5.0; discs without metadata leave
+diff --git a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h
+index f443ab9af9..a2f824dc3d 100644
+--- a/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h
++++ b/xbmc/cores/VideoPlayer/DVDInputStreams/DVDInputStreamBluray.h
+@@ -81,6 +81,9 @@ struct BlurayTitleUiSnapshot
+   {
+     int64_t startMs = 0;
+     std::string name;
++    // the clip the chapter starts in (BDMV/STREAM/<clip>.m2ts) and its time within that clip
++    std::string clip;
++    int64_t clipMs = -1;
+   };
+   std::vector<SChapter> chapters;
+ };
+@@ -413,6 +416,16 @@ public:
+     if (ui)
+       m_titleUiPresented = ui;
+   }
++  /* the clip a presented chapter (1-based) starts in and its time in that clip. Player thread. */
++  bool GetPresentedChapterClip(int ch, std::string& clip, int64_t& clipMs) const
++  {
++    const auto& chapters = m_titleUiPresented->chapters;
++    if (ch < 1 || static_cast<size_t>(ch) > chapters.size() || chapters[ch - 1].clip.empty())
++      return false;
++    clip = chapters[ch - 1].clip;
++    clipMs = chapters[ch - 1].clipMs;
++    return clipMs >= 0;
++  }
+ 
+   /* TS PID of the disc-dictated audio/PG stream, resolved LIVE against the
+    * CURRENT playitem's stream table. The BD stream-selection events are
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.cpp b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+index b71fff4bfe..32af8d9307 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.cpp
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.cpp
+@@ -7035,6 +7035,35 @@ int64_t CVideoPlayer::GetChapterPos(int chapterIdx) const
+   return -1;
+ }
+ 
++bool CVideoPlayer::GetChapterThumbSource(int chapterIdx, std::string& path, int64_t& posMs) const
++{
++  std::unique_lock lock(m_StateSection);
++  if (chapterIdx <= 0 || chapterIdx > static_cast<int>(m_State.chapterClips.size()))
++    return false;
++  const auto& [clip, clipMs] = m_State.chapterClips[chapterIdx - 1];
++  if (clip.empty() || clipMs < 0)
++    return false;
++
++  // index.bdmv (folder), the .iso, or a bluray:// path of either
++  std::string disc{m_item.GetPath()};
++  if (URIUtils::IsBlurayPath(disc))
++    disc = URIUtils::GetDiscFile(disc);
++  const std::string m2ts{clip + ".m2ts"};
++  if (URIUtils::IsDiscImage(disc))
++  {
++    CURL url("udf://");
++    url.SetHostName(disc);
++    url.SetFileName(URIUtils::AddFileToFolder("BDMV", "STREAM", m2ts));
++    path = url.Get();
++  }
++  else if (URIUtils::IsBDFile(disc))
++    path = URIUtils::AddFileToFolder(URIUtils::GetDirectory(disc), "STREAM", m2ts);
++  else
++    return false;
++  posMs = clipMs;
++  return true;
++}
++
+ std::optional<std::chrono::milliseconds> CVideoPlayer::GetChapterPosMs(int chapterIdx) const
+ {
+   std::unique_lock lock(m_StateSection);
+@@ -7340,6 +7369,8 @@ void CVideoPlayer::UpdatePlayState(double timeout)
+ 
+     state.chapters.clear();
+     state.rawChapters.clear();
++    state.chapterClips.clear();
++    const auto blurayInput = std::dynamic_pointer_cast<CDVDInputStreamBluray>(m_pInputStream);
+     if (const int chapterCount = m_pDemuxer->GetChapterCount(); chapterCount > 0)
+     {
+       for (int i = 0, ie = chapterCount; i < ie; ++i)
+@@ -7357,6 +7388,12 @@ void CVideoPlayer::UpdatePlayState(double timeout)
+         auto& p = state.chapters.emplace_back(std::string{}, m_Edl.GetTimeWithoutCuts(rawStart));
+         m_pDemuxer->GetChapterName(p.first, i + 1);
+         state.rawChapters.emplace_back(i + 1);
++        // a Blu-ray demuxer hands on the input stream's chapters, numbered alike
++        if (blurayInput)
++        {
++          auto& clip = state.chapterClips.emplace_back(std::string{}, -1);
++          blurayInput->GetPresentedChapterClip(i + 1, clip.first, clip.second);
++        }
+       }
+     }
+ 
+@@ -7406,6 +7443,8 @@ void CVideoPlayer::UpdatePlayState(double timeout)
+     {
+       state.chapters.clear();
+       state.rawChapters.clear();
++      state.chapterClips.clear();
++      const auto bluray = std::dynamic_pointer_cast<CDVDInputStreamBluray>(m_pInputStream);
+       if (const int chapterCount = pChapter->GetChapterCount(); chapterCount > 0)
+       {
+         for (int i = 0, ie = chapterCount; i < ie; ++i)
+@@ -7419,6 +7458,11 @@ void CVideoPlayer::UpdatePlayState(double timeout)
+           auto& p = state.chapters.emplace_back(std::string{}, m_Edl.GetTimeWithoutCuts(rawStart));
+           pChapter->GetChapterName(p.first, i + 1);
+           state.rawChapters.emplace_back(i + 1);
++          if (bluray)
++          {
++            auto& clip = state.chapterClips.emplace_back(std::string{}, -1);
++            bluray->GetPresentedChapterClip(i + 1, clip.first, clip.second);
++          }
+         }
+       }
+ 
+diff --git a/xbmc/cores/VideoPlayer/VideoPlayer.h b/xbmc/cores/VideoPlayer/VideoPlayer.h
+index 9059ab41ee..13cbf8289f 100644
+--- a/xbmc/cores/VideoPlayer/VideoPlayer.h
++++ b/xbmc/cores/VideoPlayer/VideoPlayer.h
+@@ -54,6 +54,7 @@ struct SPlayerState
+     chapter = 0;
+     chapters.clear();
+     rawChapters.clear();
++    chapterClips.clear();
+     m_bookmarks.clear();
+     canpause = false;
+     canseek = false;
+@@ -91,6 +92,9 @@ struct SPlayerState
+   // for each entry in `chapters`, the corresponding 1-based chapter index reported by the
+   // demuxer/inputstream, used to translate a visible chapter number back to a seekable one.
+   std::vector<int> rawChapters;
++  // Blu-ray: for each entry in `chapters`, the clip it starts in and its time in that clip (where
++  // its thumbnail is decoded from); empty for files
++  std::vector<std::pair<std::string, int64_t>> chapterClips;
+   // position of the bookmarks
+   std::vector<std::chrono::milliseconds> m_bookmarks;
+ 
+@@ -353,6 +357,7 @@ public:
+   int GetChapter() const override;
+   void GetChapterName(std::string& strChapterName, int chapterIdx = -1) const override;
+   int64_t GetChapterPos(int chapterIdx = -1) const override; // chapter start ts in seconds
++  bool GetChapterThumbSource(int chapterIdx, std::string& path, int64_t& posMs) const override;
+   int  SeekChapter(int iChapter) override;
+   std::vector<std::chrono::milliseconds> GetBookmarks() const override;
+   bool HasBookmarks() const;
+diff --git a/xbmc/video/VideoGeneratedImageFileLoader.cpp b/xbmc/video/VideoGeneratedImageFileLoader.cpp
+index b5a5950e84..050467a696 100644
+--- a/xbmc/video/VideoGeneratedImageFileLoader.cpp
++++ b/xbmc/video/VideoGeneratedImageFileLoader.cpp
+@@ -74,7 +74,12 @@ std::unique_ptr<CTexture> CVideoGeneratedImageFileLoader::Load(
+   int chapter = 0;
+   std::from_chars(chapterOption.data(), chapterOption.data() + chapterOption.size(), chapter);
+ 
+-  return CDVDFileInfo::ExtractThumbToTexture(item, chapter);
++  // "time": the picture at this many milliseconds (Blu-ray chapters, from their clip)
++  const std::string timeOption = imageFile.GetOption("time");
++  int64_t timeMs = -1;
++  std::from_chars(timeOption.data(), timeOption.data() + timeOption.size(), timeMs);
++
++  return CDVDFileInfo::ExtractThumbToTexture(item, chapter, timeMs);
+ }
+ 
+ } // namespace KODI::VIDEO
+diff --git a/xbmc/video/dialogs/GUIDialogVideoBookmarks.cpp b/xbmc/video/dialogs/GUIDialogVideoBookmarks.cpp
+index 446f49667d..b410dec7b2 100644
+--- a/xbmc/video/dialogs/GUIDialogVideoBookmarks.cpp
++++ b/xbmc/video/dialogs/GUIDialogVideoBookmarks.cpp
+@@ -304,9 +304,22 @@ void CGUIDialogVideoBookmarks::OnRefreshList()
+     if (CServiceBroker::GetSettingsComponent()->GetSettings()->GetBool(
+             CSettings::SETTING_MYVIDEOS_EXTRACTCHAPTERTHUMBS))
+     {
+-      auto chapterPath = IMAGE_FILES::CImageFileURL::FromFile(m_filePath, "video");
+-      chapterPath.AddOption("chapter", std::to_string(i));
+-      item->SetArt("thumb", chapterPath.ToCacheKey());
++      // a disc's chapter comes from the clip it starts in, by time (the disc itself is not
++      // extracted from); a file's by chapter number
++      std::string thumbSource;
++      int64_t thumbPosMs{0};
++      if (appPlayer->GetChapterThumbSource(i, thumbSource, thumbPosMs))
++      {
++        auto chapterPath = IMAGE_FILES::CImageFileURL::FromFile(thumbSource, "video");
++        chapterPath.AddOption("time", std::to_string(thumbPosMs));
++        item->SetArt("thumb", chapterPath.ToCacheKey());
++      }
++      else
++      {
++        auto chapterPath = IMAGE_FILES::CImageFileURL::FromFile(m_filePath, "video");
++        chapterPath.AddOption("chapter", std::to_string(i));
++        item->SetArt("thumb", chapterPath.ToCacheKey());
++      }
+     }
+ 
+     item->SetProperty("chapter", i);
+-- 
+2.43.0
+
