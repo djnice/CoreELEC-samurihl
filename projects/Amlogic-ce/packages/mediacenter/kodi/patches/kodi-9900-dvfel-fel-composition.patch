@@ -79,8 +79,9 @@ new file mode 100644
 index 0000000000..52cc57ead3
 --- /dev/null
 +++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp
-@@ -0,0 +1,877 @@
+@@ -0,0 +1,878 @@
 +/*
++ *  Copyright (C) 2026 djnice <djnice@freemail.hu>
 + *  Copyright (C) 2026 Team CoreELEC
 + *  This file is part of Kodi - https://kodi.tv
 + *
@@ -962,8 +963,9 @@ new file mode 100644
 index 0000000000..eb6264f1f6
 --- /dev/null
 +++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.h
-@@ -0,0 +1,119 @@
+@@ -0,0 +1,120 @@
 +/*
++ *  Copyright (C) 2026 djnice <djnice@freemail.hu>
 + *  Copyright (C) 2026 Team CoreELEC
 + *  This file is part of Kodi - https://kodi.tv
 + *
@@ -1233,8 +1235,9 @@ new file mode 100644
 index 0000000000..91c663650a
 --- /dev/null
 +++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/dvfel_uapi.h
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,66 @@
 +/* SPDX-License-Identifier: GPL-2.0-or-later WITH Linux-syscall-note */
++/* Copyright (C) 2026 djnice <djnice@freemail.hu> */
 +/*
 + * dvfel userspace interface (/dev/dvfel)
 + *
@@ -1304,7 +1307,13 @@ new file mode 100644
 index 0000000000..f8ed5e76d9
 --- /dev/null
 +++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.c
-@@ -0,0 +1,756 @@
+@@ -0,0 +1,762 @@
++/*
++ *  Copyright (C) 2026 djnice <djnice@freemail.hu>
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
 +#ifndef _GNU_SOURCE
 +#define _GNU_SOURCE
 +#endif
@@ -2066,7 +2075,13 @@ new file mode 100644
 index 0000000000..4dfa143ba7
 --- /dev/null
 +++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.h
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,93 @@
++/*
++ *  Copyright (C) 2026 djnice <djnice@freemail.hu>
++ *
++ *  SPDX-License-Identifier: GPL-2.0-or-later
++ */
++
 +/*
 + * felgpu - Dolby Vision FEL composition on OpenGL ES 3.2
 + *

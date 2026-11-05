@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 djnice <djnice@freemail.hu>
 /*
  * dvfel - Dolby Vision FEL composition node for Amlogic S5 (S928X)
  *

@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later WITH Linux-syscall-note */
+/* Copyright (C) 2026 djnice <djnice@freemail.hu> */
 /*
  * dvfel userspace interface (/dev/dvfel)
  *
