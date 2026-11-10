@@ -1,8 +1,13 @@
+
+
+ .../cores/VideoPlayer/DVDCodecs/Video/AMLCodec.cpp | 24 ++++++++++++++++++++--
+ 1 file changed, 22 insertions(+), 2 deletions(-)
+
 diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLCodec.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLCodec.cpp
-index 7da50e206e..b47a452809 100644
+index 56c111d..f69d865 100644
 --- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLCodec.cpp
 +++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLCodec.cpp
-@@ -3453,6 +3453,20 @@ CDVDVideoCodec::VCReturn CAMLCodec::GetPicture(VideoPicture *pVideoPicture)
+@@ -3535,6 +3535,20 @@ CDVDVideoCodec::VCReturn CAMLCodec::GetPicture(VideoPicture *pVideoPicture)
                  elapsed_since_last_frame.count(), static_cast<int>(starve_probe_delay.count()));
      }
  
@@ -23,7 +28,7 @@ index 7da50e206e..b47a452809 100644
      pVideoPicture->iFlags = 0;
  
      m_minimum_buffer_level = (streambuffer ? m_minimum_buffer_level : 0.0f);
-@@ -3460,7 +3474,13 @@ CDVDVideoCodec::VCReturn CAMLCodec::GetPicture(VideoPicture *pVideoPicture)
+@@ -3542,7 +3556,13 @@ CDVDVideoCodec::VCReturn CAMLCodec::GetPicture(VideoPicture *pVideoPicture)
      m_tp_last_frame = std::chrono::steady_clock::now();
      BDSTAGE::PictureEmitted();
  
@@ -38,7 +43,7 @@ index 7da50e206e..b47a452809 100644
        pVideoPicture->iDuration = static_cast<double>(am_private->video_rate) * DVD_TIME_BASE / UNIT_FREQ;
      else
      {
-@@ -3471,7 +3491,7 @@ CDVDVideoCodec::VCReturn CAMLCodec::GetPicture(VideoPicture *pVideoPicture)
+@@ -3553,7 +3573,7 @@ CDVDVideoCodec::VCReturn CAMLCodec::GetPicture(VideoPicture *pVideoPicture)
      }
  
      pVideoPicture->dts = DVD_NOPTS_VALUE;

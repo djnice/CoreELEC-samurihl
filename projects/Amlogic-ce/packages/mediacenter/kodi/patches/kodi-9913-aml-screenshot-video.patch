@@ -17,20 +17,19 @@ render captures) always failed: CScreenshotAML was no longer called anywhere.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- .../HwDecRender/RendererAML.cpp               |  34 +++
- .../VideoRenderers/HwDecRender/RendererAML.h  |   4 +
- xbmc/utils/ScreenshotAML.cpp                  | 286 +++++++++++++-----
- xbmc/utils/ScreenshotAML.h                    |  31 +-
- xbmc/windowing/amlogic/CMakeLists.txt         |   6 +-
- .../amlogic/ScreenshotSurfaceAML.cpp          |  32 ++
- xbmc/windowing/amlogic/ScreenshotSurfaceAML.h |  24 ++
- xbmc/windowing/amlogic/WinSystemAmlogic.cpp   |   4 +-
+
+ .../VideoRenderers/HwDecRender/RendererAML.cpp     |  34 +++
+ .../VideoRenderers/HwDecRender/RendererAML.h       |   4 +
+ xbmc/utils/ScreenshotAML.cpp                       | 286 +++++++++++++++------
+ xbmc/utils/ScreenshotAML.h                         |  31 ++-
+ xbmc/windowing/amlogic/CMakeLists.txt              |   6 +-
+ xbmc/windowing/amlogic/ScreenshotSurfaceAML.cpp    |  32 +++
+ xbmc/windowing/amlogic/ScreenshotSurfaceAML.h      |  24 ++
+ xbmc/windowing/amlogic/WinSystemAmlogic.cpp        |   4 +-
  8 files changed, 334 insertions(+), 87 deletions(-)
- create mode 100644 xbmc/windowing/amlogic/ScreenshotSurfaceAML.cpp
- create mode 100644 xbmc/windowing/amlogic/ScreenshotSurfaceAML.h
 
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.cpp
-index fd05552a47..fff909215b 100644
+index fd05552..fff9092 100644
 --- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.cpp
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.cpp
 @@ -13,6 +13,8 @@
@@ -100,7 +99,7 @@ index fd05552a47..fff909215b 100644
 +  return true;
 +}
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.h b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.h
-index 873cacf2f2..f69799cd09 100644
+index 873cacf..f69799c 100644
 --- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.h
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.h
 @@ -40,6 +40,10 @@ public:
@@ -115,7 +114,7 @@ index 873cacf2f2..f69799cd09 100644
    void Reset();
  
 diff --git a/xbmc/utils/ScreenshotAML.cpp b/xbmc/utils/ScreenshotAML.cpp
-index 7fa1fd1adb..05610c5a55 100644
+index 7fa1fd1..05610c5 100644
 --- a/xbmc/utils/ScreenshotAML.cpp
 +++ b/xbmc/utils/ScreenshotAML.cpp
 @@ -7,101 +7,229 @@
@@ -428,7 +427,7 @@ index 7fa1fd1adb..05610c5a55 100644
 +  return videoRect;
 +}
 diff --git a/xbmc/utils/ScreenshotAML.h b/xbmc/utils/ScreenshotAML.h
-index 26176182a0..4fe69e3923 100644
+index 2617618..4fe69e3 100644
 --- a/xbmc/utils/ScreenshotAML.h
 +++ b/xbmc/utils/ScreenshotAML.h
 @@ -8,10 +8,33 @@
@@ -470,7 +469,7 @@ index 26176182a0..4fe69e3923 100644
 +  static CRect GetVideoRect();
  };
 diff --git a/xbmc/windowing/amlogic/CMakeLists.txt b/xbmc/windowing/amlogic/CMakeLists.txt
-index 3c7b5796c5..d649174d80 100644
+index 3c7b579..d649174 100644
 --- a/xbmc/windowing/amlogic/CMakeLists.txt
 +++ b/xbmc/windowing/amlogic/CMakeLists.txt
 @@ -7,8 +7,10 @@ set(HEADERS WinSystemAmlogic.h
@@ -488,7 +487,7 @@ index 3c7b5796c5..d649174d80 100644
  core_add_library(windowing_Amlogic)
 diff --git a/xbmc/windowing/amlogic/ScreenshotSurfaceAML.cpp b/xbmc/windowing/amlogic/ScreenshotSurfaceAML.cpp
 new file mode 100644
-index 0000000000..e5e5d57aa6
+index 0000000..e5e5d57
 --- /dev/null
 +++ b/xbmc/windowing/amlogic/ScreenshotSurfaceAML.cpp
 @@ -0,0 +1,32 @@
@@ -526,7 +525,7 @@ index 0000000000..e5e5d57aa6
 +}
 diff --git a/xbmc/windowing/amlogic/ScreenshotSurfaceAML.h b/xbmc/windowing/amlogic/ScreenshotSurfaceAML.h
 new file mode 100644
-index 0000000000..19f59cd329
+index 0000000..19f59cd
 --- /dev/null
 +++ b/xbmc/windowing/amlogic/ScreenshotSurfaceAML.h
 @@ -0,0 +1,24 @@
@@ -555,10 +554,10 @@ index 0000000000..19f59cd329
 +  bool Read(const ScreenshotContext& ctx) override;
 +};
 diff --git a/xbmc/windowing/amlogic/WinSystemAmlogic.cpp b/xbmc/windowing/amlogic/WinSystemAmlogic.cpp
-index 49755cee01..7ca028f09c 100644
+index ee86efc..4b64326 100644
 --- a/xbmc/windowing/amlogic/WinSystemAmlogic.cpp
 +++ b/xbmc/windowing/amlogic/WinSystemAmlogic.cpp
-@@ -22,7 +22,7 @@
+@@ -25,7 +25,7 @@
  #include "windowing/Resolution.h"
  #include "platform/linux/powermanagement/LinuxPowerSyscall.h"
  #include "platform/linux/FDEventMonitor.h"
@@ -567,7 +566,7 @@ index 49755cee01..7ca028f09c 100644
  #include "resources/LocalizeStrings.h"
  #include "resources/ResourcesComponent.h"
  #include "settings/DisplaySettings.h"
-@@ -446,7 +446,7 @@ bool CWinSystemAmlogic::InitWindowSystem()
+@@ -477,7 +477,7 @@ bool CWinSystemAmlogic::InitWindowSystem()
    RETRO::CRPProcessInfoAmlogic::Register();
    RETRO::CRPProcessInfoAmlogic::RegisterRendererFactory(new RETRO::CRendererFactoryOpenGLES);
    CRendererAML::Register();
@@ -576,6 +575,3 @@ index 49755cee01..7ca028f09c 100644
  
    auto setting = settings->GetSetting(CSettings::SETTING_VIDEOPLAYER_USEDISPLAYASCLOCK);
    if (setting)
--- 
-2.43.0
-

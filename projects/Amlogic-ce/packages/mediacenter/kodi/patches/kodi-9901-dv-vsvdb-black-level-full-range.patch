@@ -1,8 +1,15 @@
+
+
+ .../resource.language.en_gb/resources/strings.po   |  2 +-
+ system/settings/settings.xml                       | 12 +++--------
+ xbmc/windowing/amlogic/WinSystemAmlogic.cpp        | 25 ++++++++++++++++++++++
+ 3 files changed, 29 insertions(+), 10 deletions(-)
+
 diff --git a/addons/resource.language.en_gb/resources/strings.po b/addons/resource.language.en_gb/resources/strings.po
-index 3c4ac8f7b4..86f39b424f 100644
+index 6b61f60..ac0a371 100644
 --- a/addons/resource.language.en_gb/resources/strings.po
 +++ b/addons/resource.language.en_gb/resources/strings.po
-@@ -26499,7 +26499,7 @@ msgstr ""
+@@ -26634,7 +26634,7 @@ msgstr ""
  #. Description of setting with label #60380
  #: system/settings/settings.xml
  msgctxt "#60381"
@@ -12,10 +19,10 @@ index 3c4ac8f7b4..86f39b424f 100644
  
  #: system/settings/settings.xml
 diff --git a/system/settings/settings.xml b/system/settings/settings.xml
-index 1c1c926b27..753cde1f40 100755
+index 8a0ac04..3b414c0 100755
 --- a/system/settings/settings.xml
 +++ b/system/settings/settings.xml
-@@ -4453,7 +4453,8 @@
+@@ -4497,7 +4497,8 @@
            <control type="spinner" format="string" />
          </setting>
          <!-- Black level advertised in the injected VSVDB (v2 min-luminance index): the
@@ -25,7 +32,7 @@ index 1c1c926b27..753cde1f40 100755
          <setting id="coreelec.amlogic.dolbyvision.vsvdb.minlum" type="integer" label="60380" help="60381" parent="coreelec.amlogic.dolbyvision.vsvdb.maxlum.override">
            <requirement>HAVE_AMCODEC</requirement>
            <level>2</level>
-@@ -4463,14 +4464,7 @@
+@@ -4507,14 +4508,7 @@
              <dependency type="visible" setting="coreelec.amlogic.dolbyvision.vsvdb.maxlum.override" operator="is">true</dependency>
            </dependencies>
            <constraints>
@@ -42,10 +49,10 @@ index 1c1c926b27..753cde1f40 100755
            <control type="spinner" format="string" />
          </setting>
 diff --git a/xbmc/windowing/amlogic/WinSystemAmlogic.cpp b/xbmc/windowing/amlogic/WinSystemAmlogic.cpp
-index 108f76cf59..49755cee01 100644
+index 7893208..ee86efc 100644
 --- a/xbmc/windowing/amlogic/WinSystemAmlogic.cpp
 +++ b/xbmc/windowing/amlogic/WinSystemAmlogic.cpp
-@@ -32,6 +32,7 @@
+@@ -35,6 +35,7 @@
  #include "settings/lib/SettingsManager.h"
  #include "guilib/DispResource.h"
  #include "utils/AMLUtils.h"
@@ -53,7 +60,7 @@ index 108f76cf59..49755cee01 100644
  #include "utils/log.h"
  #include "threads/SingleLock.h"
  
-@@ -336,6 +337,29 @@ void VS10DvFiller(const SettingConstPtr& setting, std::vector<IntegerSettingOpti
+@@ -367,6 +368,29 @@ void VS10DvFiller(const SettingConstPtr& setting, std::vector<IntegerSettingOpti
    if (aml_display_support_hdr_pq()) list.emplace_back(vs10_label(60065), DOLBY_VISION_OUTPUT_MODE_HDR10); // HDR10
    if (aml_display_support_dv()) list.emplace_back(vs10_label(60063), DOLBY_VISION_OUTPUT_MODE_IPT); // Off = native DV
  }
@@ -83,7 +90,7 @@ index 108f76cf59..49755cee01 100644
  } // namespace
  
  bool CWinSystemAmlogic::InitWindowSystem()
-@@ -398,6 +422,7 @@ bool CWinSystemAmlogic::InitWindowSystem()
+@@ -429,6 +453,7 @@ bool CWinSystemAmlogic::InitWindowSystem()
      dvMgr->RegisterSettingOptionsFiller("DolbyVisionVS10HDR10", VS10Hdr10Filler);
      dvMgr->RegisterSettingOptionsFiller("DolbyVisionVS10HDRHLG", VS10HdrHlgFiller);
      dvMgr->RegisterSettingOptionsFiller("DolbyVisionVS10DV", VS10DvFiller);

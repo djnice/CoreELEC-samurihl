@@ -23,15 +23,16 @@ set_drmProp takes a uint64_t value: OUT_FENCE_PTR passes a pointer.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- xbmc/windowing/amlogic/AMLDisplay.cpp | 187 +++++++++++++++-----------
- xbmc/windowing/amlogic/AMLDisplay.h   |  18 ++-
- 2 files changed, 123 insertions(+), 82 deletions(-)
+
+ xbmc/windowing/amlogic/AMLDisplay.cpp | 185 +++++++++++++++++++---------------
+ xbmc/windowing/amlogic/AMLDisplay.h   |  16 +++
+ 2 files changed, 121 insertions(+), 80 deletions(-)
 
 diff --git a/xbmc/windowing/amlogic/AMLDisplay.cpp b/xbmc/windowing/amlogic/AMLDisplay.cpp
-index 1f6b7d8154..2313375901 100644
+index ebe9b57..5a2dcfb 100644
 --- a/xbmc/windowing/amlogic/AMLDisplay.cpp
 +++ b/xbmc/windowing/amlogic/AMLDisplay.cpp
-@@ -253,6 +253,60 @@ void CAMLDRMUtils::CleanAndClose()
+@@ -281,6 +281,60 @@ void CAMLDRMUtils::CleanAndClose()
    }
  
    m_connection = DRM_MODE_DISCONNECTED;
@@ -92,7 +93,7 @@ index 1f6b7d8154..2313375901 100644
  }
  
  void CAMLDRMUtils::aml_init_drmDevice()
-@@ -631,73 +685,66 @@ int CAMLDRMUtils::get_drmProp(
+@@ -669,73 +723,66 @@ int CAMLDRMUtils::get_drmProp(
      unsigned int id, std::string name, unsigned int obj_type, void* data, int* data_len)
  {
    int ret = -1;
@@ -206,12 +207,9 @@ index 1f6b7d8154..2313375901 100644
    }
  
    drmModeFreeObjectProperties(props);
-@@ -763,51 +810,29 @@ bool CAMLDRMUtils::aml_output_wire_stale()
- }
- 
+@@ -804,49 +851,27 @@ bool CAMLDRMUtils::aml_output_wire_stale()
  void CAMLDRMUtils::set_drmProp(unsigned int id, std::string name,
--  unsigned int obj_type, unsigned int value, drmModeAtomicReqPtr req)
-+  unsigned int obj_type, uint64_t value, drmModeAtomicReqPtr req)
+   unsigned int obj_type, uint64_t value, drmModeAtomicReqPtr req)
  {
 -  unsigned int i;
    int res;
@@ -271,7 +269,7 @@ index 1f6b7d8154..2313375901 100644
  
  // get a property
 diff --git a/xbmc/windowing/amlogic/AMLDisplay.h b/xbmc/windowing/amlogic/AMLDisplay.h
-index b8d338ef17..8c48839f26 100644
+index e1a2dd8..1b1dcb2 100644
 --- a/xbmc/windowing/amlogic/AMLDisplay.h
 +++ b/xbmc/windowing/amlogic/AMLDisplay.h
 @@ -8,7 +8,10 @@
@@ -285,12 +283,9 @@ index b8d338ef17..8c48839f26 100644
  #include <unistd.h>
  #include <utility>
  #include <vector>
-@@ -128,9 +131,22 @@ private:
-   void apply_dv_wire_format();
-   bool leaving_dv_wire() const;
+@@ -130,7 +133,20 @@ private:
    void set_drmProp(unsigned int id, std::string name,
--    unsigned int obj_type, unsigned int value, drmModeAtomicReqPtr req);
-+    unsigned int obj_type, uint64_t value, drmModeAtomicReqPtr req);
+     unsigned int obj_type, uint64_t value, drmModeAtomicReqPtr req);
    bool SupportsFormat(drmModePlane *plane, uint32_t format);
 +
 +  struct DrmProp
@@ -306,9 +301,6 @@ index b8d338ef17..8c48839f26 100644
 +  // see find_drmProp()
 +  std::map<std::pair<uint32_t, uint32_t>, std::map<std::string, DrmProp>> m_propCache;
 +  std::mutex m_propCacheLock;
-   // The last mode set left the link in a DV tunnel format: TV-led (RGB/444
-   // 8-bit) or player-led/LLDV (YUV422 12-bit). Either one has to be handed back
-   // to the kernel on the way out - see leaving_dv_wire().
--- 
-2.43.0
-
+   // The link may carry a DV tunnel format: TV-led (RGB/444 8-bit) or
+   // player-led/LLDV (YUV422 12-bit), until it is handed back to the kernel on
+   // the way out - see leaving_dv_wire().

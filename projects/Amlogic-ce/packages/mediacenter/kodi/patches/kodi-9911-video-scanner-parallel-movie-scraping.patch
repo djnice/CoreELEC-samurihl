@@ -25,6 +25,7 @@ file to the serial scan.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
+
  .../interfaces/generic/ScriptInvocationManager.cpp |  37 +++-
  xbmc/interfaces/generic/ScriptInvocationManager.h  |  10 +
  xbmc/interfaces/python/PythonInvoker.cpp           |  13 ++
@@ -33,7 +34,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  5 files changed, 312 insertions(+), 1 deletion(-)
 
 diff --git a/xbmc/interfaces/generic/ScriptInvocationManager.cpp b/xbmc/interfaces/generic/ScriptInvocationManager.cpp
-index c6fe84593a..314825d7aa 100644
+index 952f379..72d3808 100644
 --- a/xbmc/interfaces/generic/ScriptInvocationManager.cpp
 +++ b/xbmc/interfaces/generic/ScriptInvocationManager.cpp
 @@ -157,8 +157,26 @@ bool CScriptInvocationManager::HasLanguageInvoker(const std::string &script) con
@@ -97,7 +98,7 @@ index c6fe84593a..314825d7aa 100644
    {
      if (addon != nullptr)
 diff --git a/xbmc/interfaces/generic/ScriptInvocationManager.h b/xbmc/interfaces/generic/ScriptInvocationManager.h
-index 6ae97a48ee..11dc92c4c8 100644
+index 4ade3a6..14b9d7c 100644
 --- a/xbmc/interfaces/generic/ScriptInvocationManager.h
 +++ b/xbmc/interfaces/generic/ScriptInvocationManager.h
 @@ -38,6 +38,16 @@ public:
@@ -118,7 +119,7 @@ index 6ae97a48ee..11dc92c4c8 100644
     * \brief Executes the given script asynchronously in a separate thread.
     *
 diff --git a/xbmc/interfaces/python/PythonInvoker.cpp b/xbmc/interfaces/python/PythonInvoker.cpp
-index ef608a4b86..0e26bac20d 100644
+index ef608a4..0e26bac 100644
 --- a/xbmc/interfaces/python/PythonInvoker.cpp
 +++ b/xbmc/interfaces/python/PythonInvoker.cpp
 @@ -138,6 +138,16 @@ bool CPythonInvoker::execute(const std::string& script, const std::vector<std::s
@@ -163,7 +164,7 @@ index ef608a4b86..0e26bac20d 100644
  
      onDeinitialization();
 diff --git a/xbmc/video/VideoInfoScanner.cpp b/xbmc/video/VideoInfoScanner.cpp
-index 3de2da3659..ed4a3b6ba5 100644
+index 25c0406..208c0e8 100644
 --- a/xbmc/video/VideoInfoScanner.cpp
 +++ b/xbmc/video/VideoInfoScanner.cpp
 @@ -31,6 +31,7 @@
@@ -174,7 +175,7 @@ index 3de2da3659..ed4a3b6ba5 100644
  #include "messaging/helpers/DialogHelper.h"
  #include "messaging/helpers/DialogOKHelper.h"
  #include "playlists/PlayListFileItemClassify.h"
-@@ -63,11 +64,15 @@
+@@ -64,11 +65,15 @@
  
  #include <algorithm>
  #include <chrono>
@@ -190,7 +191,7 @@ index 3de2da3659..ed4a3b6ba5 100644
  #include <unordered_map>
  #include <utility>
  
-@@ -805,6 +810,10 @@ CVideoInfoScanner::~CVideoInfoScanner()
+@@ -827,6 +832,10 @@ CVideoInfoScanner::~CVideoInfoScanner()
  
      m_database.Open();
  
@@ -201,7 +202,7 @@ index 3de2da3659..ed4a3b6ba5 100644
      bool FoundSomeInfo = false;
      std::vector<int> seenPaths;
      seenPaths.reserve(items.Size());
-@@ -912,6 +921,7 @@ CVideoInfoScanner::~CVideoInfoScanner()
+@@ -939,6 +948,7 @@ CVideoInfoScanner::~CVideoInfoScanner()
      if(pDlgProgress)
        pDlgProgress->ShowProgressBar(false);
  
@@ -209,7 +210,7 @@ index 3de2da3659..ed4a3b6ba5 100644
      m_database.Close();
      return FoundSomeInfo;
    }
-@@ -1377,6 +1387,161 @@ CVideoInfoScanner::~CVideoInfoScanner()
+@@ -1408,6 +1418,161 @@ CVideoInfoScanner::~CVideoInfoScanner()
      return edition;
    }
  
@@ -371,7 +372,7 @@ index 3de2da3659..ed4a3b6ba5 100644
    CInfoScanner::InfoRet CVideoInfoScanner::RetrieveInfoForMovie(CFileItem* pItem,
                                                                  bool bDirNames,
                                                                  ScraperPtr& info2,
-@@ -1614,6 +1779,24 @@ CVideoInfoScanner::~CVideoInfoScanner()
+@@ -1647,6 +1812,24 @@ CVideoInfoScanner::~CVideoInfoScanner()
          return HandleMovieSetAndVersions();
      }
  
@@ -396,7 +397,7 @@ index 3de2da3659..ed4a3b6ba5 100644
      if (pURL && pURL->HasUrls())
        url = *pURL;
      else if ((retVal = FindVideo(movieTitle, movieYear, info2, url, pDlgProgress)) <= 0)
-@@ -1632,6 +1815,60 @@ CVideoInfoScanner::~CVideoInfoScanner()
+@@ -1666,6 +1849,60 @@ CVideoInfoScanner::~CVideoInfoScanner()
      return InfoRet::NOT_FOUND;
    }
  
@@ -458,7 +459,7 @@ index 3de2da3659..ed4a3b6ba5 100644
        CFileItem* pItem,
        bool bDirNames,
 diff --git a/xbmc/video/VideoInfoScanner.h b/xbmc/video/VideoInfoScanner.h
-index 33e43e0549..34552bc6f2 100644
+index 4875b68..fd31474 100644
 --- a/xbmc/video/VideoInfoScanner.h
 +++ b/xbmc/video/VideoInfoScanner.h
 @@ -19,6 +19,7 @@
@@ -469,7 +470,7 @@ index 33e43e0549..34552bc6f2 100644
  #include <set>
  #include <string>
  #include <string_view>
-@@ -330,6 +331,18 @@ namespace KODI::VIDEO
+@@ -332,6 +333,18 @@ namespace KODI::VIDEO
      std::pair<InfoType, std::unique_ptr<IVideoInfoTagLoader>> ReadInfoTag(
          CFileItem& item, const ADDON::ScraperPtr& scraper, bool lookInFolder, bool resetTag);
  
@@ -488,7 +489,7 @@ index 33e43e0549..34552bc6f2 100644
      //! Sticky - never reset, so a scanner instance is good for one scan only
      std::atomic<bool> m_bStop{false};
      bool m_scanAll;
-@@ -381,6 +394,9 @@ namespace KODI::VIDEO
+@@ -387,6 +400,9 @@ namespace KODI::VIDEO
  
      mutable KODI::REGEXP::RegExpCache m_regexpCache;
  

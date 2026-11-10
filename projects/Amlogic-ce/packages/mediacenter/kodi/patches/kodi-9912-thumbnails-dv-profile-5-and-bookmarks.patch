@@ -18,43 +18,43 @@ a time, decoding on from the keyframe to that time).
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- .../DVDCodecs/Video/DVDVideoCodec.cpp         |   1 +
- .../DVDCodecs/Video/DVDVideoCodec.h           |   5 +
- .../DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp   |   4 +
- xbmc/cores/VideoPlayer/DVDFileInfo.cpp        | 288 ++++++++++++++++--
- xbmc/cores/VideoPlayer/DVDFileInfo.h          |   9 +-
- .../video/dialogs/GUIDialogVideoBookmarks.cpp |  19 +-
- 6 files changed, 297 insertions(+), 29 deletions(-)
+
+ .../VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp  |   1 +
+ .../VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h    |   4 +
+ .../DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp        |   4 +
+ xbmc/cores/VideoPlayer/DVDFileInfo.cpp             | 294 +++++++++++++++++++--
+ xbmc/cores/VideoPlayer/DVDFileInfo.h               |   9 +-
+ xbmc/video/dialogs/GUIDialogVideoBookmarks.cpp     |  19 +-
+ 6 files changed, 300 insertions(+), 31 deletions(-)
 
 diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp
-index 59388e3940..429d544b10 100644
+index 4cd55fe..06d2181 100644
 --- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp
 +++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.cpp
-@@ -51,6 +51,7 @@ void VideoPicture::Reset()
-   pict_type = 0;
+@@ -52,6 +52,7 @@ void VideoPicture::Reset()
  
    hdrType = StreamHdrType::HDR_TYPE_NONE;
+   doviRpu.reset();
 +  doviMetadata.reset();
  
    hasDisplayMetadata = false;
    hasLightMetadata = false;
 diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h
-index e5e23d6c70..a9e6783bcc 100644
+index af4c05b..c2363df 100644
 --- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h
 +++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodec.h
-@@ -18,6 +18,8 @@ extern "C" {
+@@ -18,6 +18,7 @@ extern "C" {
  #include <libavutil/mastering_display_metadata.h>
  }
  
 +#include <cstdint>
-+#include <memory>
- #include <vector>
- #include <string>
  #include <map>
-@@ -70,6 +72,9 @@ public:
-   StreamHdrType hdrType;
+ #include <memory>
+ #include <string>
+@@ -80,6 +81,9 @@ public:
    StreamHdrType hdrTypeAlt;
    std::string strDVELType;
+   std::shared_ptr<const DoviRpu> doviRpu;
 +  //! the frame's AVDOVIMetadata blob (self-contained, offsets inside), set by the software decoder
 +  //! for Dolby Vision; the thumbnail extractor rebuilds profile 5 pictures from it
 +  std::shared_ptr<const std::vector<uint8_t>> doviMetadata;
@@ -62,11 +62,11 @@ index e5e23d6c70..a9e6783bcc 100644
    bool hasDisplayMetadata = false;
    AVMasteringDisplayMetadata displayMetadata;
 diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
-index a7d4d30386..f484c4d5ac 100644
+index da85398..8da895a 100644
 --- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
 +++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/DVDVideoCodecFFmpeg.cpp
-@@ -1152,11 +1152,15 @@ bool CDVDVideoCodecFFmpeg::GetPictureCommon(VideoPicture* pVideoPicture)
-     pVideoPicture->hasLightMetadata = true;
+@@ -1199,11 +1199,15 @@ bool CDVDVideoCodecFFmpeg::GetPictureCommon(VideoPicture* pVideoPicture)
+           m_hints.dovi.dv_profile, m_hints.dovi.dv_bl_signal_compatibility_id, std::move(rpu)});
    }
  
 +  pVideoPicture->doviMetadata.reset();
@@ -82,19 +82,20 @@ index a7d4d30386..f484c4d5ac 100644
        const AVDOVIRpuDataHeader* hdr = av_dovi_get_header(dovi);
        const AVDOVIDataMapping* mapping = av_dovi_get_mapping(dovi);
 diff --git a/xbmc/cores/VideoPlayer/DVDFileInfo.cpp b/xbmc/cores/VideoPlayer/DVDFileInfo.cpp
-index c6af78ae26..ae71ee3e85 100644
+index 0e81309..075903c 100644
 --- a/xbmc/cores/VideoPlayer/DVDFileInfo.cpp
 +++ b/xbmc/cores/VideoPlayer/DVDFileInfo.cpp
-@@ -44,6 +44,8 @@
- #include "cores/FFmpeg.h"
+@@ -43,7 +43,9 @@
+ #include "Util.h"
  #include "filesystem/File.h"
  
 +#include <algorithm>
+ #include <chrono>
 +#include <cmath>
- #include <cstdlib>
+ #include <cstdint>
  #include <memory>
- #include <string>
-@@ -51,6 +53,7 @@
+ #include <mutex>
+@@ -52,6 +54,7 @@
  extern "C" {
  #include <libavcodec/avcodec.h>
  #include <libavformat/avformat.h>
@@ -102,10 +103,10 @@ index c6af78ae26..ae71ee3e85 100644
  #include <libavutil/mastering_display_metadata.h>
  #include <libswscale/swscale.h>
  }
-@@ -148,6 +151,214 @@ bool CDVDFileInfo::SeekAndDecodeFirstPicture(CDVDDemux& demuxer,
+@@ -202,6 +205,214 @@ public:
+ CCriticalSection thumbSwsSection;
+ SwsContext* thumbSwsTone = nullptr;
  
- namespace
- {
 +/*! After SeekAndDecodeFirstPicture (the keyframe before the time): decode on until the picture
 + * at seekTo_ms, so a bookmark thumbnail shows the bookmarked moment. Bounded by packets and time;
 + * keeps the last good picture. */
@@ -127,7 +128,7 @@ index c6af78ae26..ae71ee3e85 100644
 +    packetsTried++;
 +    if (!pPacket)
 +      return;
-+    if (pPacket->iStreamId != videoStream || pPacket->isELPackage)
++    if (pPacket->iStreamId != videoStream)
 +    {
 +      CDVDDemuxUtils::FreeDemuxPacket(pPacket);
 +      continue;
@@ -317,15 +318,21 @@ index c6af78ae26..ae71ee3e85 100644
  //! Convert a decoded picture to a BGRA texture sized for the thumbnail cache.
  std::unique_ptr<CTexture> PictureToTexture(const VideoPicture& picture, const CDVDStreamInfo& hint)
  {
-@@ -173,36 +384,52 @@ std::unique_ptr<CTexture> PictureToTexture(const VideoPicture& picture, const CD
- 
+@@ -228,41 +439,58 @@ std::unique_ptr<CTexture> PictureToTexture(const VideoPicture& picture, const CD
  #if LIBSWSCALE_BUILD >= AV_VERSION_INT(9, 0, 100)
+   // color management builds a 3D LUT, which takes seconds on ARM, so keep it for HDR and
+   // wide gamut sources
+-  if (picture.color_transfer == AVCOL_TRC_SMPTE2084 ||
++  // Dolby Vision without a compatible base layer (profile 5): rebuilt from the RPU
++  const bool doviProfile5 = hint.dovi.dv_profile && hint.dovi.rpu_present_flag &&
++                            hint.dovi.dv_bl_signal_compatibility_id == 0 && picture.doviMetadata;
++  if (doviProfile5 || picture.color_transfer == AVCOL_TRC_SMPTE2084 ||
+       picture.color_transfer == AVCOL_TRC_ARIB_STD_B67 ||
+       picture.color_primaries == AVCOL_PRI_BT2020)
    {
 -    AVFrame* srcFrame = av_frame_alloc();
 +    AVFrame* srcFrame = nullptr;
-+    // Dolby Vision without a compatible base layer (profile 5): rebuilt from the RPU
-+    if (hint.dovi.dv_profile && hint.dovi.rpu_present_flag &&
-+        hint.dovi.dv_bl_signal_compatibility_id == 0 && picture.doviMetadata)
++    if (doviProfile5)
 +    {
 +      srcFrame = DoviProfile5ToPQ(picture, planes, stride, nWidth, nHeight);
 +      if (!srcFrame)
@@ -334,9 +341,10 @@ index c6af78ae26..ae71ee3e85 100644
 +    const bool doviRebuilt = srcFrame != nullptr;
 +    if (!srcFrame)
 +      srcFrame = av_frame_alloc();
+     AVFrame* midFrame = av_frame_alloc();
      AVFrame* dstFrame = av_frame_alloc();
-     SwsContext* sws = sws_alloc_context();
-     if (srcFrame && dstFrame && sws)
+     SwsContext* swsScale = sws_alloc_context();
+     if (srcFrame && midFrame && dstFrame && swsScale)
      {
 -      srcFrame->width = static_cast<int>(picture.iWidth);
 -      srcFrame->height = static_cast<int>(picture.iHeight);
@@ -394,7 +402,17 @@ index c6af78ae26..ae71ee3e85 100644
        }
  
        dstFrame->width = static_cast<int>(nWidth);
-@@ -260,7 +487,8 @@ std::unique_ptr<CTexture> PictureToTexture(const VideoPicture& picture, const CD
+@@ -278,7 +506,8 @@ std::unique_ptr<CTexture> PictureToTexture(const VideoPicture& picture, const CD
+       // scale first, so the tone mapping works on thumbnail sized RGBA64 buffers
+       AVFrame* toneFrame = srcFrame;
+       int res = 0;
+-      if (nWidth != picture.iWidth || nHeight != picture.iHeight)
++      if (static_cast<int>(nWidth) != srcFrame->width ||
++          static_cast<int>(nHeight) != srcFrame->height)
+       {
+         midFrame->width = static_cast<int>(nWidth);
+         midFrame->height = static_cast<int>(nHeight);
+@@ -345,7 +574,8 @@ std::unique_ptr<CTexture> PictureToTexture(const VideoPicture& picture, const CD
  } // namespace
  
  std::unique_ptr<CTexture> CDVDFileInfo::ExtractThumbToTexture(const CFileItem& fileItem,
@@ -404,7 +422,7 @@ index c6af78ae26..ae71ee3e85 100644
  {
    if (!CanExtract(fileItem))
      return {};
-@@ -332,11 +560,13 @@ std::unique_ptr<CTexture> CDVDFileInfo::ExtractThumbToTexture(const CFileItem& f
+@@ -418,11 +648,13 @@ std::unique_ptr<CTexture> CDVDFileInfo::ExtractThumbToTexture(const CFileItem& f
  
      if (pVideoCodec)
      {
@@ -420,7 +438,7 @@ index c6af78ae26..ae71ee3e85 100644
  
        CLog::LogF(LOGDEBUG, "seeking to pos {}ms (total: {}ms) in {}", nSeekTo, nTotalLen,
                   redactPath);
-@@ -344,7 +574,11 @@ std::unique_ptr<CTexture> CDVDFileInfo::ExtractThumbToTexture(const CFileItem& f
+@@ -430,7 +662,11 @@ std::unique_ptr<CTexture> CDVDFileInfo::ExtractThumbToTexture(const CFileItem& f
        VideoPicture picture = {};
        if (SeekAndDecodeFirstPicture(*demuxer, *pVideoCodec, nVideoStream, nSeekTo, picture,
                                      packetsTried))
@@ -433,10 +451,10 @@ index c6af78ae26..ae71ee3e85 100644
          CLog::LogF(LOGDEBUG, "decode failed in {} after {} packets.", redactPath, packetsTried);
      }
 diff --git a/xbmc/cores/VideoPlayer/DVDFileInfo.h b/xbmc/cores/VideoPlayer/DVDFileInfo.h
-index 2ac92e9d3f..17fd8ca1b7 100644
+index bdaf5b7..8bf25aa 100644
 --- a/xbmc/cores/VideoPlayer/DVDFileInfo.h
 +++ b/xbmc/cores/VideoPlayer/DVDFileInfo.h
-@@ -26,8 +26,15 @@ struct VideoPicture;
+@@ -27,8 +27,15 @@ struct VideoPicture;
  class CDVDFileInfo
  {
  public:
@@ -454,7 +472,7 @@ index 2ac92e9d3f..17fd8ca1b7 100644
    /*!
     * @brief Seek the demuxer to a position and decode the first picture that is not dropped.
 diff --git a/xbmc/video/dialogs/GUIDialogVideoBookmarks.cpp b/xbmc/video/dialogs/GUIDialogVideoBookmarks.cpp
-index a460ced7ef..446f49667d 100644
+index a460ced..446f496 100644
 --- a/xbmc/video/dialogs/GUIDialogVideoBookmarks.cpp
 +++ b/xbmc/video/dialogs/GUIDialogVideoBookmarks.cpp
 @@ -15,10 +15,12 @@
@@ -496,6 +514,3 @@ index a460ced7ef..446f49667d 100644
          if (!encoded)
          {
            CLog::Log(LOGERROR, "CGUIDialogVideoBookmarks: failed to create bookmark thumbnail");
--- 
-2.43.0
-

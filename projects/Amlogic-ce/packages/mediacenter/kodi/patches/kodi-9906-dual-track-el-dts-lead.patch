@@ -15,15 +15,16 @@ sample tables. m2ts layers share the timeline: unchanged.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- .../DVDDemuxers/DVDDemuxFFmpeg.cpp            | 67 ++++++++++++++++++-
- .../VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h  |  4 ++
+
+ .../VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp     | 67 +++++++++++++++++++++-
+ .../cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h |  4 ++
  2 files changed, 69 insertions(+), 2 deletions(-)
 
 diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
-index b65b3b2eae..d31876544e 100644
+index 59ab2f9..096c7a4 100644
 --- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
 +++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.cpp
-@@ -1102,6 +1102,62 @@ AVDictionary* CDVDDemuxFFmpeg::GetFFMpegOptionsFromInput()
+@@ -1110,6 +1110,62 @@ AVDictionary* CDVDDemuxFFmpeg::GetFFMpegOptionsFromInput()
    return options;
  }
  
@@ -86,7 +87,7 @@ index b65b3b2eae..d31876544e 100644
  double CDVDDemuxFFmpeg::ConvertTimestamp(int64_t pts, int den, int num)
  {
    if (pts == (int64_t)AV_NOPTS_VALUE)
-@@ -1286,8 +1342,14 @@ DemuxPacket* CDVDDemuxFFmpeg::ReadInternal(bool keep)
+@@ -1294,8 +1350,14 @@ DemuxPacket* CDVDDemuxFFmpeg::ReadInternal(bool keep)
  
            pPacket->pts =
                ConvertTimestamp(m_pkt.pkt.pts, stream->time_base.den, stream->time_base.num);
@@ -103,7 +104,7 @@ index b65b3b2eae..d31876544e 100644
            pPacket->duration = DVD_SEC_TO_TIME((double)m_pkt.pkt.duration * stream->time_base.num /
                                                stream->time_base.den);
  
-@@ -2072,6 +2134,7 @@ void CDVDDemuxFFmpeg::ClearProbedStreamParameters()
+@@ -2080,6 +2142,7 @@ void CDVDDemuxFFmpeg::ClearProbedStreamParameters()
  
  void CDVDDemuxFFmpeg::DisposeStreams()
  {
@@ -112,7 +113,7 @@ index b65b3b2eae..d31876544e 100644
    for(it = m_streams.begin(); it != m_streams.end(); ++it)
      delete it->second;
 diff --git a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
-index 913c039c60..7375ed3016 100644
+index 913c039..7375ed3 100644
 --- a/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
 +++ b/xbmc/cores/VideoPlayer/DVDDemuxers/DVDDemuxFFmpeg.h
 @@ -152,6 +152,9 @@ protected:
@@ -133,6 +134,3 @@ index 913c039c60..7375ed3016 100644
    int m_displayTime = 0;
    double m_dtsAtDisplayTime;
    bool m_seekToKeyFrame = false;
--- 
-2.43.0
-

@@ -19,54 +19,55 @@ the video's HDR coding (PQ or HLG, BT.2020) and tags the PNG with it.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- .../resources/strings.po                      |  14 +-
- system/settings/settings.xml                  |   5 +
- xbmc/application/Application.cpp              |   3 +-
- .../VideoPlayer/DVDCodecs/Video/AMLCodec.h    |   8 +
- .../HwDecRender/RendererAML.cpp               |  47 ++-
- .../VideoRenderers/HwDecRender/RendererAML.h  |   2 +
- xbmc/settings/Settings.h                      |   1 +
- xbmc/utils/IScreenshotSurface.h               |  21 +
- xbmc/utils/Screenshot.cpp                     |  26 ++
- xbmc/utils/ScreenshotAML.cpp                  | 373 ++++++++++++++----
- xbmc/utils/ScreenshotAML.h                    |  52 ++-
- .../amlogic/ScreenshotSurfaceAML.cpp          |  19 +-
+
+ .../resource.language.en_gb/resources/strings.po   |  14 +-
+ system/settings/settings.xml                       |   5 +
+ xbmc/application/Application.cpp                   |   3 +-
+ xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLCodec.h  |   8 +
+ .../VideoRenderers/HwDecRender/RendererAML.cpp     |  47 ++-
+ .../VideoRenderers/HwDecRender/RendererAML.h       |   2 +
+ xbmc/settings/Settings.h                           |   1 +
+ xbmc/utils/IScreenshotSurface.h                    |  21 ++
+ xbmc/utils/Screenshot.cpp                          |  26 ++
+ xbmc/utils/ScreenshotAML.cpp                       | 373 +++++++++++++++++----
+ xbmc/utils/ScreenshotAML.h                         |  52 ++-
+ xbmc/windowing/amlogic/ScreenshotSurfaceAML.cpp    |  19 +-
  12 files changed, 477 insertions(+), 94 deletions(-)
 
 diff --git a/addons/resource.language.en_gb/resources/strings.po b/addons/resource.language.en_gb/resources/strings.po
-index 9d7d2fd423..115737335a 100644
+index 3bc03d7..f5901a1 100644
 --- a/addons/resource.language.en_gb/resources/strings.po
 +++ b/addons/resource.language.en_gb/resources/strings.po
-@@ -25399,7 +25399,19 @@ msgctxt "#39217"
- msgid "Best"
+@@ -25534,7 +25534,19 @@ msgctxt "#39219"
+ msgid "Use the system Dolby Vision extensions to correctly display Dolby Vision profile 5, 7 (excludes FEL reconstruction), 8 and 10 video."
  msgstr ""
  
--#empty strings from id 39218 to 39899
+-#empty strings from id 39220 to 39899
 +#. Label of the setting "Tone map HDR screenshots to SDR"
 +#: system/settings/settings.xml
-+msgctxt "#39218"
++msgctxt "#39220"
 +msgid "Tone map HDR screenshots to SDR"
 +msgstr ""
 +
-+#. Description of setting with label #39218 "Tone map HDR screenshots to SDR"
++#. Description of setting with label #39220 "Tone map HDR screenshots to SDR"
 +#: system/settings/settings.xml
-+msgctxt "#39219"
++msgctxt "#39221"
 +msgid "Convert screenshots of HDR video to SDR, so they look right in any image viewer. When disabled the picture keeps the video's HDR coding (PQ or HLG, BT.2020) and is tagged with it."
 +msgstr ""
 +
-+#empty strings from id 39220 to 39899
++#empty strings from id 39222 to 39899
  
  #. List formatting: pattern used to join a list of exactly two items, e.g. "A and B"
  #. STR_LIST_AND_TWO
 diff --git a/system/settings/settings.xml b/system/settings/settings.xml
-index 2bc889bfc2..4208a4e22b 100755
+index 3cb53cd..eb5cb0d 100755
 --- a/system/settings/settings.xml
 +++ b/system/settings/settings.xml
-@@ -4088,6 +4088,11 @@
+@@ -4132,6 +4132,11 @@
              <heading>657</heading>
            </control>
          </setting>
-+        <setting id="debug.screenshottonemap" type="boolean" label="39218" help="39219">
++        <setting id="debug.screenshottonemap" type="boolean" label="39220" help="39221">
 +          <level>1</level>
 +          <default>true</default>
 +          <control type="toggle" />
@@ -75,10 +76,10 @@ index 2bc889bfc2..4208a4e22b 100755
        <group id="2" label="14111">
          <setting id="eventlog.enabled" type="boolean" label="14112" help="36460">
 diff --git a/xbmc/application/Application.cpp b/xbmc/application/Application.cpp
-index d26f24c8ac..9d55741f95 100644
+index 8beb880..5f44e56 100644
 --- a/xbmc/application/Application.cpp
 +++ b/xbmc/application/Application.cpp
-@@ -877,7 +877,8 @@ void ServiceCaptureTaps()
+@@ -882,7 +882,8 @@ void ServiceCaptureTaps()
    result.height = static_cast<unsigned int>(surface->GetHeight());
    result.stride = surface->GetStride();
    result.format = surface->GetFormat();
@@ -89,10 +90,10 @@ index d26f24c8ac..9d55741f95 100644
  
    captureService->Complete(request, result);
 diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLCodec.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLCodec.h
-index 90a98905e6..0b4f6529bd 100644
+index f48d2f3..32ed35e 100644
 --- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLCodec.h
 +++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLCodec.h
-@@ -117,6 +117,14 @@ private:
+@@ -118,6 +118,14 @@ private:
    void          SetVideoBrightness(const int brightness);
    void          SetVideoSaturation(const int saturation);
    bool          OpenAmlVideo(const CDVDStreamInfo &hints);
@@ -108,7 +109,7 @@ index 90a98905e6..0b4f6529bd 100644
    std::string   GetVfmMap(const std::string &name);
    void          SetVfmMap(const std::string &name, const std::string &map);
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.cpp b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.cpp
-index fff909215b..b61563025f 100644
+index fff9092..b615630 100644
 --- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.cpp
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.cpp
 @@ -40,7 +40,7 @@ CRendererAML::CRendererAML()
@@ -193,7 +194,7 @@ index fff909215b..b61563025f 100644
    return true;
  }
 diff --git a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.h b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.h
-index f69799cd09..747e598969 100644
+index f69799c..747e598 100644
 --- a/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.h
 +++ b/xbmc/cores/VideoPlayer/VideoRenderers/HwDecRender/RendererAML.h
 @@ -9,6 +9,7 @@
@@ -212,7 +213,7 @@ index f69799cd09..747e598969 100644
    bool m_bConfigured;
  };
 diff --git a/xbmc/settings/Settings.h b/xbmc/settings/Settings.h
-index 7f126e503e..b22af8f693 100644
+index 7f126e5..b22af8f 100644
 --- a/xbmc/settings/Settings.h
 +++ b/xbmc/settings/Settings.h
 @@ -466,6 +466,7 @@ public:
@@ -224,7 +225,7 @@ index 7f126e503e..b22af8f693 100644
    static constexpr auto SETTING_EVENTLOG_ENABLED = "eventlog.enabled";
    static constexpr auto SETTING_EVENTLOG_ENABLED_NOTIFICATIONS = "eventlog.enablednotifications";
 diff --git a/xbmc/utils/IScreenshotSurface.h b/xbmc/utils/IScreenshotSurface.h
-index 339237f0fa..4c29b1f5af 100644
+index 339237f..4c29b1f 100644
 --- a/xbmc/utils/IScreenshotSurface.h
 +++ b/xbmc/utils/IScreenshotSurface.h
 @@ -8,6 +8,8 @@
@@ -268,7 +269,7 @@ index 339237f0fa..4c29b1f5af 100644
 +  ImageColorMetadata m_color;
  };
 diff --git a/xbmc/utils/Screenshot.cpp b/xbmc/utils/Screenshot.cpp
-index 623b38f3dc..9852088607 100644
+index 623b38f..9852088 100644
 --- a/xbmc/utils/Screenshot.cpp
 +++ b/xbmc/utils/Screenshot.cpp
 @@ -13,6 +13,7 @@
@@ -319,7 +320,7 @@ index 623b38f3dc..9852088607 100644
    if (!lock.data())
    {
 diff --git a/xbmc/utils/ScreenshotAML.cpp b/xbmc/utils/ScreenshotAML.cpp
-index 05610c5a55..bb4a9c55f7 100644
+index 05610c5..bb4a9c5 100644
 --- a/xbmc/utils/ScreenshotAML.cpp
 +++ b/xbmc/utils/ScreenshotAML.cpp
 @@ -11,6 +11,7 @@
@@ -825,7 +826,7 @@ index 05610c5a55..bb4a9c55f7 100644
 +  return videoColor;
 +}
 diff --git a/xbmc/utils/ScreenshotAML.h b/xbmc/utils/ScreenshotAML.h
-index 4fe69e3923..0934852511 100644
+index 4fe69e3..0934852 100644
 --- a/xbmc/utils/ScreenshotAML.h
 +++ b/xbmc/utils/ScreenshotAML.h
 @@ -8,6 +8,7 @@
@@ -907,7 +908,7 @@ index 4fe69e3923..0934852511 100644
 +  static AMLVideoColor GetVideoColor();
  };
 diff --git a/xbmc/windowing/amlogic/ScreenshotSurfaceAML.cpp b/xbmc/windowing/amlogic/ScreenshotSurfaceAML.cpp
-index e5e5d57aa6..888ce83d6e 100644
+index e5e5d57..888ce83 100644
 --- a/xbmc/windowing/amlogic/ScreenshotSurfaceAML.cpp
 +++ b/xbmc/windowing/amlogic/ScreenshotSurfaceAML.cpp
 @@ -8,8 +8,13 @@
@@ -944,6 +945,3 @@ index e5e5d57aa6..888ce83d6e 100644
 +    SetColor(color); // the video kept its HDR coding and the picture took it
    return true;
  }
--- 
-2.43.0
-

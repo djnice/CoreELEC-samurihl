@@ -1,8 +1,16 @@
+
+
+ .../resource.language.en_gb/resources/strings.po   |   2 +-
+ .../cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp |  81 +++++
+ xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.c    | 402 ++++++++++++++++++++-
+ xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.h    |  36 ++
+ 4 files changed, 504 insertions(+), 17 deletions(-)
+
 diff --git a/addons/resource.language.en_gb/resources/strings.po b/addons/resource.language.en_gb/resources/strings.po
-index 86f39b424f..be0ee4934e 100644
+index ac0a371..f02489e 100644
 --- a/addons/resource.language.en_gb/resources/strings.po
 +++ b/addons/resource.language.en_gb/resources/strings.po
-@@ -9156,7 +9156,7 @@ msgstr ""
+@@ -9168,7 +9168,7 @@ msgstr ""
  
  #: system/settings/settings.xml
  msgctxt "#14435"
@@ -12,10 +20,10 @@ index 86f39b424f..be0ee4934e 100644
  
  #: system/settings/settings.xml
 diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp
-index 52cc57ead3..eec80575fb 100644
+index 71eca25..a14f6af 100644
 --- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp
 +++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/AMLDvFel.cpp
-@@ -13,8 +13,10 @@
+@@ -14,8 +14,10 @@
  #include "ServiceBroker.h"
  #include "settings/Settings.h"
  #include "settings/SettingsComponent.h"
@@ -26,7 +34,7 @@ index 52cc57ead3..eec80575fb 100644
  #include <cmath>
  #include <climits>
  #include <cstring>
-@@ -147,6 +149,39 @@ std::shared_ptr<felgpu_meta> ParseRpu(const uint8_t* nal, size_t size,
+@@ -148,6 +150,39 @@ std::shared_ptr<felgpu_meta> ParseRpu(const uint8_t* nal, size_t size,
      }
    }
  
@@ -66,7 +74,7 @@ index 52cc57ead3..eec80575fb 100644
    if (map)
      dovi_rpu_free_data_mapping(map);
    if (hdr)
-@@ -155,6 +190,40 @@ std::shared_ptr<felgpu_meta> ParseRpu(const uint8_t* nal, size_t size,
+@@ -156,6 +191,40 @@ std::shared_ptr<felgpu_meta> ParseRpu(const uint8_t* nal, size_t size,
    return meta;
  }
  
@@ -107,7 +115,7 @@ index 52cc57ead3..eec80575fb 100644
  // debug: /storage/dvfel_dump_pts holds a pts; the EL frame and metadata used
  // for that frame are written to /storage/dvfel_el.yuv and dvfel_meta.txt
  int64_t DumpPts()
-@@ -761,6 +830,7 @@ void CAMLDvFel::GpuThread(std::promise<bool> ready)
+@@ -762,6 +831,7 @@ void CAMLDvFel::GpuThread(std::promise<bool> ready)
      const int64_t dumpPts = DumpPts();
      int dither = -1, pattern = -1, demo = -1;
      auto nextDitherCheck = std::chrono::steady_clock::now();
@@ -115,7 +123,7 @@ index 52cc57ead3..eec80575fb 100644
      while (!m_stop)
      {
        if (std::chrono::steady_clock::now() >= nextDitherCheck)
-@@ -789,6 +859,8 @@ void CAMLDvFel::GpuThread(std::promise<bool> ready)
+@@ -790,6 +860,8 @@ void CAMLDvFel::GpuThread(std::promise<bool> ready)
          {
            demo = dem;
            felgpu_set_demo(fel, dem);
@@ -124,7 +132,7 @@ index 52cc57ead3..eec80575fb 100644
            CLog::Log(LOGINFO, "CAMLDvFel: demo mode {}", dem);
          }
        }
-@@ -825,9 +897,18 @@ void CAMLDvFel::GpuThread(std::promise<bool> ready)
+@@ -826,9 +898,18 @@ void CAMLDvFel::GpuThread(std::promise<bool> ready)
          felgpu_set_el(fel, reinterpret_cast<const uint16_t*>(el->data[0]), el->linesize[0] / 2,
                        reinterpret_cast<const uint16_t*>(el->data[1]),
                        reinterpret_cast<const uint16_t*>(el->data[2]), el->linesize[1] / 2);
@@ -144,10 +152,10 @@ index 52cc57ead3..eec80575fb 100644
          m_composed++;
        }
 diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.c b/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.c
-index f8ed5e76d9..01c4928e70 100644
+index f61be1e..edbb874 100644
 --- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.c
 +++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.c
-@@ -39,6 +39,19 @@ struct felgpu {
+@@ -45,6 +45,19 @@ struct felgpu {
      int dither_mode;                /* 0 off, 1 on, 2 left half only */
      int demo;                       /* EL on the left half only */
      int pattern;                    /* 1: grey ramp test pattern instead of the video */
@@ -167,7 +175,7 @@ index f8ed5e76d9..01c4928e70 100644
      float vwt_y[12], vwt_c[12], hwt_y[12], hwt_c[12];
      int vbase_y[2], vbase_c[2], hbase_y[2], hbase_c[2];
  
-@@ -133,6 +146,55 @@ struct felgpu {
+@@ -139,6 +152,55 @@ struct felgpu {
      "  return clamp(floor(acc + 0.5), 0.0, el_max);\n" \
      "}\n"
  
@@ -223,7 +231,7 @@ index f8ed5e76d9..01c4928e70 100644
  static const char *vs_src =
      "#version 320 es\n"
      "void main() {\n"
-@@ -198,7 +260,6 @@ static const char *fs_chroma =
+@@ -204,7 +266,6 @@ static const char *fs_chroma =
      "uniform float mmrc[16];\n"
      "uniform bool cpoly[2];\n"
      "uniform bool use_el;\n"
@@ -231,7 +239,7 @@ index f8ed5e76d9..01c4928e70 100644
      "uniform float inv_bl;\n"
      "out uvec2 o;\n"
      "float mmr_eval(int b, float c0, vec3 sig) {\n"
-@@ -240,10 +301,8 @@ static const char *fs_chroma =
+@@ -246,10 +307,8 @@ static const char *fs_chroma =
      "    vcb = cpoly[0] ? lut_at(4, cb) : predict_mmr(0, sig.y, sig);\n"
      "    vcr = cpoly[1] ? lut_at(5, cr) : predict_mmr(1, sig.z, sig);\n"
      "  }\n"
@@ -244,7 +252,7 @@ index f8ed5e76d9..01c4928e70 100644
      "    vec2 el = el_h(elc, c);\n"
      "    vcb += lut_at(2, uint(el.x));\n"
      "    vcr += lut_at(3, uint(el.y));\n"
-@@ -255,27 +314,120 @@ static const char *fs_chroma =
+@@ -261,27 +320,120 @@ static const char *fs_chroma =
  
  /* luma + packing: one fragment per output pixel word */
  static const char *fs_luma =
@@ -370,7 +378,7 @@ index f8ed5e76d9..01c4928e70 100644
  /* ------------------------------------------------------------------ */
  /* GL helpers                                                         */
  /* ------------------------------------------------------------------ */
-@@ -504,7 +656,9 @@ struct felgpu *felgpu_create(int w, int h, int taps)
+@@ -510,7 +662,9 @@ struct felgpu *felgpu_create(int w, int h, int taps)
      f->p_vert2 = program(fs_el_vert2, taps);
      f->p_chroma = program(fs_chroma, taps);
      f->p_luma = program(fs_luma, taps);
@@ -381,7 +389,7 @@ index f8ed5e76d9..01c4928e70 100644
          free(f);
          return NULL;
      }
-@@ -526,6 +680,30 @@ struct felgpu *felgpu_create(int w, int h, int taps)
+@@ -532,6 +686,30 @@ struct felgpu *felgpu_create(int w, int h, int taps)
      f->fbo_cv = make_fbo(f->el_cv);
      f->fbo_chroma = make_fbo(f->chroma);
  
@@ -412,7 +420,7 @@ index f8ed5e76d9..01c4928e70 100644
      /* EL sample phase: centered 2x (see fel_compose.c); chroma top-left sited */
      const double ce = 0.5;
      kernel(-ce / 2, taps, f->vwt_y, f->vbase_y);
-@@ -539,14 +717,18 @@ void felgpu_destroy(struct felgpu *f)
+@@ -545,14 +723,18 @@ void felgpu_destroy(struct felgpu *f)
  {
      if (!f)
          return;
@@ -435,7 +443,7 @@ index f8ed5e76d9..01c4928e70 100644
      free(f);
  }
  
-@@ -661,6 +843,137 @@ static int dither_split(const struct felgpu *f, int width)
+@@ -667,6 +849,137 @@ static int dither_split(const struct felgpu *f, int width)
      return f->dither_mode == 1 ? width : f->dither_mode == 2 ? width / 2 : 0;
  }
  
@@ -573,7 +581,7 @@ index f8ed5e76d9..01c4928e70 100644
  void felgpu_run(struct felgpu *f, GLuint bl_tex, GLuint out_fbo)
  {
      GLuint p;
-@@ -701,12 +1014,15 @@ void felgpu_run(struct felgpu *f, GLuint bl_tex, GLuint out_fbo)
+@@ -707,12 +1020,15 @@ void felgpu_run(struct felgpu *f, GLuint bl_tex, GLuint out_fbo)
      bind_tex(p, "lut", 2, f->lut);
      bind_tex(p, "dither", 3, f->dither);
      glUniform1i(glGetUniformLocation(p, "dither_split"), dither_split(f, f->w / 2));
@@ -590,7 +598,7 @@ index f8ed5e76d9..01c4928e70 100644
      p = f->p_luma;
      glUseProgram(p);
      glUniform1i(glGetUniformLocation(p, "use_el"), f->use_el);
-@@ -722,6 +1038,33 @@ void felgpu_run(struct felgpu *f, GLuint bl_tex, GLuint out_fbo)
+@@ -728,6 +1044,33 @@ void felgpu_run(struct felgpu *f, GLuint bl_tex, GLuint out_fbo)
      glUniform1i(glGetUniformLocation(p, "el_split"), f->demo ? f->w / 2 : f->w);
      glUniform1i(glGetUniformLocation(p, "pattern"), f->pattern);
      glUniform1i(glGetUniformLocation(p, "pass_h"), f->h);
@@ -624,7 +632,7 @@ index f8ed5e76d9..01c4928e70 100644
      draw(out_fbo, f->w, f->h);
      prof_mark(f, 3);
      f->prof_n++;
-@@ -742,6 +1085,33 @@ void felgpu_set_demo(struct felgpu *f, int on)
+@@ -748,6 +1091,33 @@ void felgpu_set_demo(struct felgpu *f, int on)
      f->demo = on;
  }
  
@@ -659,10 +667,10 @@ index f8ed5e76d9..01c4928e70 100644
  {
      f->pattern = pattern;
 diff --git a/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.h b/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.h
-index 4dfa143ba7..1314f915a4 100644
+index f5fcdaf..79a0543 100644
 --- a/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.h
 +++ b/xbmc/cores/VideoPlayer/DVDCodecs/Video/felgpu.h
-@@ -39,6 +39,9 @@ struct felgpu_meta {
+@@ -45,6 +45,9 @@ struct felgpu_meta {
      double mmr[3][FELGPU_MAX_PIECES][3][7];            /* [order][term] */
      int nlq_offset[3];                 /* EL codewords */
      double nlq_slope[3], nlq_thresh[3], nlq_max[3];    /* normalized */
@@ -672,7 +680,7 @@ index 4dfa143ba7..1314f915a4 100644
  };
  
  struct felgpu;
-@@ -69,6 +72,39 @@ void felgpu_set_dither(struct felgpu *f, int mode);
+@@ -75,6 +78,39 @@ void felgpu_set_dither(struct felgpu *f, int mode);
   */
  void felgpu_set_demo(struct felgpu *f, int on);
  
